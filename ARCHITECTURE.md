@@ -194,6 +194,12 @@ START -> prepare -> inspect/plan
 
 A task may finish early if it is already satisfied or cannot be safely performed. The graph must not force meaningless file edits.
 
+### Repository inventory and edit scope
+
+Inventory records every regular tracked project file as compact path, byte-size, and text/binary metadata; it does not exclude files because they are large, numerous, or written in a language the engine does not recognize. Binary files are visible to the model for analysis, but deterministic validation prevents treating them as UTF-8 text.
+
+The full manifest remains in engine state. The selection prompt uses a relevance-ranked compact subset to fit the model context and explicitly permits a user-named tracked path that is not present in that subset. Once selected, UTF-8 content is read in bounded chunks. A run may make at most 12 concrete text operations and may send at most 36 KB of selected existing text to the proposal model; these are operation/context limits, not inventory limits. Git-clean preconditions, workspace path validation, and file-specific diff evidence remain mandatory.
+
 ### Progress and budgets
 
 - Bound **model calls**, execution time, tool output size, and repeated nonproductive inspection.

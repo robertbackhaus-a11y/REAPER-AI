@@ -9,6 +9,7 @@ import ast
 import hashlib
 import json
 import os
+import re
 import time
 import tomllib
 from contextvars import ContextVar
@@ -24,13 +25,14 @@ from reaper_ai.persistence import StorageError, Store
 
 OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
 MODEL = os.environ.get("REAPER_MODEL", "qwen3.6:35b")
-MAX_FILES = 3
-MAX_SOURCE_CHARS = 20_000
+MAX_EDIT_OPERATIONS = 12
+MAX_SELECTION_MANIFEST_CHARS = 24_000
+MAX_SELECTED_SOURCE_BYTES = 36_000
+_READ_CHUNK_CHARS = 8_192
+_BINARY_PROBE_BYTES = 8_192
 MAX_MODEL_CALLS = 4  # selection + proposal + at most one repair
 MAX_WALL_SECONDS = 600
 _MAX_REPLY_CHARS = 80_000
-_EDITABLE_EXISTING_SUFFIXES = {".py", ".toml", ".md"}
-_EDITABLE_EXISTING_NAMES = {"VERSION"}
 _RUN = ContextVar("reaper_run_metrics", default=None)
 
 
@@ -83,11 +85,6 @@ def _is_python_path(path: str) -> bool:
     return Path(path).suffix.lower() == ".py"
 
 
-def _is_editable_existing_path(path: str) -> bool:
-    item = Path(path)
-    return item.name in _EDITABLE_EXISTING_NAMES or item.suffix.lower() in _EDITABLE_EXISTING_SUFFIXES
-
-
 def _validate_text_syntax(path: str, content: str) -> str:
     if _is_python_path(path):
         ast.parse(content, filename=path)
@@ -96,6 +93,66 @@ def _validate_text_syntax(path: str, content: str) -> str:
         tomllib.loads(content)
         return "ok"
     return "not_applicable"
+
+
+def _file_kind(target: Path) -> str:
+    """Classify without decoding a whole file during inventory."""
+    with target.open("rb") as source:
+        probe = source.read(_BINARY_PROBE_BYTES)
+    if b"\0" in probe:
+        return "binary"
+    try:
+        probe.decode("utf-8")
+    except UnicodeDecodeError:
+        return "binary"
+    return "text"
+
+
+def _read_text_sections(target: Path) -> str:
+    """Load selected UTF-8 source on demand, in bounded read chunks."""
+    sections: list[str] = []
+    with target.open("r", encoding="utf-8") as source:
+        while section := source.read(_READ_CHUNK_CHARS):
+            sections.append(section)
+    content = "".join(sections)
+    if "\0" in content:
+        raise ValueError(f"File contains NUL bytes and is not safe for UTF-8 text editing: {target.name}")
+    return content
+
+
+def _selection_manifest(inventory: list[dict], task: str) -> tuple[list[dict], int]:
+    """Keep full inventory in state while fitting a relevant manifest in model context."""
+    task_terms = set(re.findall(r"[A-Za-z0-9_.-]+", task.casefold()))
+
+    def rank(item: dict) -> tuple[int, int, str]:
+        path = item["path"].casefold()
+        name = Path(path).name
+        exact = 0 if path in task_terms or name in task_terms else 1
+        related = 0 if any(term in path for term in task_terms if len(term) > 2) else 1
+        text = 0 if item["kind"] == "text" else 1
+        return exact, related + text, path
+
+    manifest: list[dict] = []
+    used = 0
+    for item in sorted(inventory, key=rank):
+        compact = {key: item[key] for key in ("path", "kind", "bytes")}
+        size = len(json.dumps(compact, ensure_ascii=False)) + 1
+        if used + size > MAX_SELECTION_MANIFEST_CHARS:
+            continue
+        manifest.append(compact)
+        used += size
+    return manifest, len(inventory) - len(manifest)
+
+
+def _selection_prompt(state: CodingState) -> str:
+    manifest, omitted = _selection_manifest(state["inventory"], state["task"])
+    note = ""
+    if omitted:
+        note = (
+            f" The full inventory has {len(state['inventory'])} files; {omitted} less-relevant paths are omitted "
+            "only from this model manifest. Explicitly named tracked paths remain selectable."
+        )
+    return f"Task:\n{state['task']}\n\nInventory manifest:{note}\n" + json.dumps(manifest, ensure_ascii=False)
 
 
 def ask_json(system: str, user: str) -> dict:
@@ -144,36 +201,21 @@ def inventory(state: CodingState) -> dict:
         top = git(root, "rev-parse", "--show-toplevel")
         if top.returncode or Path(top.stdout.strip()).resolve() != root:
             raise ValueError("Workspace must be the root of a Git repository")
-        files = git(root, "ls-files", "--cached", "--", "*.py", "*.toml", "*.md", "VERSION")
+        files = git(root, "ls-files", "--cached")
         if files.returncode:
             raise ValueError(files.stderr.strip())
         candidates = []
         for name in files.stdout.splitlines():
-            target = _file(str(root), name)
+            try:
+                target = _file(str(root), name)
+            except ValueError:
+                continue
             if not target.is_file():
                 continue
-            source = target.read_text(encoding="utf-8")
-            if len(source) > MAX_SOURCE_CHARS:
-                continue
             relative = target.relative_to(root).as_posix()
-            if not _is_editable_existing_path(relative):
-                continue
-            if _is_python_path(relative):
-                try:
-                    tree = ast.parse(source)
-                except SyntaxError:
-                    continue
-                symbols = [node.name for node in tree.body if isinstance(
-                    node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
-                description = (ast.get_docstring(tree) or "")[:160]
-            else:
-                symbols = []
-                description = "Tracked configuration or documentation file"
-            candidates.append({"path": relative, "symbols": symbols[:30], "description": description})
+            candidates.append({"path": relative, "kind": _file_kind(target), "bytes": target.stat().st_size})
         if not candidates:
-            raise ValueError("No eligible tracked editable files")
-        if len(candidates) > 100:
-            raise ValueError("Repository inventory too large (>100 editable files)")
+            raise ValueError("No regular tracked project files")
         return {"inventory": candidates, "status": "inventoried", "error": ""}
     except (OSError, ValueError, UnicodeError, subprocess.TimeoutExpired, RunBudgetExceeded) as exc:
         return {"status": "failed", "error": str(exc)}
@@ -184,20 +226,20 @@ def select(state: CodingState) -> dict:
     print("[SELECT]")
     try:
         result = ask_json(
-            "Select existing tracked editable files to edit AND new Python paths to create. "
-            'Return JSON {"edit":["existing.py"],"create":["new.py"]}. '
-            "At most 3 paths total; existing paths must come from inventory. "
+            "Select existing tracked UTF-8 text files to edit AND new UTF-8 text paths to create. "
+            'Return JSON {"edit":["existing.txt"],"create":["new.txt"]}. '
+            f"At most {MAX_EDIT_OPERATIONS} concrete operations; existing paths must come from inventory. "
+            "Binary files are visible for analysis but must never be selected for text editing. "
             "Only request new files if needed. Never select a path both ways.",
-            f"Task:\n{state['task']}\n\nInventory:\n"
-            + json.dumps(state["inventory"], ensure_ascii=False),
+            _selection_prompt(state),
         )
         paths, creating = result.get("edit"), result.get("create")
         if not isinstance(paths, list) or not isinstance(creating, list):
             raise ValueError("Invalid selection format")
         selected = paths + creating
-        known = {x["path"] for x in state["inventory"]}
-        if not 1 <= len(selected) <= MAX_FILES:
-            raise ValueError(f"File selection must contain 1 to {MAX_FILES} paths (got {len(selected)})")
+        known = {item["path"]: item for item in state["inventory"]}
+        if not 1 <= len(selected) <= MAX_EDIT_OPERATIONS:
+            raise ValueError(f"File selection must contain 1 to {MAX_EDIT_OPERATIONS} paths (got {len(selected)})")
         if any(not isinstance(x, str) for x in selected):
             raise ValueError("File selection paths must be strings")
         if len(set(selected)) != len(selected):
@@ -205,8 +247,17 @@ def select(state: CodingState) -> dict:
         unknown = sorted(path for path in paths if path not in known)
         if unknown:
             raise ValueError("Selected existing paths are not in the inventory: " + ", ".join(unknown))
+        binary = sorted(path for path in paths if known[path]["kind"] != "text")
+        if binary:
+            raise ValueError("Binary files cannot be edited as UTF-8 text: " + ", ".join(binary))
         root = Path(state["workspace"]).resolve()
         originals = {}
+        selected_bytes = sum(known[path]["bytes"] for path in paths)
+        if selected_bytes > MAX_SELECTED_SOURCE_BYTES:
+            raise ValueError(
+                f"Selected text content exceeds the {MAX_SELECTED_SOURCE_BYTES}-byte model context budget; "
+                "split the work into smaller operations"
+            )
         for path in paths:
             target = _file(str(root), path)
             if not target.is_file():
@@ -214,11 +265,11 @@ def select(state: CodingState) -> dict:
             clean = git(root, "diff", "HEAD", "--quiet", "--", path)
             if clean.returncode != 0:
                 raise ValueError(f"File already has Git changes: {path}")
-            originals[path] = target.read_text(encoding="utf-8")
+            originals[path] = _read_text_sections(target)
         for path in creating:
             target = _file(str(root), path)
-            if target.suffix.lower() != ".py" or target.exists() or path in known:
-                raise ValueError(f"Invalid new Python file: {path}")
+            if target.exists() or path in known:
+                raise ValueError(f"New path already exists: {path}")
             ignored = git(root, "check-ignore", "-q", "--", path)
             if ignored.returncode == 0:
                 raise ValueError(f"New file is gitignored: {path}")
@@ -236,8 +287,8 @@ def propose(state: CodingState) -> dict:
     print("[PROPOSE]")
     try:
         result = ask_json(
-            "Implement the task in the selected existing editable files AND new Python files. "
-            'Return JSON {"changes":{"relative.py":"complete updated source"}}. '
+            "Implement the task in the selected existing UTF-8 text files AND new UTF-8 text files. "
+            'Return JSON {"changes":{"relative.txt":"complete updated content"}}. '
             "Include every selected file, even if it requires no change. "
             "Retain unrelated behavior in existing files; provide full source for new files. "
             "Do not claim tests ran. No Markdown.",
@@ -252,8 +303,6 @@ def propose(state: CodingState) -> dict:
         for name, content in changes.items():
             if not isinstance(content, str) or not content.strip():
                 raise ValueError(f"Invalid proposed content: {name}")
-            if len(content) > MAX_SOURCE_CHARS * 2:
-                raise ValueError(f"Proposed content too large: {name}")
             _validate_text_syntax(name, content)
             if name in state["creating"]:
                 meaningful = True
@@ -291,7 +340,7 @@ def apply(state: CodingState) -> dict:
                 if target.exists():
                     raise ValueError(f"New file appeared during proposal: {name}")
             else:
-                if not target.is_file() or target.read_text(encoding="utf-8") != state["originals"][name]:
+                if not target.is_file() or _read_text_sections(target) != state["originals"][name]:
                     raise ValueError(f"Source changed during proposal: {name}")
                 if git(root, "diff", "HEAD", "--quiet", "--", name).returncode != 0:
                     raise ValueError(f"Git state changed: {name}")
@@ -311,7 +360,7 @@ def apply(state: CodingState) -> dict:
         for name in reversed(written):
             target = _file(str(root), name)
             try:
-                if target.read_text(encoding="utf-8") == state["changes"][name]:
+                if _read_text_sections(target) == state["changes"][name]:
                     if name in state["creating"]:
                         target.unlink()
                     else:
@@ -328,7 +377,7 @@ def _restore_written(state: CodingState) -> str:
     for name, expected in reversed(list(state["changes"].items())):
         try:
             target = _file(str(root), name)
-            if not target.is_file() or target.read_text(encoding="utf-8") != expected:
+            if not target.is_file() or _read_text_sections(target) != expected:
                 errors.append(f"{name}: concurrent change, preserved")
                 continue
             if name in state["creating"]:
@@ -374,7 +423,7 @@ def verify(state: CodingState) -> dict:
     details = []
     try:
         for name, expected in state["changes"].items():
-            actual = _file(str(root), name).read_text(encoding="utf-8")
+            actual = _read_text_sections(_file(str(root), name))
             if actual != expected:
                 raise ValueError(f"Written content mismatch: {name}")
             syntax = _validate_text_syntax(name, actual)
@@ -495,7 +544,7 @@ def _resume_state(workspace: str) -> tuple[dict, str]:
         expect_originals = next_stage in {"propose", "apply", "repair_proposal"}
         for name, original in originals.items():
             target = _file(str(root), name)
-            if not target.is_file() or (expect_originals and target.read_text(encoding="utf-8") != original):
+            if not target.is_file() or (expect_originals and _read_text_sections(target) != original):
                 raise ValueError(f"Checkpoint source no longer matches: {name}")
         for name in creating:
             target = _file(str(root), name)
@@ -504,7 +553,7 @@ def _resume_state(workspace: str) -> tuple[dict, str]:
         if next_stage == "verify":
             for name, expected in changes.items():
                 target = _file(str(root), name)
-                if not target.is_file() or target.read_text(encoding="utf-8") != expected:
+                if not target.is_file() or _read_text_sections(target) != expected:
                     raise ValueError(f"Checkpointed write no longer matches: {name}")
     _emit_event("recovery_started", run_id=run_id, stage=checkpoint["stage"], next_stage=next_stage)
     return state, next_stage

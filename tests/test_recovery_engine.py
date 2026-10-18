@@ -43,9 +43,9 @@ class RecoveryEngineTests(unittest.TestCase):
                                      "REAPER_RESUME": "1"}, clear=False), \
              patch.object(engine, "build_graph", side_effect=lambda stage: captured.setdefault("stage", stage) and Graph()):
             result = engine._original_run("ignored original task", str(self.directory))
+        self.assertEqual(result["status"], "completed", result)
         self.assertEqual(captured["stage"], "apply")
         self.assertEqual(captured["state"]["changes"]["module.py"], "value = 2\n")
-        self.assertEqual(result["status"], "completed")
 
 
 class FileSelectionRegressionTests(unittest.TestCase):
@@ -56,13 +56,17 @@ class FileSelectionRegressionTests(unittest.TestCase):
         (self.root / "pyproject.toml").write_text(
             "[project]\nname = 'sample'\nversion = '0.1.0'\n", encoding="utf-8"
         )
+        for name in ("engine.py", "api.py", "persistence.py"):
+            (self.root / name).write_text("value = 1\n", encoding="utf-8")
+        (self.root / "large.txt").write_text("x" * 20_001, encoding="utf-8")
+        (self.root / "image.bin").write_bytes(b"\0binary")
 
     def tearDown(self):
         for path in self.root.iterdir():
             path.unlink()
         self.root.rmdir()
 
-    def test_tracked_toml_is_selected_edited_and_empty_selection_is_explained(self):
+    def test_full_inventory_supports_large_text_and_safe_text_selection(self):
         state = {"workspace": str(self.root), "task": "Set version to 0.2.0", "inventory": [],
                  "selected": [], "creating": [], "originals": {}, "changes": {}, "status": "pending",
                  "error": "", "details": [], "corrections": 0, "feedback": ""}
@@ -71,7 +75,9 @@ class FileSelectionRegressionTests(unittest.TestCase):
             if args[:2] == ("rev-parse", "--show-toplevel"):
                 return subprocess.CompletedProcess(args, 0, str(root) + "\n", "")
             if args[:2] == ("ls-files", "--cached"):
-                return subprocess.CompletedProcess(args, 0, "module.py\npyproject.toml\n", "")
+                return subprocess.CompletedProcess(
+                    args, 0, "module.py\npyproject.toml\nengine.py\napi.py\npersistence.py\nlarge.txt\nimage.bin\n", ""
+                )
             if args[:3] == ("diff", "HEAD", "--quiet"):
                 return subprocess.CompletedProcess(args, 0, "", "")
             if args[:4] == ("--no-pager", "diff", "--no-ext-diff", "HEAD"):
@@ -80,7 +86,21 @@ class FileSelectionRegressionTests(unittest.TestCase):
 
         with patch.object(engine, "git", side_effect=fake_git):
             state.update(engine.inventory(state))
-            self.assertIn("pyproject.toml", [item["path"] for item in state["inventory"]])
+            entries = {item["path"]: item for item in state["inventory"]}
+            self.assertTrue({"engine.py", "api.py", "persistence.py", "pyproject.toml", "large.txt"} <= set(entries))
+            self.assertEqual(entries["large.txt"], {"path": "large.txt", "kind": "text", "bytes": 20_001})
+            self.assertEqual(entries["image.bin"]["kind"], "binary")
+            self.assertEqual(len(engine._read_text_sections(self.root / "large.txt")), 20_001)
+
+            with patch.object(engine, "ask_json", return_value={
+                "edit": ["module.py", "engine.py", "api.py", "persistence.py"], "create": []
+            }):
+                expanded = engine.select({**state, "status": "inventoried", "error": ""})
+            self.assertEqual(expanded["status"], "selected")
+
+            with patch.object(engine, "ask_json", return_value={"edit": ["image.bin"], "create": []}):
+                binary = engine.select({**state, "status": "inventoried", "error": ""})
+            self.assertEqual(binary["error"], "Binary files cannot be edited as UTF-8 text: image.bin")
 
             with patch.object(engine, "ask_json", return_value={"edit": ["pyproject.toml"], "create": []}):
                 state.update(engine.select(state))
@@ -98,7 +118,7 @@ class FileSelectionRegressionTests(unittest.TestCase):
 
             with patch.object(engine, "ask_json", return_value={"edit": [], "create": []}):
                 failed = engine.select({**state, "status": "inventoried", "error": ""})
-            self.assertEqual(failed["error"], "File selection must contain 1 to 3 paths (got 0)")
+            self.assertEqual(failed["error"], "File selection must contain 1 to 12 paths (got 0)")
 
             with patch.object(engine, "ask_json", return_value={"edit": ["unknown.toml"], "create": []}):
                 failed = engine.select({**state, "status": "inventoried", "error": ""})
