@@ -2,6 +2,7 @@
 
 from pathlib import Path
 import subprocess
+import os
 
 
 def _file(workspace: str, relative_path: str) -> Path:
