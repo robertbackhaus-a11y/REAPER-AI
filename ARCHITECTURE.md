@@ -1,0 +1,324 @@
+# REAPER-AI — Architecture
+
+**Status:** Greenfield target architecture (design, not implemented)  
+**Scope:** Local, single-user autonomous coding agent  
+**Language:** English for repository documentation; user interaction follows the user's language.
+
+## 1. Objective
+
+REAPER-AI is a locally operated engineering agent that can understand a software task, inspect a repository, propose and apply focused changes, execute appropriate checks, correct failures, and report verifiable results. A conversation is its interface; a controlled execution workflow is its core.
+
+The former REAPER-AI v0.x implementation is **not** an architectural baseline. This document describes a new system, not a migration or a retrofit. Experience from the previous implementation informs constraints, but does not require code reuse.
+
+### Design principles
+
+- **Evidence over claims.** A model's statement is not proof that a file changed or a check passed.
+- **Deterministic control, model-driven engineering.** Python determines allowed transitions, limits, and evidence collection; the model performs technical reasoning and proposes actions.
+- **Local and single-user.** No accounts, tenants, role management, cloud orchestration, or enterprise platform layers.
+- **Small, bounded work.** Focused repository inspection, limited execution attempts, and targeted verification rather than repeated full scans.
+- **Explicit failure.** A task that cannot be completed must finish with a precise explanation rather than a fabricated success.
+- **Minimal dependencies and clear boundaries.** Prefer mature libraries where they replace real infrastructure work; do not recreate an agent framework.
+- **No implicit publishing.** No automatic commits, pushes, tags, releases, deployments, or destructive repository operations.
+
+## 2. Architecture decisions
+
+| Area | Decision | Rationale |
+|---|---|---|
+| Workflow orchestration | **LangGraph (Python library)** | Explicit state, nodes, routing, bounded retries; no homegrown free-running tool loop |
+| Local inference | **Ollama** | Local model hosting, selectable models, tool-capable API |
+| Core application | **Python** | Direct integration of graphs, tools, Git, subprocesses |
+| User interface | **Custom lightweight browser UI (HTML/CSS/JavaScript)** | Full control, minimal dependencies; Chainlit is not used |
+| API/server | **FastAPI, embedded local HTTP/SSE service** | Serve the custom UI and expose sessions, runs, projects, cancellation, and structured events |
+| Long-term knowledge | **Basic Memory candidate, optional** | Store durable decisions, not transient execution state |
+| Source-of-truth | **Repository and tool results** | Current files, Git state, exit codes, and test results outrank memory |
+| Persistent execution | **Lightweight local state/checkpointing, if needed** | Resume safely without introducing new services; implementation selected later |
+| Git safety | **Never commit/push automatically** | Changes remain reviewable and under user control |
+
+LangGraph is already installed in the local development environment and is used **as an embedded Python library**, not as a hosted LangGraph server/platform. The custom UI is served locally through FastAPI; **Chainlit is excluded**. No LangSmith or other cloud dependency is required.
+
+## 3. Logical system
+
+```text
+                        User
+                         |
+           Lightweight browser interface
+               (HTML / CSS / JS)
+                         |
+                Local FastAPI / SSE
+           (sessions, models, projects,
+             run control, live events)
+                         |
+              REAPER Execution Engine
+                 (LangGraph state)
+                         |
+       +-----------------+-----------------+
+       |                 |                 |
+   Task analysis     Implementation    Verification
+       |                 |                 |
+       +---------- Execution policy ------+
+                         |
+             Structured tool adapters
+          +--------------+--------------+
+          |              |              |
+      Repository      PowerShell      Git / checks
+        files         subprocess       and diffs
+                         |
+               Local project workspace
+
+      Ollama: model inference for graph nodes
+      Optional Basic Memory: durable knowledge only
+      Local run store: conversation metadata, events, results
+```
+
+These are **logical responsibilities**, not separate network services or separate LLM agents. One local Python application may contain them all. The executor may run in a child process for cancellation and containment; that does not imply a distributed system.
+
+## 4. Core execution contract
+
+A **run** is one bounded attempt to satisfy one user request against a specific project/workspace. Conversation turns and runs are distinct: a chat can contain several runs, but one run has its own immutable initial objective and execution state.
+
+### Input
+
+- User request, including explicit constraints.
+- Project identity and **absolute repository/workspace path**.
+- Selected local model and bounded inference parameters.
+- Optional relevant conversation context, structured as prior user decisions and verified run results.
+- Execution policy (permissions, time limits, iteration limits, protected paths).
+
+### Output
+
+The engine returns a structured `RunResult` independently of model-generated prose:
+
+```text
+RunResult
+  status: completed | partial | failed | cancelled | timed_out
+  objective: string
+  summary: string
+  changed_files: list[path]
+  diff_summary: string
+  checks: list[{name, command, exit_code, outcome, output_excerpt}]
+  evidence: list[reference]
+  unresolved: list[string]
+  usage: {model_calls, input_tokens, output_tokens, elapsed_seconds}
+```
+
+`completed` means the requested action was performed and the defined verification gates passed. It does **not** promise formal correctness. `partial` is explicit when some deliverables are missing. `failed` and other terminal statuses may not be described as success in subsequent conversation context.
+
+For a **read-only** request, no code change is required; evidence is the inspected source/output. For a coding request, observable changes and appropriate checks are required unless the correct conclusion is that no change is needed, which must be explicitly evidenced.
+
+## 5. LangGraph execution model
+
+### Graph state
+
+Use a compact typed state, not the entire conversation transcript as the primary workspace:
+
+```text
+ExecutionState
+  run_id
+  objective
+  task_kind: coding | analysis | investigation | other
+  project_root
+  constraints
+  phase
+  findings: bounded list of sourced observations
+  plan: small list of concrete next actions
+  files_in_scope: list[path]
+  baseline: repository-state fingerprint
+  change_evidence: actual Git/file observations
+  checks: recorded tool execution results
+  errors: bounded list
+  attempts: counters per phase
+  messages: bounded LLM interaction context
+  result: RunResult (when terminal)
+```
+
+The model can propose findings, a plan, and tool requests; the **engine owns counters, tool results, file-change evidence, permissions, and terminal status**. Do not ask the model to fabricate engine-owned fields.
+
+### Proposed nodes
+
+1. **Classify / prepare:** Identify task type, bind project root, capture repository baseline, apply safety constraints.
+2. **Inspect / plan:** Read the minimum relevant material and produce a concrete next action. A simple task can bypass extensive planning.
+3. **Execute:** Apply a focused edit or run a relevant technical operation through tools.
+4. **Verify:** Collect actual diff/check evidence, run task-appropriate checks, and compare outcomes with the objective.
+5. **Repair (conditional):** Feed concrete verification failures back into focused execution, with a small retry budget.
+6. **Finalize:** Produce `RunResult` from state and evidence; persist a concise, accurately labeled result.
+
+Routing is conditional rather than a rigid mandatory chain:
+
+```text
+START -> prepare -> inspect/plan
+                       |
+           +-----------+-------------+
+           |                         |
+      read-only task              coding task
+           |                         |
+      verify sources              execute
+           |                         |
+           |                       verify
+           |                         |
+           |             failed and retry budget?
+           |                  yes -> repair -> verify
+           |                  no  -> finalize
+           +------------------------> finalize -> END
+```
+
+A task may finish early if it is already satisfied or cannot be safely performed. The graph must not force meaningless file edits.
+
+### Progress and budgets
+
+- Bound **model calls**, execution time, tool output size, and repeated nonproductive inspection.
+- Track **meaningful progress** separately from tool-call count: scoped findings, a concrete implementation action, actual file changes, and recorded checks.
+- Before spending more inference on inspection, request a compact next-action decision; if nothing new emerges, return an evidence-based failure rather than loop.
+- Preserve small, source-linked findings across model-context compaction. Re-read a file only for a specific missing fact or changed version.
+- Repair attempts must be limited. A verification failure never silently converts into success.
+
+Budgets are configuration values, not hardwired assumptions that every task needs the same number of steps. They will be tuned against real tasks.
+
+## 6. Model roles and delegation
+
+**Begin with one capable engineering model and deterministic graph nodes.** Do not assume the old Main/Worker split is necessary.
+
+Optional specialist workers may later be introduced when a task is genuinely separable, e.g. repository search, independent diagnostics, or a narrowly scoped implementation. Every delegated task must have:
+
+- An explicit objective, allowed paths/tools, and bounded resource budget.
+- Its own context rather than access to all chat history.
+- Structured results, evidence and failure status—not only a narrative summary.
+- A clear ownership rule for file modifications; avoid concurrent editing of the same working tree without isolation.
+
+Workers are a capability to add after the single-agent execution path works, not an initial requirement. Different model sizes are an optimization, not an architecture principle.
+
+## 7. Tool layer
+
+Tools are narrow Python adapters returning **structured results**. A shell remains available for operations that cannot be expressed as a focused tool, but should not be the sole file-inspection or Git interface.
+
+### Initial tools
+
+| Tool | Responsibility | Evidence |
+|---|---|---|
+| `list_files` / `search_code` / `read_file` | Focused repository discovery and bounded file excerpts | Paths, line ranges, source versions |
+| `apply_edit` | Narrow edits with file/version preconditions | Changed paths and edit outcome |
+| `git_status` / `git_diff` | Compare repository state with captured baseline | Machine-observed changes |
+| `run_command` | PowerShell or child process execution with cwd/timeout/output cap | Command, exit code, captured output |
+| `run_checks` | Targeted syntax/build/test commands | Exact commands, exit codes, results |
+
+Tools must validate their working directory and report failures explicitly. An output-truncation flag is never interpreted as a complete source read. Tool implementations—not the LLM—record actual invocation data.
+
+### Safety and change policy
+
+- Operate only on explicitly selected project/workspace unless the user authorizes another path.
+- Preserve pre-existing dirty changes; capture baseline before the run. Do not confuse existing modifications with this run's work.
+- Default to no Git commit, push, tag, release, deployment, package installation, or destructive deletion.
+- Require explicit approval for irreversible or high-impact actions.
+- Make cancellation terminate the entire process tree, including shell children; use suitable Windows process containment where required.
+- A dedicated project working directory is distinct from persistent application data.
+
+## 8. Verification and truthful completion
+
+Verification is a separate engine responsibility, not a model self-assessment.
+
+For coding tasks, capture the pre-run baseline and post-run repository state, including relevant untracked files. Record the actual diff and every check executed. Success requires the expected artifact/change (or justified no-op) plus reasonable task-specific verification. A successful syntax check is not equivalent to satisfying functional requirements.
+
+The engine must distinguish:
+
+- **Observed:** file exists, tracked/untracked changes, command returned code 0, test output recorded.
+- **Inferred:** model assessment that a change meets a requirement.
+- **Unknown:** behavior not tested or evidence unavailable.
+
+Where semantic correctness cannot be established automatically, report that limitation in `unresolved`. Do not declare `Risks: none` merely because the model wrote it.
+
+## 9. Conversation, execution, and memory
+
+Three separate scopes:
+
+| Scope | Contains | Authority |
+|---|---|---|
+| Conversation | User requests, preferences, decisions, short verified result summaries | User intent and interaction history |
+| Execution state | Current plan, progress, tools, changes, checks, graph checkpoints | Authority for this run's actual progress |
+| Long-term memory | Durable facts, decisions, known constraints, lessons | Advisory; may be stale |
+
+Memory retrieval is **on demand**. Repository and environment facts must be rechecked when correctness depends on their current state. Memory writes occur only for useful durable findings and must identify unsuccessful/partial outcomes accurately. The agent must not write that an implementation succeeded before verification.
+
+Conversation history should not be reconstructed by concatenating model-generated success claims. Store status and evidence references separately, and supply only the relevant context to new runs.
+
+## 10. UI, API, and streaming
+
+### Selected frontend: lightweight custom browser UI
+
+Build and maintain a small **local HTML/CSS/JavaScript interface** served by FastAPI. No Chainlit, separate frontend server, SPA framework, npm toolchain, or hosted service is required. The interface must support:
+
+- Local single-user operation, no mandatory hosted services.
+- Chat with session history and selectable Ollama model.
+- Project/repository selection and visible active workspace.
+- Streaming of current phase, tool activity, verification results, and final status.
+- Cancellation that actually stops child processes.
+- Readable diffs and evidence links.
+- Low maintenance overhead and straightforward installation.
+
+The UI must consume **structured engine events**, not parse human-readable stderr messages:
+
+```text
+run_started
+phase_changed
+model_activity
+ tool_started / tool_completed
+files_changed
+verification_completed
+run_completed
+```
+
+Event payloads include `run_id`, timestamps, status, and applicable evidence identifiers. FastAPI exposes a small HTTP API for commands and SSE for one-way live run events. The browser renders these events without scraping logs. Engine logic remains independent of the frontend.
+
+## 11. Persistence and recovery
+
+- Keep application data separate from source code and project repositories.
+- Persist conversations, completed run results, and bounded execution events locally.
+- Prefer LangGraph's compatible local checkpointing when pause/resume is required; avoid a second custom checkpointing mechanism.
+- Never automatically resume a run that may have partially executed non-idempotent shell commands without checking what already happened.
+- Do not adopt the previous JSONL storage model by default; select a simple local format once UI and recovery requirements are clear.
+- Retain compact diagnostics for token use, tool errors, execution time, and abort reason. Avoid recording secrets or unlimited command output.
+
+## 12. Operational boundaries
+
+- Windows 11 is the primary target.
+- Single local user and local Ollama models; no cloud LLM dependency.
+- Project repositories can be outside the application directory.
+- Clearly distinguish **application installation**, **application data**, and **user project workspace**.
+- Installation and dependency versions should be reproducible; avoid copying LangGraph source into REAPER-AI.
+- The application must still handle Ollama unavailability, tool timeout, cancellation, full model context, and malformed model tool calls as explicit failures.
+
+## 13. Scope boundaries
+
+**Included in the initial architecture:** one reliable execution path for coding and analysis, structured state and evidence, Git/file/command tools, bounded verification/repair, local Ollama, a minimal operator interface, and truthful results.
+
+**Not initially required:** parallel agents, autonomous background schedules, multi-user access, enterprise permissions, remote workers, distributed execution, plugin marketplace, cloud observability, vector infrastructure, or an elaborate project management system.
+
+Potential future capabilities are evaluated only after the core can complete representative coding tasks reliably.
+
+## 14. Open architecture decisions
+
+The following items are intentionally **not settled** by this document:
+
+1. **Inference adapter:** direct Ollama client or LangChain-compatible adapter, based on reliable tool-call behavior with the selected models.
+2. **Local persistence:** exact schema and backend for conversations and LangGraph checkpoints, based on resume requirements.
+3. **Execution isolation:** whether the graph runs in the UI process or a managed local child process; reliable cancellation and Windows subprocess containment are mandatory either way.
+4. **File editing implementation:** patch-based edit tool and precondition strategy to prevent accidental overwrites.
+5. **Verification policy:** task-specific minimum checks and success criteria, without a heavyweight universal test pipeline.
+6. **Memory:** whether Basic Memory demonstrably helps enough to justify its initial integration; no memory-first requirement.
+
+These decisions must be resolved before production implementation; they do not block agreement on the execution architecture.
+
+## 15. Acceptance criteria for the architecture
+
+The architecture is viable only if a prototype can demonstrate all of the following with real local models and repositories:
+
+1. A focused coding request produces a real, attributable diff and task-appropriate verification.
+2. A model cannot claim implementation success without observable evidence.
+3. Nonproductive inspection is bounded and ends with a meaningful status, not uncontrolled token consumption.
+4. Read-only analysis completes correctly without forced edits.
+5. A failed check triggers a bounded correction attempt or an explicit failure.
+6. Existing user modifications are protected and never silently counted as new work.
+7. Cancellation stops the executing process tree; subsequent runs start cleanly.
+8. User-visible progress reflects engine events, not speculative model statements.
+
+---
+
+**Architectural direction:** Build REAPER-AI from scratch around embedded **LangGraph + local Ollama + evidence-producing tools**. The custom lightweight UI and local FastAPI/SSE boundary are selected; choose the persistence implementation after validating the execution contract. Do not recreate the v0.x free-running stage runner.

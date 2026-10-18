@@ -1,0 +1,17 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "reaper-ai"
+version = "0.1.0"
+description = "Local autonomous coding agent powered by LangGraph and Ollama"
+requires-python = ">=3.12"
+license = "MIT"
+dependencies = [
+    "langgraph>=1.2,<2",
+    "httpx>=0.28,<1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/reaper_ai"]
