@@ -1,6 +1,6 @@
 # REAPER-AI — Development Roadmap
 
-**Status:** Planned — greenfield implementation  
+**Status:** Implementation in progress — M0/M1 working baseline, M2 qualified acceptance; M3 next  
 **Architecture baseline:** [ARCHITECTURE.md](ARCHITECTURE.md) (approved)  
 **Target:** Windows 11, local single-user autonomous coding agent  
 **Technology decisions:** Python, embedded LangGraph, Ollama, FastAPI, SSE, custom HTML/CSS/vanilla JavaScript UI  
@@ -28,10 +28,10 @@ This is a new implementation. The former REAPER-AI runner, Main/Worker architect
 
 | Milestone | Outcome | Main deliverable |
 |---|---|---|
-| M0 — Foundation | Reproducible local Python project | Installable minimal project skeleton |
-| M1 — Engine proof | Real coding task through LangGraph | CLI-only inspect → edit → verify flow |
-| M2 — Reliability | Bounded, truthful, cancellable runs | Evidence, repair, safety, process containment |
-| M3 — Local application | Run execution accessible through an API | FastAPI, projects, models, structured events |
+| M0 — Foundation | Implemented working baseline; original individual acceptance items not all audited | Installable minimal project skeleton |
+| M1 — Engine proof | Implemented; coding E2E evidence recorded | CLI-only inspect → edit → verify flow |
+| M2 — Reliability | Qualified acceptance; verified coding function and synthetic process-tree timeout; limitations below | Evidence, repair, safety, process containment |
+| M3 — Local application | **Next / not started** | FastAPI, projects, models, structured events |
 | M4 — User interface | Usable lightweight local application | Vanilla JS chat and run-progress UI |
 | M5 — Persistence | Usable conversations and run history | Local store, result retrieval, safe recovery |
 | M6 — Release candidate | Verified end-to-end REAPER-AI | Documentation, installation, real-world acceptance |
@@ -130,6 +130,17 @@ The initial deliverable is **one dependable agent**. Multi-agent delegation and 
 - Preserve evidence from interrupted runs; never replay potentially non-idempotent commands automatically.
 
 **Gate M2:** real and synthetic targeted trials cover successful edit, false success, failure/repair, read-only run, pre-existing dirty changes, timeout and cancellation.
+
+<!-- M2 IMPLEMENTATION STATUS (2026-10-18) -->
+#### Implementation checkpoint — 2026-10-18
+
+- **M0 working baseline:** Python virtual environment/package, embedded LangGraph import and local Ollama connection established. Do not imply every original F01/F02 completion criterion was separately checked.
+- **M1 working baseline:** CLI engine can inspect/select, propose/apply changes in a disposable Git repository and report syntax/Git evidence. The first two-file exercise updated `calculator.py` and created `service.py`.
+- **M2 implemented:** R01 call/time budgets and usage, R02 structured outcomes/check evidence, R03 bounded repair logic, R04 Windows Job Object supervisor with timeout backstop. This is an implementation inventory, not proof that every branch works.
+- **Verified:** `multiply(6, 7) == 42` and `multiply_numbers(6, 7) == 42` with live Python imports (`FUNCTIONAL: OK`). R04 synthetic three-second timeout terminated parent and child (`R04: PASS`, exit 2). Dirty working-tree protection yielded an explicit failure instead of overwriting modified files.
+- **Installed, not verified:** Run provenance (`run_id`, Git HEAD baseline, pre/post Git status) was patched into the engine; no subsequent run has demonstrated those fields.
+- **Not fully covered:** False-success rejection, all repair/failure variants, real user cancellation, interruption diagnostics, resumed runs and complete original M2 gate scenario matrix. They remain acceptance concerns for M3/M6 where relevant. **Do not rerun the successful coding exercise just to increase test counts.**
+- **Next:** M3 A01 — a minimal local FastAPI layer around the already implemented engine/supervisor. Add project and model discovery/events in A02/A03; no frontend framework, auto-commit or new orchestration stack.
 
 ### M3 — Local API and project binding
 
@@ -243,4 +254,4 @@ Promote an item only after a real use case justifies it, with an explicit new wo
 - Keep documentation consistent, but **write the README after this roadmap is approved**, as agreed.
 - Never perform Git commit/push/release automatically.
 
-**Next step:** review and approve this ROADMAP. Only then begin F01 and draft the README in the agreed sequence.
+**Next step:** implement M3/A01 as a minimal local FastAPI API for runs, using the existing engine/supervisor. M2 limitations above remain explicitly open. No automatic Git commit or push.

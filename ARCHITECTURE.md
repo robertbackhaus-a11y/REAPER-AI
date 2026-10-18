@@ -1,6 +1,6 @@
 # REAPER-AI — Architecture
 
-**Status:** Greenfield target architecture (design, not implemented)  
+**Status:** Implementation in progress — CLI engine and M2 reliability baseline implemented; M3 API/UI not yet implemented  
 **Scope:** Local, single-user autonomous coding agent  
 **Language:** English for repository documentation; user interaction follows the user's language.
 
@@ -71,6 +71,17 @@ LangGraph is already installed in the local development environment and is used 
 ```
 
 These are **logical responsibilities**, not separate network services or separate LLM agents. One local Python application may contain them all. The executor may run in a child process for cancellation and containment; that does not imply a distributed system.
+
+<!-- M2 IMPLEMENTATION STATUS (2026-10-18) -->
+### Implementation checkpoint — M0 to M2 (2026-10-18)
+
+- **M0:** Local Python package with embedded LangGraph and Ollama connectivity established; CLI entry point available. This does not certify every originally proposed F01/F02 deliverable.
+- **M1:** CLI coding path in `src/reaper_ai/engine.py` with focused repository/file/Git tools in `tools.py`. A disposable-repository, two-file coding task completed with recorded syntax/Git evidence.
+- **M2:** Bounded model calls/wall time, structured `RUN_RESULT`, limited correction handling and a separate Windows supervisor in `src/reaper_ai/supervisor.py` are implemented. The tested coding result (`multiply` and `multiply_numbers`) passed a real Python import/call assertion: `FUNCTIONAL: OK`.
+- **R04 evidence:** Synthetic timeout after three seconds returned supervisor exit 2 and verified termination of both parent and child processes (`R04: PASS`). This proves the tested timeout path, **not** every cancellation or interruption case.
+- **Run provenance:** A patch adding `run_id`, Git baseline and before/after status metadata was installed. Its emitted fields and semantics **have not been runtime-verified**.
+- **Unverified/deferred:** Exhaustive R01–R03 edge-case behavior, general functional correctness, resumed runs, user-driven cancellation, and all planned API/UI/persistence features. Existing dirty files remain protected; no automatic adoption/rollback of pre-existing changes is implied.
+- **Observed result vocabulary:** The current engine has emitted `failed` and more specific verification levels/statuses; it must not be described as fully implementing the idealized `RunResult` contract below until checked against actual code. The architecture below remains the target where not specifically evidenced.
 
 ## 4. Core execution contract
 
@@ -299,7 +310,7 @@ The following items are intentionally **not settled** by this document:
 
 1. **Inference adapter:** direct Ollama client or LangChain-compatible adapter, based on reliable tool-call behavior with the selected models.
 2. **Local persistence:** exact schema and backend for conversations and LangGraph checkpoints, based on resume requirements.
-3. **Execution isolation:** whether the graph runs in the UI process or a managed local child process; reliable cancellation and Windows subprocess containment are mandatory either way.
+3. **Execution isolation:** CLI engine runs under a managed Windows child-process supervisor; synthetic timeout and full process-tree termination have been verified. API-driven cancellation and abnormal-exit paths remain to be integrated and checked in M3.
 4. **File editing implementation:** patch-based edit tool and precondition strategy to prevent accidental overwrites.
 5. **Verification policy:** task-specific minimum checks and success criteria, without a heavyweight universal test pipeline.
 6. **Memory:** whether Basic Memory demonstrably helps enough to justify its initial integration; no memory-first requirement.
