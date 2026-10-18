@@ -1,6 +1,25 @@
+## Installation (Windows)
+
+Requirements: Windows 11, Python 3.12+, Git and Ollama.
+
+```powershell
+git clone https://github.com/robertbackhaus-a11y/REAPER-AI.git
+cd REAPER-AI
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install .
+ollama pull qwen3.6:35b
+.\.venv\Scripts\python.exe -m uvicorn reaper_ai.api:app --host 127.0.0.1 --port 8000
+```
+
+Open http://127.0.0.1:8000/ in your browser.
+
+For development, use `pip install -e .` instead of `pip install .` to install the project in editable mode.
+
+REAPER-AI runs locally and does not commit or push changes automatically.
+
 # REAPER-AI — Architecture
 
-**Status:** Implementation in progress — M0–M3 implemented with documented acceptance limits; M4 UI next  
+**Status:** M0–M4 and M5/P01 implemented with documented acceptance limits; P02 recovery and P03 memory remain separate decisions.
 **Scope:** Local, single-user autonomous coding agent  
 **Language:** English for repository documentation; user interaction follows the user's language.
 
@@ -31,7 +50,8 @@ The former REAPER-AI v0.x implementation is **not** an architectural baseline. T
 | API/server | **FastAPI, embedded local HTTP/SSE service** | Serve the custom UI and expose sessions, runs, projects, cancellation, and structured events |
 | Long-term knowledge | **Basic Memory candidate, optional** | Store durable decisions, not transient execution state |
 | Source-of-truth | **Repository and tool results** | Current files, Git state, exit codes, and test results outrank memory |
-| Persistent execution | **Lightweight local state/checkpointing, if needed** | Resume safely without introducing new services; implementation selected later |
+| Conversation/run history | **SQLite via Python stdlib** | One local file, no ORM or server; records conversations, runs, results, and bounded structured events |
+| Persistent execution | **Deferred to P02** | No checkpoint/resume mechanism is introduced by the history store |
 | Git safety | **Never commit/push automatically** | Changes remain reviewable and under user control |
 
 LangGraph is already installed in the local development environment and is used **as an embedded Python library**, not as a hosted LangGraph server/platform. The custom UI is served locally through FastAPI; **Chainlit is excluded**. No LangSmith or other cloud dependency is required.
@@ -290,12 +310,13 @@ Event payloads include `run_id`, timestamps, status, and applicable evidence ide
 
 ## 11. Persistence and recovery
 
-- Keep application data separate from source code and project repositories.
-- Persist conversations, completed run results, and bounded execution events locally.
-- Prefer LangGraph's compatible local checkpointing when pause/resume is required; avoid a second custom checkpointing mechanism.
-- Never automatically resume a run that may have partially executed non-idempotent shell commands without checking what already happened.
-- Do not adopt the previous JSONL storage model by default; select a simple local format once UI and recovery requirements are clear.
-- Retain compact diagnostics for token use, tool errors, execution time, and abort reason. Avoid recording secrets or unlimited command output.
+M5/P01 uses a small SQLite database through `reaper_ai.persistence.Store`. The default path is `%LOCALAPPDATA%\REAPER-AI\reaper-ai.sqlite3`; `REAPER_DATA_DIR` can select a different parent directory. It is application data, never a target workspace or repository artifact.
+
+The schema keeps conversations and messages separate from run records. A run links to its selected conversation and stores workspace, model, task, timeout, status, start/finish metadata, exit code, and structured terminal result. At run completion the API records machine-readable engine events (each limited to 32 KB) and corresponding stage-result rows. It also writes a compact factual terminal message based on status/check/file evidence, rather than model success prose. The UI and local API can load this history after restart.
+
+SQLite failures before a run starts reject the request clearly; a post-run history-write failure is exposed on the live run as `storage_error` without replacing the observed engine outcome. Raw supervisor logs are transient and are not promoted to an unbounded database archive.
+
+For a follow-up in the selected conversation, the API supplies a bounded context made only from prior user requests and structured, observed run metadata; stored assistant/model prose is excluded and repository facts must still be rechecked. This is **not** checkpointing or recovery: P01 never resumes a process or replays commands after restart. P02 must decide whether LangGraph-compatible checkpoints are needed and document interrupted-run semantics. P03 remains the separate decision about durable memory beyond the active conversation.
 
 ## 12. Operational boundaries
 
@@ -319,7 +340,7 @@ Potential future capabilities are evaluated only after the core can complete rep
 The following items are intentionally **not settled** by this document:
 
 1. **Inference adapter:** direct Ollama client or LangChain-compatible adapter, based on reliable tool-call behavior with the selected models.
-2. **Local persistence:** exact schema and backend for conversations and LangGraph checkpoints, based on resume requirements.
+2. **Checkpointing/recovery:** whether P02 needs LangGraph-compatible checkpoints and which interrupted-run semantics are safe.
 3. **Execution isolation:** CLI engine runs under a managed Windows child-process supervisor; synthetic timeout and full process-tree termination have been verified. API-driven cancellation and abnormal-exit paths remain to be integrated and checked in M3.
 4. **File editing implementation:** patch-based edit tool and precondition strategy to prevent accidental overwrites.
 5. **Verification policy:** task-specific minimum checks and success criteria, without a heavyweight universal test pipeline.
@@ -344,7 +365,7 @@ The architecture is viable only if a prototype can demonstrate all of the follow
 
 **Architectural direction:** Build REAPER-AI from scratch around embedded **LangGraph + local Ollama + evidence-producing tools**. The custom lightweight UI and local FastAPI/SSE boundary are selected; choose the persistence implementation after validating the execution contract. Do not recreate the v0.x free-running stage runner.
 
-## Implementation status — M4
+## Implementation status — M4 and M5/P01
 
 The lightweight browser UI is implemented with HTML, CSS and vanilla JavaScript, served locally by FastAPI.
 
@@ -358,5 +379,7 @@ Limitations:
 - Structural verification does not establish functional correctness.
 - The displayed Git diff reflects the current workspace, not an immutable run snapshot.
 - Browser cancellation and reconnection have not been separately verified.
-- Persistent sessions, run history and recovery remain M5 scope.
+- Persistent sessions and completed run history are implemented in SQLite (M5/P01); recovery remains P02 scope.
 - Run-result presentation and public run-ID consistency require refinement.
+
+M5/P01 verification is covered by focused storage/API tests for conversation/message/run association, persisted stage results/events, and lookup after a fresh in-memory API registry. No real checkpoint/restart-resume claim is made.

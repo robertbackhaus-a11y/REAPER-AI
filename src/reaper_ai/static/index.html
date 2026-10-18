@@ -11,6 +11,7 @@
   <div class="layout">
     <aside class="sidebar">
       <div class="brand"><span class="brand-icon">R</span><div><strong>REAPER-AI</strong><small>Local engineering agent</small></div></div>
+      <div class="field"><label for="conversation">Gespräch</label><div class="path-row"><select id="conversation"><option value="">Neues Gespräch</option></select><button id="new-conversation" class="secondary" title="Neues Gespräch">＋</button></div><small id="conversation-status" class="muted">Verlauf wird geladen …</small></div>
       <div class="field"><label for="workspace">Git-Workspace (absoluter Pfad)</label><div class="path-row"><input id="workspace" spellcheck="false" placeholder="C:\\tools\\src\\my-project"><button id="validate" class="secondary">Prüfen</button></div><small id="project-status" class="muted">Noch nicht geprüft</small></div>
       <div class="field"><label for="model">Ollama-Modell</label><div class="path-row"><select id="model"><option>Modelle laden …</option></select><button id="reload" class="secondary" title="Modelle neu laden">↻</button></div></div>
       <div class="field"><label for="timeout">Zeitlimit (Sekunden)</label><input id="timeout" type="number" value="660" min="1" max="3600"></div>

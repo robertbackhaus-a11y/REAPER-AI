@@ -1,6 +1,6 @@
 # REAPER-AI — Development Roadmap
 
-**Status:** Implementation in progress — M0–M3 completed with documented limitations; M4 next  
+**Status:** M0–M4 and M5/P01 implemented with documented limitations; P02 and P03 remain separate work packages.
 **Architecture baseline:** [ARCHITECTURE.md](ARCHITECTURE.md) (approved)  
 **Target:** Windows 11, local single-user autonomous coding agent  
 **Technology decisions:** Python, embedded LangGraph, Ollama, FastAPI, SSE, custom HTML/CSS/vanilla JavaScript UI  
@@ -204,6 +204,14 @@ The initial deliverable is **one dependable agent**. Multi-agent delegation and 
 - Feed subsequent turns only relevant user decisions and verified prior results—not raw model success claims.
 
 **Done when:** restarting the app preserves completed conversations/results without misleading follow-up context.
+
+#### P01 implementation and acceptance checkpoint — 2026-10-18
+
+- **Storage:** implemented a single local SQLite file using Python's standard library; no ORM, server, or background service. The default location is `%LOCALAPPDATA%\REAPER-AI\reaper-ai.sqlite3`, with `REAPER_DATA_DIR` as an explicit parent-directory override. Database files are ignored by Git.
+- **Records:** conversations, user/terminal-result messages, runs, bounded structured engine events, and corresponding stage-result records are stored separately and linked by IDs. Run records retain workspace, model, task, timeout, status, timestamps, exit code, and structured result.
+- **Retrieval:** the API exposes conversation history and reloads completed runs from SQLite when the in-memory registry is empty. The browser offers a conversation selector and renders stored messages after restart. A follow-up receives only bounded user-request and observed-result context; raw model success claims are not used as context.
+- **Errors/boundaries:** pre-run database failures are explicit API errors; a post-run history failure does not overwrite the engine's actual terminal status. Raw logs remain temporary, individual persisted event payloads are capped, and P01 does not resume or replay interrupted runs.
+- **Focused verification:** persistence/API tests cover storage, reload with a new store instance, conversation/run association, stage results, and retrieval after clearing the API's memory registry.
 
 **P02 — Optional checkpoints and safe recovery**
 

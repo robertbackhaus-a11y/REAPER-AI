@@ -1,8 +1,4 @@
-"""M3/A01: minimal, local-only, single-user run API.
-
-In-memory run metadata only (M5 handles persistence). No SSE (A03).
-One active run, no publication, and no implicit retries.
-"""
+"""Local, single-user run API with SQLite conversation and run history."""
 
 import json
 import asyncio
@@ -20,12 +16,15 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from reaper_ai.persistence import StorageError, Store
+
 app = FastAPI(title="REAPER-AI", version="0.1.0")
 _lock = threading.Lock()
 _runs: dict[str, dict] = {}
 _active: str | None = None
 _procs: dict[str, subprocess.Popen] = {}
 _MAX_LOG = 128_000
+_store = Store()
 
 
 def _utc() -> str:
@@ -37,10 +36,65 @@ class StartRequest(BaseModel):
     task: str = Field(min_length=1, max_length=20_000)
     timeout: int = Field(default=660, ge=1, le=3600)
     model: str | None = Field(default=None, min_length=1, max_length=200)
+    conversation_id: str | None = Field(default=None, min_length=1, max_length=64)
 
 
 def _public(entry: dict) -> dict:
     return {k: v for k, v in entry.items() if k not in {"log_path"}}
+
+
+def _storage_failure(exc: StorageError) -> HTTPException:
+    return HTTPException(status_code=503, detail=f"Local persistence unavailable: {exc}")
+
+
+def _entry(run_id: str) -> dict:
+    """Find a live entry first, then the persisted history after a restart."""
+    with _lock:
+        entry = _runs.get(run_id)
+        if entry is not None:
+            return entry
+    try:
+        stored = _store.get_run(run_id)
+    except StorageError as exc:
+        raise _storage_failure(exc) from exc
+    if stored is None:
+        raise HTTPException(status_code=404, detail="Unknown run")
+    return stored
+
+
+def _terminal_summary(run_id: str, status: str, result: dict | None) -> str:
+    """A compact, observed-only chat record; raw model prose is not saved here."""
+    changed = result.get("changed_files", []) if isinstance(result, dict) else []
+    checks = result.get("checks", []) if isinstance(result, dict) else []
+    reason = result.get("reason") if isinstance(result, dict) else None
+    parts = [f"Run {run_id} finished with status: {status}."]
+    if changed:
+        parts.append("Recorded changed files: " + ", ".join(str(path) for path in changed[:20]) + ".")
+    if checks:
+        parts.append(f"Recorded checks: {len(checks)}.")
+    if reason:
+        parts.append("Reason: " + str(reason)[:500])
+    return " ".join(parts)
+
+
+def _persist_events(run_id: str, log_path: str) -> None:
+    """Persist structured engine events once, after the supervisor has finished."""
+    try:
+        lines = Path(log_path).read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return
+    sequence = 0
+    for line in lines:
+        if not line.startswith("REAPER_EVENT:"):
+            continue
+        try:
+            event = json.loads(line[len("REAPER_EVENT:"):].strip())
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(event, dict) or not isinstance(event.get("type"), str):
+            continue
+        sequence += 1
+        _store.record_event(run_id, sequence, event)
 
 
 def _watch(run_id: str, proc: subprocess.Popen) -> None:
@@ -68,6 +122,19 @@ def _watch(run_id: str, proc: subprocess.Popen) -> None:
         if _active == run_id:
             _active = None
         _procs.pop(run_id, None)
+        try:
+            _store.complete_run(run_id, status=entry["status"], finished_at=entry["finished_at"],
+                                exit_code=code, result=result)
+            _persist_events(run_id, entry["log_path"])
+            if entry.get("conversation_id"):
+                _store.add_message(
+                    entry["conversation_id"], role="assistant",
+                    content=_terminal_summary(run_id, entry["status"], result), run_id=run_id,
+                    metadata={"status": entry["status"], "result": result},
+                )
+        except StorageError as exc:
+            # The engine outcome remains authoritative even if its history cannot be saved.
+            entry["storage_error"] = str(exc)
 
 
 @app.get("/health")
@@ -127,6 +194,39 @@ def validate_project(request: ProjectRequest):
     return {"workspace": str(root), "valid": True}
 
 
+class ConversationRequest(BaseModel):
+    workspace: str | None = Field(default=None, max_length=10_000)
+    model: str | None = Field(default=None, max_length=200)
+    title: str | None = Field(default=None, max_length=200)
+
+
+@app.get("/conversations")
+def list_conversations():
+    try:
+        return {"conversations": _store.list_conversations()}
+    except StorageError as exc:
+        raise _storage_failure(exc) from exc
+
+
+@app.post("/conversations", status_code=201)
+def create_conversation(request: ConversationRequest):
+    try:
+        return _store.create_conversation(workspace=request.workspace, model=request.model, title=request.title)
+    except StorageError as exc:
+        raise _storage_failure(exc) from exc
+
+
+@app.get("/conversations/{conversation_id}")
+def get_conversation(conversation_id: str):
+    try:
+        conversation = _store.get_conversation_detail(conversation_id)
+    except StorageError as exc:
+        raise _storage_failure(exc) from exc
+    if conversation is None:
+        raise HTTPException(status_code=404, detail="Unknown conversation")
+    return conversation
+
+
 @app.post("/runs", status_code=202)
 def start_run(request: StartRequest):
     global _active
@@ -142,11 +242,35 @@ def start_run(request: StartRequest):
         raise HTTPException(status_code=422, detail=f"Model not installed: {model}")
     run_id = uuid.uuid4().hex[:12]
     log_path = Path(tempfile.gettempdir()) / f"reaper-api-{run_id}.log"
-    cmd = [sys.executable, "-u", "-m", "reaper_ai.supervisor", "--workspace", str(root),
-           "--task", request.task, "--timeout", str(request.timeout)]
     with _lock:
         if _active is not None:
             raise HTTPException(status_code=409, detail=f"Run {_active} is still active")
+        try:
+            if request.conversation_id:
+                conversation = _store.get_conversation(request.conversation_id)
+                if conversation is None:
+                    raise HTTPException(status_code=404, detail="Unknown conversation")
+            else:
+                conversation = _store.create_conversation(
+                    workspace=str(root), model=model, title=request.task[:120]
+                )
+            prior_context = _store.relevant_context(conversation["id"])
+            entry = {"run_id": run_id, "conversation_id": conversation["id"], "workspace": str(root),
+                     "model": model, "task": request.task, "timeout": request.timeout, "status": "running",
+                     "started_at": _utc(), "finished_at": None, "exit_code": None, "result": None,
+                     "log_path": str(log_path)}
+            _store.create_run(entry)
+            _store.add_message(conversation["id"], role="user", content=request.task, run_id=run_id)
+        except StorageError as exc:
+            raise _storage_failure(exc) from exc
+        engine_task = request.task
+        if prior_context:
+            engine_task += (
+                "\n\nRelevant prior conversation context follows. It is limited to user intent and "
+                "observed prior run records; re-check repository facts before relying on it.\n" + prior_context
+            )
+        cmd = [sys.executable, "-u", "-m", "reaper_ai.supervisor", "--workspace", str(root),
+               "--task", engine_task, "--timeout", str(request.timeout)]
         try:
             with log_path.open("wb") as output:
                 env = os.environ.copy()
@@ -155,10 +279,13 @@ def start_run(request: StartRequest):
                 proc = subprocess.Popen(cmd, cwd=str(Path(__file__).resolve().parents[2]),
                                         stdout=output, stderr=subprocess.STDOUT, env=env)
         except OSError as exc:
+            try:
+                _store.complete_run(run_id, status="failed", finished_at=_utc(), exit_code=None,
+                                    result={"status": "failed", "reason": f"Supervisor could not start: {exc}"})
+            except StorageError:
+                pass
             raise HTTPException(status_code=500, detail=f"Supervisor could not start: {exc}") from exc
-        _runs[run_id] = {"run_id": run_id, "workspace": str(root), "model": model, "task": request.task,
-                         "status": "running", "started_at": _utc(), "finished_at": None,
-                         "exit_code": None, "result": None, "log_path": str(log_path)}
+        _runs[run_id] = entry
         _procs[run_id] = proc
         _active = run_id
     threading.Thread(target=_watch, args=(run_id, proc), daemon=True).start()
@@ -167,18 +294,16 @@ def start_run(request: StartRequest):
 
 @app.get("/runs/{run_id}")
 def get_run(run_id: str):
-    with _lock:
-        if run_id not in _runs:
-            raise HTTPException(status_code=404, detail="Unknown run")
-        return _public(_runs[run_id])
+    return _public(_entry(run_id))
 
 
 @app.get("/runs/{run_id}/log")
 def get_log(run_id: str):
-    with _lock:
-        if run_id not in _runs:
-            raise HTTPException(status_code=404, detail="Unknown run")
-        path = _runs[run_id]["log_path"]
+    entry = _entry(run_id)
+    path = entry.get("log_path")
+    if not path:
+        return {"run_id": run_id, "log": "", "truncated": False,
+                "notice": "Raw supervisor logs are not retained after an API restart; use structured events and result."}
     try:
         with open(path, "rb") as f:
             f.seek(0, 2)
@@ -194,7 +319,14 @@ def get_log(run_id: str):
 def cancel_run(run_id: str):
     with _lock:
         if run_id not in _runs:
-            raise HTTPException(status_code=404, detail="Unknown run")
+            # A stored run is historical; only a live in-memory process is cancellable.
+            try:
+                stored = _store.get_run(run_id)
+            except StorageError as exc:
+                raise _storage_failure(exc) from exc
+            if stored is None:
+                raise HTTPException(status_code=404, detail="Unknown run")
+            raise HTTPException(status_code=409, detail="Run is no longer active")
         entry = _runs[run_id]
         proc = _procs.get(run_id)
         if proc is None or proc.poll() is not None:
@@ -202,6 +334,10 @@ def cancel_run(run_id: str):
         if entry["status"] == "cancelling":
             return {"run_id": run_id, "status": "cancelling"}
         entry["status"] = "cancelling"
+        try:
+            _store.update_run_status(run_id, "cancelling")
+        except StorageError as exc:
+            entry["storage_error"] = str(exc)
     # Killing the supervisor closes its Windows Job Object, killing its child tree.
     try:
         subprocess.run(["taskkill", "/PID", str(proc.pid), "/F", "/T"],
@@ -217,10 +353,24 @@ def cancel_run(run_id: str):
 # replay from the beginning is intentional for reconnecting local UI clients.
 @app.get("/runs/{run_id}/events")
 async def stream_events(run_id: str, request: Request):
-    with _lock:
-        if run_id not in _runs:
-            raise HTTPException(status_code=404, detail="Unknown run")
-        path = Path(_runs[run_id]["log_path"])
+    entry = _entry(run_id)
+    path_value = entry.get("log_path")
+    if not path_value:
+        try:
+            events = _store.list_events(run_id)
+        except StorageError as exc:
+            raise _storage_failure(exc) from exc
+
+        async def replay():
+            for item in events:
+                payload = item["payload"] if isinstance(item["payload"], dict) else {"payload": item["payload"]}
+                payload["api_run_id"] = run_id
+                yield (f"id: {item['sequence']}\nevent: {item['event_type']}\n"
+                       f"data: {json.dumps(payload, ensure_ascii=False)}\n\n")
+
+        return StreamingResponse(replay(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+    path = Path(path_value)
 
     async def stream():
         offset = 0
@@ -261,7 +411,7 @@ async def stream_events(run_id: str, request: Request):
                     event["api_run_id"] = run_id
                     yield f"id: {sequence}\nevent: {event['type']}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
             with _lock:
-                run = _runs[run_id]
+                run = _runs.get(run_id, entry)
                 terminal = run["finished_at"] is not None
                 status = run["status"]
                 result = run["result"]
@@ -295,15 +445,12 @@ def ui_index():
 # REAPER-AI M4/U02: bounded, read-only Git diff for finished runs.
 @app.get("/runs/{run_id}/diff")
 def get_run_diff(run_id: str):
-    with _lock:
-        if run_id not in _runs:
-            raise HTTPException(status_code=404, detail="Unknown run")
-        entry = _runs[run_id]
-        if entry["finished_at"] is None:
-            raise HTTPException(status_code=409, detail="Run not finished")
-        root = Path(entry["workspace"])
-        result = entry.get("result") or {}
-        paths = result.get("changed_files") or []
+    entry = _entry(run_id)
+    if entry["finished_at"] is None:
+        raise HTTPException(status_code=409, detail="Run not finished")
+    root = Path(entry["workspace"])
+    result = entry.get("result") or {}
+    paths = result.get("changed_files") or []
     if not isinstance(paths, list) or not paths:
         return {"run_id": run_id, "diff": "", "notice": "No recorded changed files."}
     if not all(isinstance(path, str) and path and not Path(path).is_absolute() and ".." not in Path(path).parts for path in paths):
