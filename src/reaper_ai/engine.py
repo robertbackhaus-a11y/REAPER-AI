@@ -1,7 +1,7 @@
 """REAPER-AI: bounded, multi-file coding engine with structural verification.
 
-One repository inventory, one file-selection call, one change-proposal call,
-one preflight, one apply, one verification. No autonomous tool loop.
+One repository inventory, one file-selection call, deterministic source analysis,
+one change-proposal call, one preflight, one apply, one verification. No autonomous tool loop.
 """
 
 import argparse
@@ -27,13 +27,23 @@ OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
 MODEL = os.environ.get("REAPER_MODEL", "qwen3.6:35b")
 MAX_EDIT_OPERATIONS = 12
 MAX_SELECTION_MANIFEST_CHARS = 24_000
-MAX_SELECTED_SOURCE_BYTES = 36_000
 _READ_CHUNK_CHARS = 8_192
 _BINARY_PROBE_BYTES = 8_192
 MAX_MODEL_CALLS = 4  # selection + proposal + at most one repair
 MAX_WALL_SECONDS = 600
 _MAX_REPLY_CHARS = 80_000
+_MODEL_PROTOCOL_OVERHEAD_BYTES = 512
 _RUN = ContextVar("reaper_run_metrics", default=None)
+
+_PROPOSAL_SYSTEM = (
+    "Implement only the needed changes in the provided source sections. "
+    'Return JSON {"edits":[{"path":"relative.txt","start_line":1,"end_line":2,'
+    '"start_offset":0,"end_offset":20,"expected":"exact unique existing text",'
+    '"replacement":"replacement text"}],"new_files":{}}. '
+    "An edit range must exactly match one provided section; expected must be a unique snippet within it. "
+    "Use multiple non-overlapping edits for multiple changes. New files must be selected creation paths. "
+    "Do not return full existing files, Markdown, or claims about tests."
+)
 
 
 # REAPER-AI A03 STRUCTURED EVENTS
@@ -66,6 +76,8 @@ class CodingState(TypedDict):
     selected: list[str]
     creating: list[str]
     originals: dict[str, str]
+    analysis: list[dict]
+    edits: list[dict]
     changes: dict[str, str]
     status: str
     error: str
@@ -118,6 +130,147 @@ def _read_text_sections(target: Path) -> str:
     if "\0" in content:
         raise ValueError(f"File contains NUL bytes and is not safe for UTF-8 text editing: {target.name}")
     return content
+
+
+def _model_context_budget() -> int:
+    """Configurable prompt limit, kept below the local model's context window."""
+    try:
+        configured = int(os.environ.get("REAPER_MODEL_CONTEXT_CHARS", "36000"))
+    except ValueError:
+        configured = 36_000
+    return max(8_000, min(configured, 96_000))
+
+
+def _line_offsets(content: str) -> list[int]:
+    offsets = [0]
+    for index, character in enumerate(content):
+        if character == "\n":
+            offsets.append(index + 1)
+    return offsets
+
+
+def _split_line_range(content: str, start_line: int, end_line: int, label: str) -> list[dict]:
+    sections: list[dict] = []
+    offsets = _line_offsets(content)
+    line = start_line
+    while line <= end_line:
+        section_end = line
+        start = offsets[line - 1]
+        while section_end <= end_line:
+            candidate_end = offsets[section_end] if section_end < len(offsets) else len(content)
+            if section_end > line and candidate_end - start > _READ_CHUNK_CHARS:
+                break
+            section_end += 1
+        actual_end = max(line, section_end - 1)
+        end = offsets[actual_end] if actual_end < len(offsets) else len(content)
+        # A generated/minified file can have one line larger than the normal
+        # section size.  Keep it readable by cutting that one line by offsets.
+        while start < end:
+            section_end = min(start + _READ_CHUNK_CHARS, end)
+            sections.append({"start_line": line, "end_line": actual_end,
+                             "start_offset": start, "end_offset": section_end,
+                             "label": label, "content": content[start:section_end]})
+            start = section_end
+        line = actual_end + 1
+    return sections
+
+
+def _source_sections(path: str, content: str) -> list[dict]:
+    line_count = max(1, len(_line_offsets(content)))
+    sections: list[dict] = []
+    if not _is_python_path(path):
+        return _split_line_range(content, 1, line_count, "file region")
+    try:
+        tree = ast.parse(content, filename=path)
+    except SyntaxError:
+        return _split_line_range(content, 1, line_count, "file region")
+    cursor = 1
+    for node in tree.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        decorators = [decorator.lineno for decorator in node.decorator_list]
+        start_line = min([node.lineno, *decorators])
+        end_line = node.end_lineno or node.lineno
+        if cursor < start_line:
+            sections.extend(_split_line_range(content, cursor, start_line - 1, "file region"))
+        label = ("class" if isinstance(node, ast.ClassDef) else "function") + " " + node.name
+        sections.extend(_split_line_range(content, start_line, end_line, label))
+        cursor = end_line + 1
+    if cursor <= line_count:
+        sections.extend(_split_line_range(content, cursor, line_count, "file region"))
+    return sections
+
+
+def _analysis_prompt(state: CodingState, sections: list[dict]) -> str:
+    return (
+        f"Task:\n{state['task']}\n\nCorrection guidance: {state.get('feedback', '')}\n"
+        f"\nSelected existing files: {[path for path in state['selected'] if path not in state['creating']]}"
+        f"\nNew files: {state['creating']}\n\nFocused source sections:\n"
+        + json.dumps(sections, ensure_ascii=False)
+    )
+
+
+def _proposal_prompt_size(state: CodingState, sections: list[dict]) -> int:
+    """Conservative UTF-8 size for both messages and their API framing."""
+    return (len(_PROPOSAL_SYSTEM.encode("utf-8")) + len(_analysis_prompt(state, sections).encode("utf-8"))
+            + _MODEL_PROTOCOL_OVERHEAD_BYTES)
+
+
+def _analyze_selected_sources(state: CodingState) -> list[dict]:
+    budget = _model_context_budget()
+    terms = set(re.findall(r"[A-Za-z0-9_.-]+", state["task"].casefold()))
+    candidates: list[dict] = []
+    for path in state["selected"]:
+        if path in state["creating"]:
+            continue
+        for section in _source_sections(path, state["originals"][path]):
+            item = {"path": path, **section}
+            haystack = (path + " " + item["label"] + " " + item["content"]).casefold()
+            item["_rank"] = (
+                0 if Path(path).name.casefold() in terms or path.casefold() in terms else 1,
+                0 if any(term in haystack for term in terms if len(term) > 2) else 1,
+                0 if item["label"] != "file region" else 1,
+                item["start_line"],
+                item["start_offset"],
+            )
+            candidates.append(item)
+    focused: list[dict] = []
+    seen: set[tuple[str, int, int]] = set()
+    prompt_size = _proposal_prompt_size(state, [])
+
+    def compact(item: dict) -> dict:
+        return {key: item[key] for key in
+                ("path", "start_line", "end_line", "start_offset", "end_offset", "label", "content")}
+
+    def add_if_fits(item: dict) -> bool:
+        nonlocal prompt_size
+        identity = (item["path"], item["start_offset"], item["end_offset"])
+        if identity in seen:
+            return False
+        candidate = compact(item)
+        encoded = json.dumps(candidate, ensure_ascii=False).encode("utf-8")
+        added_size = len(encoded) + (2 if focused else 0)  # json.dumps inserts ", " between list items.
+        if prompt_size + added_size > budget:
+            return False
+        seen.add(identity)
+        focused.append(candidate)
+        prompt_size += added_size
+        return True
+
+    # First give every selected file a focused foothold.  This prevents one
+    # large, early path from consuming the entire context window.
+    for path in state["selected"]:
+        if path in state["creating"]:
+            continue
+        for item in sorted((item for item in candidates if item["path"] == path),
+                           key=lambda candidate: candidate["_rank"]):
+            if add_if_fits(item):
+                break
+    for item in sorted(candidates, key=lambda candidate: candidate["_rank"]):
+        add_if_fits(item)
+    if not focused and candidates:
+        raise ValueError(f"No source section fits the {budget}-byte model context budget")
+    return focused
 
 
 def _selection_manifest(inventory: list[dict], task: str) -> tuple[list[dict], int]:
@@ -252,12 +405,6 @@ def select(state: CodingState) -> dict:
             raise ValueError("Binary files cannot be edited as UTF-8 text: " + ", ".join(binary))
         root = Path(state["workspace"]).resolve()
         originals = {}
-        selected_bytes = sum(known[path]["bytes"] for path in paths)
-        if selected_bytes > MAX_SELECTED_SOURCE_BYTES:
-            raise ValueError(
-                f"Selected text content exceeds the {MAX_SELECTED_SOURCE_BYTES}-byte model context budget; "
-                "split the work into smaller operations"
-            )
         for path in paths:
             target = _file(str(root), path)
             if not target.is_file():
@@ -275,54 +422,94 @@ def select(state: CodingState) -> dict:
                 raise ValueError(f"New file is gitignored: {path}")
             if ignored.returncode != 1:
                 raise ValueError(f"Git ignore check failed: {path}")
-        return {"selected": selected, "creating": creating, "originals": originals,
+        return {"selected": selected, "creating": creating, "originals": originals, "analysis": [], "edits": [],
                 "status": "selected", "error": ""}
     except (OSError, ValueError, UnicodeError, httpx.HTTPError,
             subprocess.TimeoutExpired, json.JSONDecodeError, RunBudgetExceeded) as exc:
         return {"status": "failed", "error": str(exc)}
 
 
+def analyze(state: CodingState) -> dict:
+    _emit_event("phase_changed", phase="analyze")
+    print("[ANALYZE]")
+    try:
+        return {"analysis": _analyze_selected_sources(state), "status": "analyzed", "error": ""}
+    except (OSError, ValueError, UnicodeError, RunBudgetExceeded) as exc:
+        return {"status": "failed", "error": str(exc)}
+
+
+def _edit_position(source: str, edit: dict, available_ranges: set[tuple[str, int, int]]) -> int:
+    required = {"path", "start_line", "end_line", "start_offset", "end_offset", "expected", "replacement"}
+    if set(edit) != required:
+        raise ValueError("Each edit must contain path, line/offset range, expected, and replacement")
+    path, start_line, end_line, start_offset, end_offset, expected, replacement = (
+        edit["path"], edit["start_line"], edit["end_line"], edit["start_offset"], edit["end_offset"],
+        edit["expected"], edit["replacement"]
+    )
+    if (not isinstance(path, str) or not isinstance(start_line, int) or not isinstance(end_line, int)
+            or not isinstance(start_offset, int) or not isinstance(end_offset, int)
+            or not isinstance(expected, str) or not expected or not isinstance(replacement, str)):
+        raise ValueError("Invalid edit value types or empty expected text")
+    if (path, start_offset, end_offset) not in available_ranges:
+        raise ValueError(f"Edit range was not provided for {path}: lines {start_line}-{end_line}")
+    position = source.find(expected)
+    if position < 0 or source.find(expected, position + 1) >= 0:
+        raise ValueError(f"Expected text must occur exactly once in {path}")
+    if position < start_offset or position + len(expected) > end_offset:
+        raise ValueError(f"Expected text is outside the provided range for {path}: lines {start_line}-{end_line}")
+    return position
+
+
+def _changes_from_edits(state: CodingState, edits: list[dict]) -> dict[str, str]:
+    available_ranges = {(item["path"], item["start_offset"], item["end_offset"])
+                        for item in state["analysis"]}
+    grouped: dict[str, list[tuple[int, dict]]] = {}
+    for edit in edits:
+        path = edit.get("path") if isinstance(edit, dict) else None
+        if path not in state["originals"]:
+            raise ValueError(f"Edit targets an unselected or new file: {path}")
+        grouped.setdefault(path, []).append((_edit_position(state["originals"][path], edit, available_ranges), edit))
+    changes: dict[str, str] = {}
+    for path, path_edits in grouped.items():
+        intervals = sorted((edit["start_offset"], edit["end_offset"]) for _, edit in path_edits)
+        if any(current[0] <= previous[1] for previous, current in zip(intervals, intervals[1:])):
+            raise ValueError(f"Overlapping edit ranges for {path}")
+        updated = state["originals"][path]
+        for position, edit in sorted(path_edits, key=lambda item: item[0], reverse=True):
+            expected = edit["expected"]
+            updated = updated[:position] + edit["replacement"] + updated[position + len(expected):]
+        changes[path] = updated
+    return changes
+
+
 def propose(state: CodingState) -> dict:
     _emit_event("phase_changed", phase="propose")
     print("[PROPOSE]")
     try:
-        result = ask_json(
-            "Implement the task in the selected existing UTF-8 text files AND new UTF-8 text files. "
-            'Return JSON {"changes":{"relative.txt":"complete updated content"}}. '
-            "Include every selected file, even if it requires no change. "
-            "Retain unrelated behavior in existing files; provide full source for new files. "
-            "Do not claim tests ran. No Markdown.",
-            f"Task:\n{state['task']}\n\nCorrection guidance: {state.get('feedback', '')}\n\nEdit existing: {state['selected']}\n"
-            f"Create new: {state['creating']}\nCurrent existing sources:\n"
-            + json.dumps(state["originals"], ensure_ascii=False),
-        )
-        changes = result.get("changes")
-        if not isinstance(changes, dict) or set(changes) != set(state["selected"]):
-            raise ValueError("Proposed file set differs from selected files")
-        meaningful = False
+        sections = state.get("analysis") or _analyze_selected_sources(state)
+        result = ask_json(_PROPOSAL_SYSTEM, _analysis_prompt(state, sections))
+        edits, new_files = result.get("edits"), result.get("new_files", {})
+        if not isinstance(edits, list) or not isinstance(new_files, dict):
+            raise ValueError("Proposal must contain an edits list and new_files object")
+        if not 1 <= len(edits) + len(new_files) <= MAX_EDIT_OPERATIONS:
+            raise ValueError(f"Proposal must contain 1 to {MAX_EDIT_OPERATIONS} concrete operations")
+        if set(new_files) != set(state["creating"]):
+            raise ValueError("Proposed new-file set differs from selected creation paths")
+        changes = _changes_from_edits({**state, "analysis": sections}, edits)
+        changes.update(new_files)
         for name, content in changes.items():
-            if not isinstance(content, str) or not content.strip():
+            if not isinstance(content, str) or (name in new_files and not content.strip()):
                 raise ValueError(f"Invalid proposed content: {name}")
             _validate_text_syntax(name, content)
-            if name in state["creating"]:
-                meaningful = True
-            elif _is_python_path(name):
-                new_tree = ast.parse(content, filename=name)
-                old_tree = ast.parse(state["originals"][name], filename=name)
-                if ast.dump(new_tree, include_attributes=False) != ast.dump(old_tree, include_attributes=False):
-                    meaningful = True
-            elif content != state["originals"][name]:
-                meaningful = True
-        if not meaningful:
-            return {"status": "no_semantic_change", "error": "No meaningful selected-file change; task completion not proven"}
-        # Reject cosmetic-only Python modifications and unchanged text files.
         changes = {name: content for name, content in changes.items()
                    if name in state["creating"] or (
                        ast.dump(ast.parse(content), include_attributes=False)
                        != ast.dump(ast.parse(state["originals"][name]), include_attributes=False)
                        if _is_python_path(name) else content != state["originals"][name]
                    )}
-        return {"changes": changes, "status": "proposed", "error": ""}
+        if not changes:
+            return {"status": "no_semantic_change", "error": "No meaningful selected-file change; task completion not proven"}
+        return {"analysis": sections, "edits": edits, "changes": changes, "status": "proposed", "error": ""}
     except (ValueError, SyntaxError, httpx.HTTPError, json.JSONDecodeError, RunBudgetExceeded) as exc:
         return {"status": "proposal_failed", "error": str(exc)}
 
@@ -468,8 +655,8 @@ def repair_proposal(state: CodingState) -> dict:
 
 def _next_stage(stage: str, state: dict) -> str | None:
     status = state.get("status")
-    if stage in {"inventory", "select", "apply"}:
-        return {"inventory": "select", "select": "propose", "apply": "verify"}.get(stage) \
+    if stage in {"inventory", "select", "analyze", "apply"}:
+        return {"inventory": "select", "select": "analyze", "analyze": "propose", "apply": "verify"}.get(stage) \
             if status not in {"failed", "no_semantic_change", "proposal_failed"} else None
     if stage == "propose":
         if status == "proposed":
@@ -499,16 +686,17 @@ def _checkpointed(stage: str, function):
 
 
 def build_graph(start_stage: str = "inventory"):
-    if start_stage not in {"inventory", "select", "propose", "repair_proposal", "apply", "verify"}:
+    if start_stage not in {"inventory", "select", "analyze", "propose", "repair_proposal", "apply", "verify"}:
         raise ValueError(f"Unsupported checkpoint stage: {start_stage}")
     graph = StateGraph(CodingState)
     for name, function in (("inventory", inventory), ("select", select),
-                           ("propose", propose), ("repair_proposal", repair_proposal),
+                           ("analyze", analyze), ("propose", propose), ("repair_proposal", repair_proposal),
                            ("apply", apply), ("verify", verify)):
         graph.add_node(name, _checkpointed(name, function))
     graph.add_edge(START, start_stage)
     graph.add_conditional_edges("inventory", advance, {"next": "select", "end": END})
-    graph.add_conditional_edges("select", advance, {"next": "propose", "end": END})
+    graph.add_conditional_edges("select", advance, {"next": "analyze", "end": END})
+    graph.add_conditional_edges("analyze", advance, {"next": "propose", "end": END})
     graph.add_conditional_edges("propose", lambda state: "next" if state["status"] == "proposed" else retry_proposal(state),
                                 {"next": "apply", "repair": "repair_proposal", "end": END})
     graph.add_edge("repair_proposal", "propose")
@@ -534,7 +722,7 @@ def _resume_state(workspace: str) -> tuple[dict, str]:
     root = Path(workspace).resolve()
     if state.get("workspace") != str(root):
         raise ValueError("Checkpoint workspace does not match the requested repository")
-    if next_stage in {"propose", "apply", "verify", "repair_proposal"}:
+    if next_stage in {"analyze", "propose", "apply", "verify", "repair_proposal"}:
         originals = state.get("originals")
         changes = state.get("changes")
         creating = state.get("creating")
@@ -572,7 +760,7 @@ def run(task: str, workspace: str) -> dict:
             start_stage = "inventory"
             initial = {"workspace": str(Path(workspace).resolve()), "task": task,
                        "inventory": [], "selected": [], "creating": [], "originals": {},
-                       "changes": {}, "status": "pending", "error": "", "details": [],
+                       "analysis": [], "edits": [], "changes": {}, "status": "pending", "error": "", "details": [],
                        "corrections": 0, "feedback": ""}
         outcome = build_graph(start_stage).invoke(initial, config={"recursion_limit": 15})
         internal = outcome["status"]

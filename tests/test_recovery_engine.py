@@ -56,8 +56,14 @@ class FileSelectionRegressionTests(unittest.TestCase):
         (self.root / "pyproject.toml").write_text(
             "[project]\nname = 'sample'\nversion = '0.1.0'\n", encoding="utf-8"
         )
-        for name in ("engine.py", "api.py", "persistence.py"):
+        for name in ("api.py", "persistence.py"):
             (self.root / name).write_text("value = 1\n", encoding="utf-8")
+        for name, marker in (("engine.py", "engine_marker"), ("tools.py", "tools_marker"),
+                             ("system_tools.py", "system_tools_marker")):
+            (self.root / name).write_text(
+                f"def {marker}():\n    return 'old-{marker}'\n\n# untouched\n" + "# context\n" * 2_500,
+                encoding="utf-8",
+            )
         (self.root / "large.txt").write_text("x" * 20_001, encoding="utf-8")
         (self.root / "image.bin").write_bytes(b"\0binary")
 
@@ -68,7 +74,7 @@ class FileSelectionRegressionTests(unittest.TestCase):
 
     def test_full_inventory_supports_large_text_and_safe_text_selection(self):
         state = {"workspace": str(self.root), "task": "Set version to 0.2.0", "inventory": [],
-                 "selected": [], "creating": [], "originals": {}, "changes": {}, "status": "pending",
+                 "selected": [], "creating": [], "originals": {}, "analysis": [], "edits": [], "changes": {}, "status": "pending",
                  "error": "", "details": [], "corrections": 0, "feedback": ""}
 
         def fake_git(root, *args):
@@ -76,7 +82,7 @@ class FileSelectionRegressionTests(unittest.TestCase):
                 return subprocess.CompletedProcess(args, 0, str(root) + "\n", "")
             if args[:2] == ("ls-files", "--cached"):
                 return subprocess.CompletedProcess(
-                    args, 0, "module.py\npyproject.toml\nengine.py\napi.py\npersistence.py\nlarge.txt\nimage.bin\n", ""
+                    args, 0, "module.py\npyproject.toml\nengine.py\ntools.py\nsystem_tools.py\napi.py\npersistence.py\nlarge.txt\nimage.bin\n", ""
                 )
             if args[:3] == ("diff", "HEAD", "--quiet"):
                 return subprocess.CompletedProcess(args, 0, "", "")
@@ -87,16 +93,49 @@ class FileSelectionRegressionTests(unittest.TestCase):
         with patch.object(engine, "git", side_effect=fake_git):
             state.update(engine.inventory(state))
             entries = {item["path"]: item for item in state["inventory"]}
-            self.assertTrue({"engine.py", "api.py", "persistence.py", "pyproject.toml", "large.txt"} <= set(entries))
+            self.assertTrue({"engine.py", "tools.py", "system_tools.py", "api.py", "persistence.py", "pyproject.toml", "large.txt"} <= set(entries))
             self.assertEqual(entries["large.txt"], {"path": "large.txt", "kind": "text", "bytes": 20_001})
             self.assertEqual(entries["image.bin"]["kind"], "binary")
             self.assertEqual(len(engine._read_text_sections(self.root / "large.txt")), 20_001)
 
             with patch.object(engine, "ask_json", return_value={
-                "edit": ["module.py", "engine.py", "api.py", "persistence.py"], "create": []
+                "edit": ["engine.py", "tools.py", "system_tools.py", "api.py", "persistence.py"], "create": []
             }):
-                expanded = engine.select({**state, "status": "inventoried", "error": ""})
+                expanded = {**state, **engine.select({**state, "status": "inventoried", "error": ""})}
             self.assertEqual(expanded["status"], "selected")
+            self.assertEqual(engine._next_stage("select", expanded), "analyze")
+            self.assertGreater(sum(len(content) for content in expanded["originals"].values()),
+                               engine._model_context_budget())
+            expanded.update(engine.analyze(expanded))
+            self.assertEqual(expanded["status"], "analyzed")
+            self.assertTrue({"engine.py", "tools.py", "system_tools.py"} <=
+                            {section["path"] for section in expanded["analysis"]})
+            self.assertLessEqual(engine._proposal_prompt_size(expanded, expanded["analysis"]),
+                                 engine._model_context_budget())
+
+            def edit_for(path, expected, replacement):
+                section = next(section for section in expanded["analysis"]
+                               if section["path"] == path and expected in section["content"])
+                return {key: section[key] for key in ("path", "start_line", "end_line", "start_offset", "end_offset")} | {
+                    "expected": expected, "replacement": replacement
+                }
+
+            multi_edits = [
+                edit_for("engine.py", "    return 'old-engine_marker'\n", "    return 'new-engine_marker'\n"),
+                edit_for("tools.py", "    return 'old-tools_marker'\n", "    return 'new-tools_marker'\n"),
+                edit_for("system_tools.py", "    return 'old-system_tools_marker'\n", "    return 'new-system_tools_marker'\n"),
+            ]
+            with patch.object(engine, "ask_json", return_value={"edits": multi_edits, "new_files": {}}):
+                expanded.update(engine.propose(expanded))
+            self.assertEqual(expanded["status"], "proposed", expanded["error"])
+            self.assertEqual(set(expanded["changes"]), {"engine.py", "tools.py", "system_tools.py"})
+            expanded.update(engine.apply(expanded))
+            self.assertEqual(expanded["status"], "written", expanded["error"])
+            for name, marker in (("engine.py", "engine_marker"), ("tools.py", "tools_marker"),
+                                 ("system_tools.py", "system_tools_marker")):
+                content = (self.root / name).read_text(encoding="utf-8")
+                self.assertIn(f"new-{marker}", content)
+                self.assertIn("# untouched", content)
 
             with patch.object(engine, "ask_json", return_value={"edit": ["image.bin"], "create": []}):
                 binary = engine.select({**state, "status": "inventoried", "error": ""})
@@ -107,8 +146,12 @@ class FileSelectionRegressionTests(unittest.TestCase):
             self.assertEqual(state["status"], "selected")
             self.assertIn("version = '0.1.0'", state["originals"]["pyproject.toml"])
 
-            changed = "[project]\nname = 'sample'\nversion = '0.2.0'\n"
-            with patch.object(engine, "ask_json", return_value={"changes": {"pyproject.toml": changed}}):
+            state.update(engine.analyze(state))
+            section = next(section for section in state["analysis"] if section["path"] == "pyproject.toml")
+            edit = {key: section[key] for key in ("path", "start_line", "end_line", "start_offset", "end_offset")} | {
+                "expected": "version = '0.1.0'", "replacement": "version = '0.2.0'"
+            }
+            with patch.object(engine, "ask_json", return_value={"edits": [edit], "new_files": {}}):
                 state.update(engine.propose(state))
             self.assertEqual(state["status"], "proposed")
             state.update(engine.apply(state))

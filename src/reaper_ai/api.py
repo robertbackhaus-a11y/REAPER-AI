@@ -352,7 +352,7 @@ def _recovery_record(run_id: str) -> tuple[dict, dict | None, bool, str]:
     if not checkpoint.get("valid"):
         return entry, checkpoint, False, str(checkpoint.get("invalid_reason") or "Checkpoint is invalid")
     state = checkpoint.get("state")
-    valid_stages = {"inventory", "select", "propose", "repair_proposal", "apply", "verify"}
+    valid_stages = {"inventory", "select", "analyze", "propose", "repair_proposal", "apply", "verify"}
     if not isinstance(state, dict) or state.get("workspace") != entry["workspace"]:
         try:
             _store.invalidate_checkpoint(run_id, "Checkpoint workspace does not match the run")

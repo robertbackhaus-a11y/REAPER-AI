@@ -244,6 +244,13 @@ The initial deliverable is **one dependable agent**. Multi-agent delegation and 
 - **Read boundary:** memory is loaded on demand when a run starts, for its workspace plus explicitly global user decisions. It is advisory context; the engine is instructed to re-check repository facts. The browser offers an explicit project-knowledge action; `GET/POST /memory` provide the equivalent local API.
 - **Focused verification:** one persistence/restart test proves source attribution, workspace isolation, retrieval after reopening SQLite, and exclusion of assistant prose; the existing API persistence test covers the explicit user-decision endpoint.
 
+#### Context handling implementation checkpoint — 2026-10-18 (BUG-007)
+
+- **Cause addressed:** P01/P02 state could retain multiple selected large files, but the old proposal stage sent their complete combined contents to one model call and rejected the run at its 36,000-byte prompt guard.
+- **Implemented:** selection, deterministic source analysis, and proposal are now separate stages. Analysis supplies bounded function, class, or file-range sections, first reserving a section for each selected file and then prioritizing task-relevant sections within `REAPER_MODEL_CONTEXT_CHARS` (default 36,000 UTF-8 bytes; clamp 8,000–96,000). Checkpoints retain that analysis state, so a resumed proposal does not need to re-run completed selection/analysis.
+- **Edit safety:** a proposal returns exact expected snippets and supplied line/character-offset ranges rather than full existing files. Multiple non-overlapping edits are assembled from the saved originals and still pass the existing clean-Git/source preflight before writes.
+- **Focused verification:** one regression flow selects source larger than the context budget across `engine.py`, `tools.py`, and `system_tools.py`, proves each has an analyzed section, applies three targeted edits, and verifies that unrelated content remains intact.
+
 ### M6 — Final acceptance and first release
 
 **D01 — Representative end-to-end acceptance**
