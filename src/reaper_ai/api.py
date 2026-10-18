@@ -311,6 +311,8 @@ def start_run(request: StartRequest):
                 env["REAPER_MODEL"] = model
                 env["REAPER_API_RUN_ID"] = run_id
                 env["PYTHONUNBUFFERED"] = "1"
+                env["PYTHONUTF8"] = "1"
+                env["PYTHONIOENCODING"] = "utf-8:backslashreplace"
                 proc = subprocess.Popen(cmd, cwd=str(Path(__file__).resolve().parents[2]),
                                         stdout=output, stderr=subprocess.STDOUT, env=env)
         except OSError as exc:
@@ -398,6 +400,8 @@ def resume_run(run_id: str):
                 env["REAPER_API_RUN_ID"] = run_id
                 env["REAPER_RESUME"] = "1"
                 env["PYTHONUNBUFFERED"] = "1"
+                env["PYTHONUTF8"] = "1"
+                env["PYTHONIOENCODING"] = "utf-8:backslashreplace"
                 proc = subprocess.Popen(cmd, cwd=str(Path(__file__).resolve().parents[2]),
                                         stdout=output, stderr=subprocess.STDOUT, env=env)
         except OSError as exc:

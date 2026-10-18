@@ -138,7 +138,7 @@ The initial deliverable is **one dependable agent**. Multi-agent delegation and 
 - **M1 working baseline:** CLI engine can inspect/select, propose/apply changes in a disposable Git repository and report syntax/Git evidence. The first two-file exercise updated `calculator.py` and created `service.py`.
 - **M2 implemented:** R01 call/time budgets and usage, R02 structured outcomes/check evidence, R03 bounded repair logic, R04 Windows Job Object supervisor with timeout backstop. This is an implementation inventory, not proof that every branch works.
 - **Verified:** `multiply(6, 7) == 42` and `multiply_numbers(6, 7) == 42` with live Python imports (`FUNCTIONAL: OK`). R04 synthetic three-second timeout terminated parent and child (`R04: PASS`, exit 2). Dirty working-tree protection yielded an explicit failure instead of overwriting modified files.
-- **Installed, not verified:** Run provenance (`run_id`, Git HEAD baseline, pre/post Git status) was patched into the engine; no subsequent run has demonstrated those fields.
+- **Historical cleanup:** the retired static pipeline and its Git before/after provenance wrapper were removed in favor of persisted API run identity, events, and per-write hash evidence from the iterative agent.
 - **Not fully covered:** False-success rejection, all repair/failure variants, real user cancellation, interruption diagnostics, resumed runs and complete original M2 gate scenario matrix. They remain acceptance concerns for M3/M6 where relevant. **Do not rerun the successful coding exercise just to increase test counts.**
 - **Next:** M3 A01 — a minimal local FastAPI layer around the already implemented engine/supervisor. Add project and model discovery/events in A02/A03; no frontend framework, auto-commit or new orchestration stack.
 
@@ -226,7 +226,7 @@ The initial deliverable is **one dependable agent**. Multi-agent delegation and 
 - **Interruption and safety:** API startup marks stale `running`/`cancelling` records as `interrupted`; it never starts them. Recovery is available only through an explicit API/UI action for interrupted, cancelled, or timed-out runs with a valid checkpoint. Missing, damaged, unsupported, or workspace-inconsistent state is rejected clearly.
 - **Control surface:** `GET /runs/{run_id}/recovery` explains recovery availability; `POST /runs/{run_id}/resume` starts a supervised continuation. The browser surfaces the checkpoint status and continuation control in conversation history, including runs interrupted before a terminal message was stored.
 - **Scope:** this is a single-user, stage-boundary continuation mechanism built on the P01 database, not automatic process restoration, event sourcing, or P03 durable memory.
-- **Focused verification:** tests cover SQLite checkpoint reload and digest invalidation, stale-run detection after a simulated restart, recovery API availability, and an interrupted proposal checkpoint whose continuation begins at `apply` without rerunning proposal.
+- **Focused verification:** tests cover SQLite checkpoint reload and digest invalidation, stale-run detection after a simulated restart, recovery API availability, and an interrupted agent continuation from its saved next decision without rerunning observed tools.
 
 **P03 — Optional durable memory (decision gate)**
 
@@ -244,12 +244,10 @@ The initial deliverable is **one dependable agent**. Multi-agent delegation and 
 - **Read boundary:** memory is loaded on demand when a run starts, for its workspace plus explicitly global user decisions. It is advisory context; the engine is instructed to re-check repository facts. The browser offers an explicit project-knowledge action; `GET/POST /memory` provide the equivalent local API.
 - **Focused verification:** one persistence/restart test proves source attribution, workspace isolation, retrieval after reopening SQLite, and exclusion of assistant prose; the existing API persistence test covers the explicit user-decision endpoint.
 
-#### Context handling implementation checkpoint — 2026-10-18 (BUG-007)
+#### Context handling history — 2026-10-18 (BUG-007)
 
-- **Cause addressed:** P01/P02 state could retain multiple selected large files, but the old proposal stage sent their complete combined contents to one model call and rejected the run at its 36,000-byte prompt guard.
-- **Implemented:** selection, deterministic source analysis, and proposal are now separate stages. Analysis supplies bounded function, class, or file-range sections, first reserving a section for each selected file and then prioritizing task-relevant sections within `REAPER_MODEL_CONTEXT_CHARS` (default 36,000 UTF-8 bytes; clamp 8,000–96,000). Checkpoints retain that analysis state, so a resumed proposal does not need to re-run completed selection/analysis.
-- **Edit safety:** a proposal returns exact expected snippets and supplied line/character-offset ranges rather than full existing files. Multiple non-overlapping edits are assembled from the saved originals and still pass the existing clean-Git/source preflight before writes.
-- **Focused verification:** one regression flow selects source larger than the context budget across `engine.py`, `tools.py`, and `system_tools.py`, proves each has an analyzed section, applies three targeted edits, and verifies that unrelated content remains intact.
+- The former static pipeline briefly used selected source sections and snippet/range proposals to manage context. That implementation was removed with the pipeline.
+- The active agent retains compact observations in its prompt, reads files or ranges on demand through `tools.py`, and keeps `REAPER_MODEL_CONTEXT_CHARS` as its prompt budget. Existing-file writes use the read hash rather than a static proposal range.
 
 ### M6 — Iterative agent transition, final acceptance and first release
 
@@ -264,7 +262,7 @@ The initial deliverable is **one dependable agent**. Multi-agent delegation and 
 
 #### P01 implementation checkpoint — 2026-10-18
 
-- **Implemented:** `reaper_ai.agent` supplies the checkpoint-friendly `AgentState` and central `dispatch_tool`. Existing `tools.py` now provides file listing, line-range reads, and line-oriented text search; `system_tools.py` remains the shell/Python implementation.
+- **Implemented:** `reaper_ai.agent` supplies the checkpoint-friendly minimal `AgentState` (plan, step, next action, observations, verification, and tool-call accounting) and central `dispatch_tool`. Immutable task/workspace state is held by the graph; `tools.py` provides file listing, line-range reads, and line-oriented text search; `system_tools.py` remains the shell/Python implementation.
 - **Safety:** no shell allow-list, blacklist, risk class, or approval workflow remains. The dispatcher has text writes protected by an observed SHA-256 precondition; conflicts never overwrite an intervening change.
 - **Integration:** state, tool results, and checkpoints use the existing SQLite store. Git is optional and a workspace is project context rather than a filesystem boundary.
 - **Focused verification:** one dispatcher test performs list/read/range/search/write, an absolute-path write, Python discovery, Git status, PowerShell `Get-Location`, a nonzero command, and a timeout.
@@ -282,6 +280,12 @@ The initial deliverable is **one dependable agent**. Multi-agent delegation and 
 - **Budgets and recovery:** agent runs retain the wall-time limit, compact result capture, and a LangGraph recursion guard derived from the wall-time budget, but no artificial model, tool, file, or repair-operation cap. SQLite checkpoints are written after every safe agent node. An interrupted agent resumes at the saved `agent_*` next node with its observed tools intact; it does not replay completed actions.
 - **Execution:** shell commands and file operations use the launched user's OS permissions without elevation. Existing text writes require a matching read hash; tool errors remain observations so Sentinel can correct itself.
 - **Focused verification:** a deterministic end-to-end agent test performs text search, a failed missing-file range read, a corrected range read, completion, and restart at the saved next decision without rerunning the three tools. A live `qwen3:8b` read-only run searched `def dispatch_tool`, read `src/reaper_ai/agent.py` lines 152–180, used three model decisions/two successful tool calls, and left Git status unchanged.
+
+#### Post-M6 technical cleanup — 2026-10-18
+
+- **Removed:** the obsolete `Inventory → Select → Analyze → Propose → Apply → Verify` graph, its snippet/range replacement and repair helpers, duplicate engine Git snapshots, and its dedicated legacy tests.
+- **Retained:** the iterative graph, direct Ollama client, dispatcher, `tools.py` file/Git adapters, `system_tools.py` shell/Python discovery, FastAPI/UI, SQLite history/checkpoints/memory, and Windows supervisor.
+- **Compatibility:** current agent checkpoints retain all fields needed for recovery. Older agent snapshots with surplus state fields are accepted; checkpoints for the removed static graph are preserved as records but cannot be resumed.
 
 **D01 — Representative end-to-end acceptance**
 

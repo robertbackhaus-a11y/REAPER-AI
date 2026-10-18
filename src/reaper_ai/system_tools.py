@@ -1,4 +1,4 @@
-"""System-level tools for REAPER-AI: Shell execution, Python env management, and global file access."""
+"""System-level tools for REAPER-AI: shell execution and Python discovery."""
 
 import subprocess
 import os
@@ -71,129 +71,11 @@ def run_shell_command(
         }
 
 
-def find_python_executables() -> list:
-    """
-    Find available Python executables on the system.
-    
-    Returns:
-        List of paths to Python executables.
-    """
-    candidates = []
-    
-    # Check common locations
-    if os.name == 'nt':
-        common_paths = [
-            "C:\\Python39\\python.exe",
-            "C:\\Python310\\python.exe",
-            "C:\\Python311\\python.exe",
-            "C:\\Python312\\python.exe",
-            "C:\\Program Files\\Python39\\python.exe",
-            "C:\\Program Files\\Python310\\python.exe",
-            "C:\\Program Files\\Python311\\python.exe",
-            "C:\\Program Files\\Python312\\python.exe",
-        ]
-    else:
-        common_paths = [
-            "/usr/bin/python3",
-            "/usr/bin/python",
-            "/usr/local/bin/python3",
-            "/usr/local/bin/python",
-        ]
-        
-    # Also check PATH
-    path_dirs = os.environ.get("PATH", "").split(os.pathsep)
-    for d in path_dirs:
-        p = Path(d) / ("python.exe" if os.name == 'nt' else "python3")
-        if p.exists():
-            candidates.append(str(p.resolve()))
-            
-    # Add common paths if not already in PATH
-    for p in common_paths:
-        if Path(p).exists() and str(Path(p).resolve()) not in candidates:
-            candidates.append(str(Path(p).resolve()))
-            
-    return list(set(candidates))
-
-
-def create_python_env(
-    env_path: str,
-    python_executable: Optional[str] = None,
-    packages: Optional[list] = None
-) -> dict:
-    """
-    Create a Python virtual environment and optionally install packages.
-    
-    Args:
-        env_path: Path to create the virtual environment.
-        python_executable: Path to Python executable. If None, uses current interpreter.
-        packages: List of packages to install after creation.
-        
-    Returns:
-        Dict with 'ok', 'env_path', 'installed_packages'.
-    """
-    try:
-        # Determine Python executable
-        if python_executable is None:
-            python_executable = sys.executable
-            
-        if not Path(python_executable).exists():
-            return {
-                "ok": False,
-                "error": f"Python executable not found: {python_executable}",
-            }
-            
-        # Create virtual environment
-        result = subprocess.run(
-            [python_executable, "-m", "venv", env_path],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=60
-        )
-        
-        if result.returncode != 0:
-            return {
-                "ok": False,
-                "error": f"Failed to create venv: {result.stderr}",
-            }
-            
-        # Determine pip executable
-        if os.name == 'nt':
-            pip_executable = Path(env_path) / "Scripts" / "pip.exe"
-        else:
-            pip_executable = Path(env_path) / "bin" / "pip"
-            
-        installed_packages = []
-        
-        # Install packages if specified
-        if packages:
-            for package in packages:
-                install_result = subprocess.run(
-                    [str(pip_executable), "install", package],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=120
-                )
-                if install_result.returncode == 0:
-                    installed_packages.append(package)
-                else:
-                    return {
-                        "ok": False,
-                        "error": f"Failed to install {package}: {install_result.stderr}",
-                        "installed_packages": installed_packages,
-                    }
-                    
-        return {
-            "ok": True,
-            "env_path": str(Path(env_path).resolve()),
-            "installed_packages": installed_packages,
-        }
-    except Exception as exc:
-        return {
-            "ok": False,
-            "error": str(exc),
-        }
-# File reads and writes are centralized in reaper_ai.tools.
+def find_python_executables() -> list[str]:
+    """Return the active interpreter and Python launchers resolvable on PATH."""
+    candidates = {str(Path(sys.executable).resolve())}
+    names = ("python.exe", "python", "py.exe", "py") if os.name == "nt" else ("python3", "python")
+    for name in names:
+        if executable := shutil.which(name):
+            candidates.add(str(Path(executable).resolve()))
+    return sorted(candidates, key=str.casefold)

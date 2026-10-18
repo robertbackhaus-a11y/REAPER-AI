@@ -12,6 +12,18 @@ from ctypes import wintypes
 from pathlib import Path
 
 
+def _configure_utf8_stdio() -> None:
+    """Keep supervisor diagnostics writable with legacy Windows code pages."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace")
+        except (AttributeError, OSError):
+            continue
+
+
+_configure_utf8_stdio()
+
+
 if sys.platform == "win32":
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
 

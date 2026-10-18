@@ -100,7 +100,7 @@ These are **logical responsibilities**, not separate network services or separat
 - **M1:** CLI coding path in `src/reaper_ai/engine.py` with focused repository/file/Git tools in `tools.py`. A disposable-repository, two-file coding task completed with recorded syntax/Git evidence.
 - **M2:** Bounded model calls/wall time, structured `RUN_RESULT`, limited correction handling and a separate Windows supervisor in `src/reaper_ai/supervisor.py` are implemented. The tested coding result (`multiply` and `multiply_numbers`) passed a real Python import/call assertion: `FUNCTIONAL: OK`.
 - **R04 evidence:** Synthetic timeout after three seconds returned supervisor exit 2 and verified termination of both parent and child processes (`R04: PASS`). This proves the tested timeout path, **not** every cancellation or interruption case.
-- **Run provenance:** A patch adding `run_id`, Git baseline and before/after status metadata was installed. Its emitted fields and semantics **have not been runtime-verified**.
+- **Run provenance:** historical before/after Git snapshot code was removed when the static pipeline was retired. Run identity, events, and attributable file hashes remain in the API/SQLite records and tool observations.
 - **Unverified/deferred:** Exhaustive R01–R03 edge-case behavior, general functional correctness, resumed runs, user-driven cancellation, and all planned API/UI/persistence features. Existing dirty files remain protected; no automatic adoption/rollback of pre-existing changes is implied.
 - **Observed result vocabulary:** The current engine has emitted `failed` and more specific verification levels/statuses; it must not be described as fully implementing the idealized `RunResult` contract below until checked against actual code. The architecture below remains the target where not specifically evidenced.
 
@@ -167,7 +167,7 @@ The model can propose findings, a plan, and tool requests; the **engine owns cou
 
 ### M6/P01 agent foundation (implemented)
 
-`reaper_ai.agent.AgentState` is a compact, JSON-serializable state for every new run. It holds the objective and project context, plan/current step, next action, compact observations, Git/file baselines, change evidence, verification state, and wall-time/tool accounting. The existing SQLite checkpoint already stores the complete engine state, so no second persistence store or checkpoint mechanism is introduced.
+`reaper_ai.agent.AgentState` is a compact, JSON-serializable state for every new run. It holds only the plan/current step, next action, compact observations, verification state, and tool-call accounting. Immutable task and workspace context remain in the enclosing LangGraph state; file hashes remain with individual guarded write actions. The existing SQLite checkpoint already stores the complete engine state, so no second persistence store or checkpoint mechanism is introduced. Older agent checkpoints may contain now-unused extra keys and remain readable.
 
 `dispatch_tool` is the single execution boundary. A request has a tool name, structured arguments, and a context containing workspace and optional working directory. Its result always has `ok`, `exit_code` where applicable, stdout/stderr or structured data, `duration_ms`, `changes`, and a precise `error`. Output is bounded before it can become an observation. It does not elevate privileges; the operating system is the authority for every action.
 
@@ -184,7 +184,7 @@ agent_decide → agent_finalize → END
 
 The agent has a wall-time budget, compact captured output, and a LangGraph recursion guard derived from wall time; it has no arbitrary model-call, tool-call, file, or repair cap. It checkpoints after prepare, decision, execution, and observation through the existing SQLite store. Recovery recognizes `agent_*` stages and starts at their stored next safe node; already-observed tools are not rerun. The API accepts any existing absolute project directory; Git is optional, and SSE carries the existing phase/model/tool/checkpoint events.
 
-### Proposed nodes
+### Historical pre-M6 target nodes (superseded)
 
 1. **Classify / prepare:** Identify task type, bind project root, capture repository baseline, apply safety constraints.
 2. **Inspect / plan:** Read the minimum relevant material and produce a concrete next action. A simple task can bypass extensive planning.
@@ -214,13 +214,11 @@ START -> prepare -> inspect/plan
 
 A task may finish early if it is already satisfied or cannot be safely performed. The graph must not force meaningless file edits.
 
-### Repository inventory and edit scope
+### On-demand file access and edit scope
 
-Inventory records every regular tracked project file as compact path, byte-size, and text/binary metadata; it does not exclude files because they are large, numerous, or written in a language the engine does not recognize. Binary files are visible to the model for analysis, but deterministic validation prevents treating them as UTF-8 text.
+The agent requests file listing/searching and focused text or line-range reads through `tools.py`; there is no separate inventory, selection, proposal, or apply pipeline. Paths can be workspace-relative or absolute, subject to the started user's operating-system permissions. Text tools distinguish binary content from UTF-8 text, so binary files can be listed but are not silently treated as editable text.
 
-The full manifest remains in engine state. The selection prompt uses a relevance-ranked compact subset to fit its own prompt and explicitly permits a user-named tracked path that is not present in that subset. Once selected, UTF-8 content is read in bounded chunks and retained as the exact precondition for later writes; it is not blindly copied into the proposal prompt.
-
-The graph then has a deterministic **source-analysis** boundary between selection and proposal. It maps selected text into bounded functions, classes, or generic file sections with line and character-offset ranges plus a SHA-256 digest of the original file. It first retains one fitting section from every selected file, then fills the configurable proposal budget with task-relevant sections. `REAPER_MODEL_CONTEXT_CHARS` defaults to 36,000 UTF-8 bytes and is clamped to 8,000–96,000; the complete proposal prompt is checked against that limit. The model may return at most 12 precise non-overlapping edits, each echoing an already supplied range and digest plus an expected snippet that is unique **within that range**. The engine applies replacements against the retained original source in reverse offset order, then immediately verifies the expected range and complete source digest before writing, followed by its Git preconditions. This permits identical text in separate functions while rejecting a stale or ambiguous target range without overwriting an intervening external change.
+The planner prompt is bounded by `REAPER_MODEL_CONTEXT_CHARS` (default 36,000 UTF-8 bytes, clamped to 8,000–96,000) and retains only compact recent observations. Existing-file writes require the SHA-256 value returned by a preceding read; `tools.py` compares that value immediately before writing and returns a conflict instead of overwriting an intervening change. The write result records before/after hashes as change evidence. Git can supply additional inspection evidence but is not a precondition.
 
 ### Progress and budgets
 
@@ -249,15 +247,15 @@ Workers are a capability to add after the single-agent execution path works, not
 
 Tools are narrow Python adapters returning **structured results**. A shell remains available for operations that cannot be expressed as a focused tool, but should not be the sole file-inspection or Git interface.
 
-### Current P01 tools and future extensions
+### Current dispatcher tools
 
 | Tool | Responsibility | Evidence |
 |---|---|---|
-| `list_files` / `search_code` / `read_file` | Focused repository discovery and bounded file excerpts | Paths, line ranges, source versions |
-| `apply_edit` | Narrow edits with file/version preconditions | Changed paths and edit outcome |
-| `git_status` / `git_diff` | Compare repository state with captured baseline | Machine-observed changes |
-| `run_command` | PowerShell or child process execution with cwd/timeout/output cap | Command, exit code, captured output |
-| `run_checks` | Targeted syntax/build/test commands | Exact commands, exit codes, results |
+| `list_files` / `search_text` / `read_file` / `read_file_range` | Focused discovery and bounded text excerpts | Paths, line ranges, source hash |
+| `write_file` | Whole-text write with read-hash precondition | Changed path, before/after hashes |
+| `git_status` / `git_diff` | Optional repository inspection | Machine-observed repository state |
+| `shell` | PowerShell or child process execution with cwd/timeout/output cap | Command, exit code, captured output |
+| `find_python` | Python launcher discovery | Resolvable executable paths |
 
 The dispatcher exposes `list_files`, `read_file`, `read_file_range`, `search_text`, `write_file`, `git_status`, `git_diff`, `find_python`, and `shell` through the iterative graph. A workspace is initial project context, not a filesystem boundary: file paths may be absolute, and the shell's working directory can be explicitly supplied. Git actions are observational and do not require a repository.
 
@@ -268,16 +266,16 @@ Tools must validate their working directory and report failures explicitly. An o
 ### Safety and change policy
 
 - Treat the workspace as normal project context, not a filesystem sandbox. Absolute file paths are permitted and remain subject to the started user's operating-system permissions.
-- Preserve pre-existing dirty changes; capture baseline before the run. Do not confuse existing modifications with this run's work.
+- A dirty Git state is not a run precondition. Existing-file writes use their just-read hash, and their before/after hashes make the individual agent change attributable.
 - Default to no Git commit, push, tag, release, deployment, package installation, or destructive deletion.
 - Make cancellation terminate the entire process tree, including shell children; use suitable Windows process containment where required.
 - A dedicated project working directory is distinct from persistent application data.
 
 ## 8. Verification and truthful completion
 
-Verification is a separate engine responsibility, not a model self-assessment.
+Verification is based on agent-selected tool evidence, not a model self-assessment.
 
-For coding tasks, capture the pre-run baseline and post-run repository state, including relevant untracked files. Record the actual diff and every check executed. Success requires the expected artifact/change (or justified no-op) plus reasonable task-specific verification. A successful syntax check is not equivalent to satisfying functional requirements.
+For coding tasks, record every observed write, Git inspection, and check command. Success requires at least one successful tool result, while functional verification still requires the agent to choose an appropriate check. A successful syntax check is not equivalent to satisfying functional correctness.
 
 The engine must distinguish:
 

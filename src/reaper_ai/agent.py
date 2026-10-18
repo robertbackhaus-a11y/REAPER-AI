@@ -13,16 +13,12 @@ _MAX_CAPTURE_CHARS = 12_000
 
 
 class AgentState(TypedDict):
-    """Serializable seed state stored alongside the existing engine state."""
+    """Serializable state needed by the iterative LangGraph loop."""
 
-    objective: str
-    project_context: dict[str, Any]
     plan: list[dict[str, Any]]
     current_step: int
     next_action: dict[str, Any] | None
     observations: list[dict[str, Any]]
-    baselines: dict[str, Any]
-    change_evidence: list[dict[str, Any]]
     verification: dict[str, Any]
     budgets: dict[str, int]
 
@@ -99,21 +95,19 @@ def _context(action: dict[str, Any]) -> tuple[str, str]:
     return str(workspace_path), str(cwd_path)
 
 
-def new_agent_state(objective: str, workspace: str) -> AgentState:
-    """Create a checkpoint-friendly state without requiring a Git repository."""
-    root = str(Path(workspace).resolve())
-    status = tools.git_status(root)
+def new_agent_state() -> AgentState:
+    """Create the minimal state used by a new iterative agent run.
+
+    Checkpoints from earlier runs may contain additional keys.  They remain
+    valid because the graph reads only the fields defined here.
+    """
     return {
-        "objective": objective,
-        "project_context": {"workspace": root, "cwd": root},
         "plan": [],
         "current_step": 0,
         "next_action": None,
         "observations": [],
-        "baselines": {"git_status": _compact(status) if status.get("ok") else None, "files": {}},
-        "change_evidence": [],
         "verification": {"status": "not_started", "checks": []},
-        "budgets": {"tool_calls": 0, "max_wall_seconds": 600},
+        "budgets": {"tool_calls": 0},
     }
 
 

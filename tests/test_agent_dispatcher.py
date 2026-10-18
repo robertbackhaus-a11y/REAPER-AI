@@ -1,5 +1,8 @@
 import unittest
 import uuid
+import os
+import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
@@ -9,6 +12,17 @@ from reaper_ai.persistence import Store
 
 
 class AgentDispatcherTests(unittest.TestCase):
+    def test_event_output_is_utf8_with_legacy_windows_codepage(self):
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "cp1252"
+        result = subprocess.run(
+            [sys.executable, "-c", "from reaper_ai.engine import _emit_event; _emit_event('unicode_probe', text='Müll € �')"],
+            capture_output=True, env=env, timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+        output = result.stdout.decode("utf-8")
+        self.assertIn("Müll € �", output)
+
     def test_dispatcher_reads_writes_observes_failures_and_timeouts(self):
         root = Path.cwd() / f".reaper-agent-{uuid.uuid4().hex}"
         outside = Path.cwd() / f".reaper-agent-outside-{uuid.uuid4().hex}.txt"
@@ -17,15 +31,9 @@ class AgentDispatcherTests(unittest.TestCase):
             (root / "sample.txt").write_text("first line\nneedle line\nthird line\n", encoding="utf-8")
             context = {"workspace": str(root)}
 
-            state = new_agent_state("inspect sample", str(root))
-            self.assertEqual(state["project_context"]["workspace"], str(root.resolve()))
-            self.assertIn("git_status", state["baselines"])
-            store = Store(root / "state.sqlite3")
-            store.create_run({"run_id": "agent-state", "workspace": str(root), "model": "test-model",
-                              "task": "inspect sample", "timeout": 30, "status": "running", "started_at": "now"})
-            store.save_checkpoint("agent-state", stage="inventory", next_stage="select",
-                                  state={"workspace": str(root), "agent": state}, stage_result={"status": "ready"})
-            self.assertEqual(store.get_checkpoint("agent-state")["state"]["agent"]["objective"], "inspect sample")
+            state = new_agent_state()
+            self.assertEqual(state["current_step"], 0)
+            self.assertEqual(state["budgets"]["tool_calls"], 0)
 
             listed = dispatch_tool({"tool": "list_files", "args": {}, "context": context})
             self.assertTrue(listed["ok"], listed)
@@ -91,9 +99,6 @@ class AgentDispatcherTests(unittest.TestCase):
             sample = root / "sample.txt"
             if sample.exists():
                 sample.unlink()
-            database = root / "state.sqlite3"
-            if database.exists():
-                database.unlink()
             root.rmdir()
 
         git_status = dispatch_tool({"tool": "git_status", "args": {},
@@ -123,7 +128,7 @@ class AgentDispatcherTests(unittest.TestCase):
 
             with patch.dict("os.environ", {"REAPER_DATA_DIR": str(root), "REAPER_API_RUN_ID": "agent-loop"},
                             clear=False), patch.object(engine, "ask_json", side_effect=lambda *_: next(decisions)):
-                result = engine._original_run("Inspect sample.txt without edits", str(root), agent_mode=True)
+                result = engine.run("Inspect sample.txt without edits", str(root))
                 checkpoint = store.get_checkpoint("agent-loop")
                 self.assertEqual(checkpoint["stage"], "agent_observe")
                 self.assertEqual(checkpoint["next_stage"], "agent_decide")
@@ -134,7 +139,7 @@ class AgentDispatcherTests(unittest.TestCase):
 
                 store.update_run_status("agent-loop", "interrupted")
                 with patch.dict("os.environ", {"REAPER_RESUME": "1"}, clear=False):
-                    resumed = engine._original_run("ignored after checkpoint", str(root), agent_mode=False)
+                    resumed = engine.run("ignored after checkpoint", str(root))
             self.assertEqual(resumed["status"], "completed", resumed)
             self.assertEqual(resumed["tool_calls"], 3)
             self.assertIn("needle", resumed["summary"])

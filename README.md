@@ -29,7 +29,7 @@ Dispatchable actions are file listing/searching, UTF-8 file and line-range reads
 
 Commands and tools execute with the started user's ordinary operating-system permissions—there is no automatic elevation, shell allow-list, command blacklist, risk class, or approval workflow. Timeouts and supervisor cancellation remain active. Existing text files must be read first and written with their returned SHA-256 hash; a changed source causes a conflict instead of an overwrite.
 
-The active graph is `Prepare → Decide → Execute → Observe → Decide … → Finalize`. Ollama returns a JSON action or final-report decision; the engine supplies project context, dispatches deterministically, and stores the normalized result as an observation. A failed tool call becomes the next decision's evidence rather than ending the run. Completion requires at least one successful tool result; a final model statement remains an assessment, not independent verification. The prior static coding graph is retained only for historical code/checkpoint compatibility and is no longer an executable API or CLI mode.
+The active graph is `Prepare → Decide → Execute → Observe → Decide … → Finalize`. Ollama returns a JSON action or final-report decision; the engine supplies project context, dispatches deterministically, and stores the normalized result as an observation. A failed tool call becomes the next decision's evidence rather than ending the run. Completion requires at least one successful tool result; a final model statement remains an assessment, not independent verification. The former static coding graph has been removed; historical static checkpoints remain in SQLite for record retention but are rejected safely because they have no executable graph.
 
 ## Local history
 
@@ -54,7 +54,7 @@ Assistant/model prose, ordinary chat messages, checkpoint state, and unsuccessfu
 
 After each completed, nonterminal engine stage, REAPER-AI replaces a versioned SQLite checkpoint containing the full execution state and that stage's result. On API startup, stale `running`/`cancelling` runs are marked `interrupted`; nothing restarts by itself. The browser shows a recovery status and an explicit **Ab … fortsetzen** button for an interrupted, cancelled, or timed-out run with a valid checkpoint. The same operation is available via `GET /runs/{run_id}/recovery` and `POST /runs/{run_id}/resume`.
 
-Recovery starts LangGraph at the checkpoint's next stage, so completed actions are not rerun. The agent saves the same SQLite checkpoint after `agent_prepare`, `agent_decide`, `agent_execute`, and `agent_observe`; a resumed agent starts at the stored safe stage with its plan, observations, and pending action intact. A missing, corrupt, incompatible, or workspace-inconsistent checkpoint is reported as unavailable or fails safely after the explicit request; it is never guessed or replayed automatically. Historical static-pipeline checkpoints remain stored but are not executable by the active iterative agent.
+Recovery starts LangGraph at the checkpoint's next stage, so completed actions are not rerun. The agent saves the same SQLite checkpoint after `agent_prepare`, `agent_decide`, `agent_execute`, and `agent_observe`; a resumed agent starts at the stored safe stage with its plan, observations, and pending action intact. A missing, corrupt, incompatible, workspace-inconsistent, or historical static-pipeline checkpoint is reported as unavailable or fails safely after the explicit request; it is never guessed or replayed automatically.
 
 ## API
 
