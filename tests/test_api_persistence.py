@@ -80,20 +80,19 @@ class ApiPersistenceTests(unittest.TestCase):
     def test_recovery_endpoint_exposes_only_explicitly_resumable_checkpoint(self):
         api._store.create_run({"run_id": "interrupted-run", "workspace": "C:/project", "model": "model",
                                "task": "resume", "timeout": 20, "status": "interrupted", "started_at": "then"})
-        api._store.save_checkpoint("interrupted-run", stage="select", next_stage="propose",
-                                   state={"workspace": "C:/project", "inventory": [], "selected": [],
-                                          "creating": [], "originals": {}, "changes": {}, "status": "selected",
-                                          "error": "", "details": [], "corrections": 0, "feedback": ""},
-                                   stage_result={"status": "selected"})
+        api._store.save_checkpoint("interrupted-run", stage="agent_observe", next_stage="agent_decide",
+                                   state={"workspace": "C:/project", "agent": {"observations": []}},
+                                   stage_result={"status": "agent_observed"})
         recovery = api.get_recovery("interrupted-run")
         self.assertTrue(recovery["can_resume"])
-        self.assertEqual(recovery["checkpoint"]["next_stage"], "propose")
+        self.assertEqual(recovery["checkpoint"]["next_stage"], "agent_decide")
 
     def test_resume_endpoint_starts_only_after_explicit_request(self):
         api._store.create_run({"run_id": "resume-api", "workspace": "C:/project", "model": "model",
                                "task": "resume", "timeout": 20, "status": "interrupted", "started_at": "then"})
-        api._store.save_checkpoint("resume-api", stage="select", next_stage="propose",
-                                   state={"workspace": "C:/project"}, stage_result={"status": "selected"})
+        api._store.save_checkpoint("resume-api", stage="agent_observe", next_stage="agent_decide",
+                                   state={"workspace": "C:/project", "agent": {"observations": []}},
+                                   stage_result={"status": "agent_observed"})
         captured = {}
 
         class Process:

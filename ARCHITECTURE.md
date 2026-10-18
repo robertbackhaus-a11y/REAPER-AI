@@ -19,7 +19,7 @@ REAPER-AI runs locally and does not commit or push changes automatically.
 
 # REAPER-AI — Architecture
 
-**Status:** M0–M4 and M5/P01–P03 implemented with documented acceptance limits; the optional external Basic Memory integration is deferred.
+**Status:** M0–M4, M5/P01–P03, and M6 (iterative state, unrestricted local dispatcher, and LangGraph loop) implemented with documented acceptance limits; the optional external Basic Memory integration is deferred.
 **Scope:** Local, single-user autonomous coding agent  
 **Language:** English for repository documentation; user interaction follows the user's language.
 
@@ -52,6 +52,7 @@ The former REAPER-AI v0.x implementation is **not** an architectural baseline. T
 | Source-of-truth | **Repository and tool results** | Current files, Git state, exit codes, and test results outrank memory |
 | Conversation/run history | **SQLite via Python stdlib** | One local file, no ORM or server; records conversations, runs, results, and bounded structured events |
 | Persistent execution | **SQLite stage checkpoints with explicit recovery** | Continue only after user action from the next verified stage; no automatic replay |
+| Iterative-agent execution | **Serializable agent state plus deterministic dispatcher** | One LangGraph loop reuses current adapters and checkpoints |
 | Git safety | **Never commit/push automatically** | Changes remain reviewable and under user control |
 
 LangGraph is already installed in the local development environment and is used **as an embedded Python library**, not as a hosted LangGraph server/platform. The custom UI is served locally through FastAPI; **Chainlit is excluded**. No LangSmith or other cloud dependency is required.
@@ -164,6 +165,25 @@ ExecutionState
 
 The model can propose findings, a plan, and tool requests; the **engine owns counters, tool results, file-change evidence, permissions, and terminal status**. Do not ask the model to fabricate engine-owned fields.
 
+### M6/P01 agent foundation (implemented)
+
+`reaper_ai.agent.AgentState` is a compact, JSON-serializable state for every new run. It holds the objective and project context, plan/current step, next action, compact observations, Git/file baselines, change evidence, verification state, and wall-time/tool accounting. The existing SQLite checkpoint already stores the complete engine state, so no second persistence store or checkpoint mechanism is introduced.
+
+`dispatch_tool` is the single execution boundary. A request has a tool name, structured arguments, and a context containing workspace and optional working directory. Its result always has `ok`, `exit_code` where applicable, stdout/stderr or structured data, `duration_ms`, `changes`, and a precise `error`. Output is bounded before it can become an observation. It does not elevate privileges; the operating system is the authority for every action.
+
+The active execution graph is:
+
+```text
+START → agent_prepare → agent_decide → agent_execute → agent_observe
+                              ↑                              │
+                              └──────── next decision ────────┘
+agent_decide → agent_finalize → END
+```
+
+`agent_decide` obtains a constrained JSON action or final-report decision from Ollama. The engine supplies project context; `agent_execute` calls `dispatch_tool`; and `agent_observe` appends the normalized result to state. Tool errors become observations for the next decision. A final report is accepted only after at least one successful observed tool result. The model's final prose remains an assessment separate from the `observed_tools` verification label.
+
+The agent has a wall-time budget, compact captured output, and a LangGraph recursion guard derived from wall time; it has no arbitrary model-call, tool-call, file, or repair cap. It checkpoints after prepare, decision, execution, and observation through the existing SQLite store. Recovery recognizes `agent_*` stages and starts at their stored next safe node; already-observed tools are not rerun. The API accepts any existing absolute project directory; Git is optional, and SSE carries the existing phase/model/tool/checkpoint events.
+
 ### Proposed nodes
 
 1. **Classify / prepare:** Identify task type, bind project root, capture repository baseline, apply safety constraints.
@@ -200,7 +220,7 @@ Inventory records every regular tracked project file as compact path, byte-size,
 
 The full manifest remains in engine state. The selection prompt uses a relevance-ranked compact subset to fit its own prompt and explicitly permits a user-named tracked path that is not present in that subset. Once selected, UTF-8 content is read in bounded chunks and retained as the exact precondition for later writes; it is not blindly copied into the proposal prompt.
 
-The graph then has a deterministic **source-analysis** boundary between selection and proposal. It maps selected text into bounded functions, classes, or generic file sections with line and character-offset ranges. It first retains one fitting section from every selected file, then fills the configurable proposal budget with task-relevant sections. `REAPER_MODEL_CONTEXT_CHARS` defaults to 36,000 UTF-8 bytes and is clamped to 8,000–96,000; the complete proposal prompt is checked against that limit. The model may return at most 12 precise non-overlapping edits, each naming an already supplied line/character range and an exact, unique expected snippet. The engine applies replacements against the retained original source in reverse offset order, then rechecks source and Git preconditions immediately before writing. This supports multiple edits without accepting whole-file replacement or overwriting an intervening external change.
+The graph then has a deterministic **source-analysis** boundary between selection and proposal. It maps selected text into bounded functions, classes, or generic file sections with line and character-offset ranges plus a SHA-256 digest of the original file. It first retains one fitting section from every selected file, then fills the configurable proposal budget with task-relevant sections. `REAPER_MODEL_CONTEXT_CHARS` defaults to 36,000 UTF-8 bytes and is clamped to 8,000–96,000; the complete proposal prompt is checked against that limit. The model may return at most 12 precise non-overlapping edits, each echoing an already supplied range and digest plus an expected snippet that is unique **within that range**. The engine applies replacements against the retained original source in reverse offset order, then immediately verifies the expected range and complete source digest before writing, followed by its Git preconditions. This permits identical text in separate functions while rejecting a stale or ambiguous target range without overwriting an intervening external change.
 
 ### Progress and budgets
 
@@ -229,7 +249,7 @@ Workers are a capability to add after the single-agent execution path works, not
 
 Tools are narrow Python adapters returning **structured results**. A shell remains available for operations that cannot be expressed as a focused tool, but should not be the sole file-inspection or Git interface.
 
-### Initial tools
+### Current P01 tools and future extensions
 
 | Tool | Responsibility | Evidence |
 |---|---|---|
@@ -239,14 +259,17 @@ Tools are narrow Python adapters returning **structured results**. A shell remai
 | `run_command` | PowerShell or child process execution with cwd/timeout/output cap | Command, exit code, captured output |
 | `run_checks` | Targeted syntax/build/test commands | Exact commands, exit codes, results |
 
+The dispatcher exposes `list_files`, `read_file`, `read_file_range`, `search_text`, `write_file`, `git_status`, `git_diff`, `find_python`, and `shell` through the iterative graph. A workspace is initial project context, not a filesystem boundary: file paths may be absolute, and the shell's working directory can be explicitly supplied. Git actions are observational and do not require a repository.
+
+There is no shell allow-list, command blacklist, risk classification, or approval dispatcher. Tools run under the started user's ordinary operating-system permissions, without automatic elevation. A text write to an existing file requires the SHA-256 returned by a prior read; a changed source returns a conflict and is not overwritten.
+
 Tools must validate their working directory and report failures explicitly. An output-truncation flag is never interpreted as a complete source read. Tool implementations—not the LLM—record actual invocation data.
 
 ### Safety and change policy
 
-- Operate only on explicitly selected project/workspace unless the user authorizes another path.
+- Treat the workspace as normal project context, not a filesystem sandbox. Absolute file paths are permitted and remain subject to the started user's operating-system permissions.
 - Preserve pre-existing dirty changes; capture baseline before the run. Do not confuse existing modifications with this run's work.
 - Default to no Git commit, push, tag, release, deployment, package installation, or destructive deletion.
-- Require explicit approval for irreversible or high-impact actions.
 - Make cancellation terminate the entire process tree, including shell children; use suitable Windows process containment where required.
 - A dedicated project working directory is distinct from persistent application data.
 
@@ -384,7 +407,7 @@ The architecture is viable only if a prototype can demonstrate all of the follow
 
 **Architectural direction:** Build REAPER-AI from scratch around embedded **LangGraph + local Ollama + evidence-producing tools**. The custom lightweight UI, local FastAPI/SSE boundary, and single-file SQLite persistence are selected and implemented. Do not recreate the v0.x free-running stage runner.
 
-## Implementation status — M4 and M5/P01–P03
+## Implementation status — M4, M5/P01–P03, and M6/P01–P02
 
 The lightweight browser UI is implemented with HTML, CSS and vanilla JavaScript, served locally by FastAPI.
 
@@ -401,4 +424,4 @@ Limitations:
 - Persistent sessions, completed run history, explicit stage-checkpoint recovery, and scoped durable memory are implemented in SQLite (M5/P01–P03).
 - Run-result presentation and public run-ID consistency require refinement.
 
-M5/P01–P03 verification is covered by focused storage/API tests for conversation/message/run association, persisted stage results/events, checkpoint integrity, stale-run detection, restart from the checkpoint's next stage, and durable-memory scope/source/restart behavior. This does not claim automatic resumption, general process restoration, or semantic fact retrieval.
+M5/P01–P03 verification is covered by focused storage/API tests for conversation/message/run association, persisted stage results/events, checkpoint integrity, stale-run detection, restart from the checkpoint's next stage, and durable-memory scope/source/restart behavior. M6 has focused dispatcher/agent tests for file list/read/range/search/write, a failed range followed by correction, recovery from the saved next decision without re-running tools, absolute-path writing, Git status, Python discovery, and PowerShell output/nonzero/timeout handling. A live `qwen3:8b` read-only run searched `def dispatch_tool`, read `src/reaper_ai/agent.py` lines 152–180, and completed with two successful observed tool results and no Git change. This does not claim general process restoration or semantic fact retrieval.

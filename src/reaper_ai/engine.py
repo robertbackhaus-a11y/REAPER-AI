@@ -1,8 +1,4 @@
-"""REAPER-AI: bounded, multi-file coding engine with structural verification.
-
-One repository inventory, one file-selection call, deterministic source analysis,
-one change-proposal call, one preflight, one apply, one verification. No autonomous tool loop.
-"""
+"""REAPER-AI iterative LangGraph tool agent with persisted recovery points."""
 
 import argparse
 import ast
@@ -15,21 +11,19 @@ import tomllib
 from contextvars import ContextVar
 import subprocess
 from pathlib import Path
-from typing import TypedDict
+from typing import Any, TypedDict
 
 import httpx
 from langgraph.graph import END, START, StateGraph
 
+from reaper_ai.agent import AgentState, dispatch_tool, new_agent_state
 from reaper_ai.tools import _file
 from reaper_ai.persistence import StorageError, Store
 
 OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
 MODEL = os.environ.get("REAPER_MODEL", "qwen3.6:35b")
-MAX_EDIT_OPERATIONS = 12
-MAX_SELECTION_MANIFEST_CHARS = 24_000
 _READ_CHUNK_CHARS = 8_192
 _BINARY_PROBE_BYTES = 8_192
-MAX_MODEL_CALLS = 4  # selection + proposal + at most one repair
 MAX_WALL_SECONDS = 600
 _MAX_REPLY_CHARS = 80_000
 _MODEL_PROTOCOL_OVERHEAD_BYTES = 512
@@ -38,9 +32,10 @@ _RUN = ContextVar("reaper_run_metrics", default=None)
 _PROPOSAL_SYSTEM = (
     "Implement only the needed changes in the provided source sections. "
     'Return JSON {"edits":[{"path":"relative.txt","start_line":1,"end_line":2,'
-    '"start_offset":0,"end_offset":20,"expected":"exact unique existing text",'
+    '"start_offset":0,"end_offset":20,"source_digest":"sha256 from section",'
+    '"expected":"exact existing text in that section",'
     '"replacement":"replacement text"}],"new_files":{}}. '
-    "An edit range must exactly match one provided section; expected must be a unique snippet within it. "
+    "An edit range and source_digest must exactly match one provided section; expected must occur once within it. "
     "Use multiple non-overlapping edits for multiple changes. New files must be selected creation paths. "
     "Do not return full existing files, Markdown, or claims about tests."
 )
@@ -63,8 +58,6 @@ def _budget():
         return None
     if time.monotonic() >= metrics["deadline"]:
         raise RunBudgetExceeded("Wall-time budget exhausted")
-    if metrics["model_calls"] >= MAX_MODEL_CALLS:
-        raise RunBudgetExceeded("Model-call budget exhausted")
     return metrics
 
 
@@ -72,6 +65,9 @@ def _budget():
 class CodingState(TypedDict):
     workspace: str
     task: str
+    # M6/P01 seed for the iterative agent.  The current stage graph does not
+    # route through it yet, but checkpoint snapshots preserve it for P02.
+    agent: AgentState
     inventory: list[dict]
     selected: list[str]
     creating: list[str]
@@ -84,6 +80,18 @@ class CodingState(TypedDict):
     details: list[dict]
     corrections: int
     feedback: str
+
+
+class AgentRunState(TypedDict):
+    """LangGraph state for the bounded, tool-driven agent path."""
+
+    workspace: str
+    task: str
+    agent: AgentState
+    status: str
+    error: str
+    details: list[dict[str, Any]]
+    last_result: dict[str, Any] | None
 
 
 def git(root: Path, *args: str) -> subprocess.CompletedProcess:
@@ -223,8 +231,9 @@ def _analyze_selected_sources(state: CodingState) -> list[dict]:
     for path in state["selected"]:
         if path in state["creating"]:
             continue
+        source_digest = code_digest(state["originals"][path])
         for section in _source_sections(path, state["originals"][path]):
-            item = {"path": path, **section}
+            item = {"path": path, "source_digest": source_digest, **section}
             haystack = (path + " " + item["label"] + " " + item["content"]).casefold()
             item["_rank"] = (
                 0 if Path(path).name.casefold() in terms or path.casefold() in terms else 1,
@@ -240,7 +249,7 @@ def _analyze_selected_sources(state: CodingState) -> list[dict]:
 
     def compact(item: dict) -> dict:
         return {key: item[key] for key in
-                ("path", "start_line", "end_line", "start_offset", "end_offset", "label", "content")}
+                ("path", "start_line", "end_line", "start_offset", "end_offset", "source_digest", "label", "content")}
 
     def add_if_fits(item: dict) -> bool:
         nonlocal prompt_size
@@ -287,10 +296,11 @@ def _selection_manifest(inventory: list[dict], task: str) -> tuple[list[dict], i
 
     manifest: list[dict] = []
     used = 0
+    budget = _model_context_budget()
     for item in sorted(inventory, key=rank):
         compact = {key: item[key] for key in ("path", "kind", "bytes")}
         size = len(json.dumps(compact, ensure_ascii=False)) + 1
-        if used + size > MAX_SELECTION_MANIFEST_CHARS:
+        if used + size > budget:
             continue
         manifest.append(compact)
         used += size
@@ -342,6 +352,208 @@ def ask_json(system: str, user: str) -> dict:
     return result
 
 
+_AGENT_DECISION_SYSTEM = """You are Sentinel's next-action planner. Return JSON only.
+Choose exactly one of:
+{"kind":"action","plan":[{"step":"short purpose"}],"action":{"tool":"supported tool","args":{...}}}
+{"kind":"final","summary":"concise evidence-based answer","verification":"what the observed tool results establish"}
+
+Supported tools: list_files(path?, max_results?), search_text(query, path?, max_results?, case_sensitive?),
+read_file(path, max_chars?), read_file_range(path, start_line, end_line, max_chars?), git_status, git_diff,
+find_python, shell(command, timeout?), write_file(path, content, expected_hash?). Use focused reads before edits.
+Paths may be relative to the project workspace or absolute. Shell commands and writes run with the started user's
+normal operating-system permissions; do not claim a fact without a tool result and do not claim an action succeeded
+unless its result says so. Before writing an existing text file, read it and pass its returned sha256 as expected_hash.
+Git is optional. Use errors returned by tools to correct your next action."""
+
+
+def _agent_prompt(state: AgentRunState) -> str:
+    """Give the model a compact, chronological observation window."""
+    agent = state["agent"]
+    budget = _model_context_budget() - len(_AGENT_DECISION_SYSTEM.encode("utf-8")) - _MODEL_PROTOCOL_OVERHEAD_BYTES
+    prefix = {"task": state["task"], "workspace": state["workspace"],
+              "path_rule": "Paths may be workspace-relative or absolute.",
+              "plan": agent["plan"], "current_step": agent["current_step"], "previous_observations": []}
+    used = len(json.dumps(prefix, ensure_ascii=False).encode("utf-8"))
+    chosen: list[dict] = []
+    for observation in reversed(agent["observations"]):
+        encoded = json.dumps(observation, ensure_ascii=False).encode("utf-8")
+        if used + len(encoded) > budget:
+            continue
+        chosen.append(observation)
+        used += len(encoded)
+    prefix["previous_observations"] = list(reversed(chosen))
+    return json.dumps(prefix, ensure_ascii=False)
+
+
+def _agent_action(decision: dict, workspace: str) -> dict | None:
+    action = decision.get("action")
+    if not isinstance(action, dict) or not isinstance(action.get("tool"), str):
+        return None
+    args = action.get("args", {})
+    if not isinstance(args, dict):
+        return None
+    # The workspace remains project context; absolute paths are intentionally
+    # handled by the dispatcher under the launched user's OS permissions.
+    context = {"workspace": workspace}
+    requested_context = action.get("context")
+    if isinstance(requested_context, dict) and isinstance(requested_context.get("cwd"), str):
+        context["cwd"] = requested_context["cwd"]
+    result = {"tool": action["tool"], "args": args, "context": context}
+    return result
+
+
+def agent_prepare(state: AgentRunState) -> dict:
+    _emit_event("phase_changed", phase="agent_prepare")
+    agent = dict(state["agent"])
+    agent["project_context"] = {**agent["project_context"], "workspace": state["workspace"]}
+    return {"agent": agent, "status": "agent_prepared", "error": "", "last_result": None}
+
+
+def agent_decide(state: AgentRunState) -> dict:
+    _emit_event("phase_changed", phase="agent_decide")
+    try:
+        decision = ask_json(_AGENT_DECISION_SYSTEM, _agent_prompt(state))
+    except (RunBudgetExceeded, httpx.TimeoutException):
+        raise
+    except Exception as exc:
+        return {"status": "agent_failed", "error": f"Agent decision failed: {exc}"}
+    agent = dict(state["agent"])
+    plan = decision.get("plan")
+    if isinstance(plan, list) and all(isinstance(item, dict) for item in plan):
+        agent["plan"] = plan
+    kind = decision.get("kind")
+    if kind == "final":
+        successful = any(observation.get("result", {}).get("ok") for observation in agent["observations"])
+        if not successful:
+            return {"agent": agent, "status": "agent_failed",
+                    "error": "Agent attempted final report without successful tool evidence"}
+        verification = dict(agent["verification"])
+        verification.update({"status": "ready", "summary": str(decision.get("summary", ""))[:4_000],
+                             "model_assessment": str(decision.get("verification", ""))[:4_000],
+                             "observed_tools": len(agent["observations"])})
+        agent["verification"] = verification
+        agent["next_action"] = None
+        return {"agent": agent, "status": "agent_finalizing", "error": ""}
+    if kind != "action":
+        return {"agent": agent, "status": "agent_failed",
+                "error": "Agent decision must be an action or final report"}
+    action = _agent_action(decision, state["workspace"])
+    if action is None:
+        return {"agent": agent, "status": "agent_failed",
+                "error": "Agent action requires a tool name and object arguments"}
+    agent["next_action"] = action
+    _emit_event("agent_decision", tool=action["tool"], step=agent["current_step"] + 1)
+    return {"agent": agent, "status": "agent_action_ready", "error": ""}
+
+
+def agent_execute(state: AgentRunState) -> dict:
+    _emit_event("phase_changed", phase="agent_execute")
+    _budget()
+    agent = dict(state["agent"])
+    action = agent.get("next_action")
+    if not isinstance(action, dict):
+        return {"status": "agent_failed", "error": "Agent has no action to execute"}
+    budgets = dict(agent["budgets"])
+    _emit_event("tool_started", tool=action.get("tool"), action=action)
+    result = dispatch_tool(action)
+    budgets["tool_calls"] = budgets.get("tool_calls", 0) + 1
+    agent["budgets"] = budgets
+    _emit_event("tool_completed", tool=action.get("tool"), ok=result["ok"], exit_code=result["exit_code"],
+                duration_ms=result["duration_ms"], error=result["error"])
+    return {"agent": agent, "last_result": result, "status": "agent_executed", "error": ""}
+
+
+def agent_observe(state: AgentRunState) -> dict:
+    _emit_event("phase_changed", phase="agent_observe")
+    agent = dict(state["agent"])
+    action = agent.get("next_action")
+    result = state.get("last_result")
+    if not isinstance(action, dict) or not isinstance(result, dict):
+        return {"status": "agent_failed", "error": "Agent observation lacks action or result"}
+    observation = {"step": agent["current_step"] + 1, "action": action, "result": result}
+    observations = [*agent["observations"], observation]
+    agent["observations"] = observations
+    agent["current_step"] += 1
+    agent["next_action"] = None
+    _emit_event("agent_observation", step=agent["current_step"], tool=action.get("tool"), ok=result.get("ok"))
+    return {"agent": agent, "status": "agent_observed", "error": "", "details": observations,
+            "last_result": None}
+
+
+def agent_finalize(state: AgentRunState) -> dict:
+    _emit_event("phase_changed", phase="agent_finalize")
+    agent = dict(state["agent"])
+    verification = dict(agent["verification"])
+    verification["status"] = "observed"
+    agent["verification"] = verification
+    _emit_event("verification_completed", status="agent_completed", checks=len(agent["observations"]))
+    return {"agent": agent, "status": "agent_completed", "error": "", "details": agent["observations"]}
+
+
+def _agent_checkpoint_next_stage(stage: str, state: dict) -> str | None:
+    status = state.get("status")
+    if stage == "agent_prepare" and status == "agent_prepared":
+        return "agent_decide"
+    if stage == "agent_decide" and status == "agent_action_ready":
+        return "agent_execute"
+    if stage == "agent_execute" and status == "agent_executed":
+        return "agent_observe"
+    if stage == "agent_observe" and status == "agent_observed":
+        return "agent_decide"
+    return None
+
+
+def _agent_checkpointed(stage: str, function):
+    """Persist safe agent decision boundaries in the existing SQLite store."""
+    def wrapped(state: AgentRunState) -> dict:
+        update = function(state)
+        run_id = os.environ.get("REAPER_API_RUN_ID")
+        next_stage = _agent_checkpoint_next_stage(stage, {**state, **update})
+        if not run_id or next_stage is None:
+            return update
+        try:
+            Store().save_checkpoint(run_id, stage=stage, next_stage=next_stage,
+                                    state={**state, **update}, stage_result=update)
+            _emit_event("checkpoint_saved", stage=stage, next_stage=next_stage)
+        except StorageError as exc:
+            return {"status": "agent_failed", "error": f"Checkpoint could not be saved: {exc}"}
+        return update
+    return wrapped
+
+
+def _route_agent_decision(state: AgentRunState) -> str:
+    return {"agent_action_ready": "execute", "agent_finalizing": "finalize"}.get(state["status"], "end")
+
+
+def _route_agent_execute(state: AgentRunState) -> str:
+    return "observe" if state["status"] == "agent_executed" else "end"
+
+
+def _route_agent_observe(state: AgentRunState) -> str:
+    return "decide" if state["status"] == "agent_observed" else "end"
+
+
+def build_agent_graph(start_stage: str = "agent_prepare"):
+    nodes = {"agent_prepare": agent_prepare, "agent_decide": agent_decide,
+             "agent_execute": agent_execute, "agent_observe": agent_observe,
+             "agent_finalize": agent_finalize}
+    if start_stage not in nodes:
+        raise ValueError(f"Unsupported agent checkpoint stage: {start_stage}")
+    graph = StateGraph(AgentRunState)
+    for name, function in nodes.items():
+        graph.add_node(name, _agent_checkpointed(name, function))
+    graph.add_edge(START, start_stage)
+    graph.add_edge("agent_prepare", "agent_decide")
+    graph.add_conditional_edges("agent_decide", _route_agent_decision,
+                                {"execute": "agent_execute", "finalize": "agent_finalize", "end": END})
+    graph.add_conditional_edges("agent_execute", _route_agent_execute,
+                                {"observe": "agent_observe", "end": END})
+    graph.add_conditional_edges("agent_observe", _route_agent_observe,
+                                {"decide": "agent_decide", "end": END})
+    graph.add_edge("agent_finalize", END)
+    return graph.compile()
+
+
 def code_digest(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
@@ -351,24 +563,14 @@ def inventory(state: CodingState) -> dict:
     print("[INVENTORY]")
     try:
         root = Path(state["workspace"]).resolve()
-        top = git(root, "rev-parse", "--show-toplevel")
-        if top.returncode or Path(top.stdout.strip()).resolve() != root:
-            raise ValueError("Workspace must be the root of a Git repository")
-        files = git(root, "ls-files", "--cached")
-        if files.returncode:
-            raise ValueError(files.stderr.strip())
         candidates = []
-        for name in files.stdout.splitlines():
-            try:
-                target = _file(str(root), name)
-            except ValueError:
-                continue
+        for target in sorted(root.rglob("*")):
             if not target.is_file():
                 continue
             relative = target.relative_to(root).as_posix()
             candidates.append({"path": relative, "kind": _file_kind(target), "bytes": target.stat().st_size})
         if not candidates:
-            raise ValueError("No regular tracked project files")
+            raise ValueError("No regular project files")
         return {"inventory": candidates, "status": "inventoried", "error": ""}
     except (OSError, ValueError, UnicodeError, subprocess.TimeoutExpired, RunBudgetExceeded) as exc:
         return {"status": "failed", "error": str(exc)}
@@ -379,9 +581,9 @@ def select(state: CodingState) -> dict:
     print("[SELECT]")
     try:
         result = ask_json(
-            "Select existing tracked UTF-8 text files to edit AND new UTF-8 text paths to create. "
+            "Select existing UTF-8 text files to edit AND new UTF-8 text paths to create. "
             'Return JSON {"edit":["existing.txt"],"create":["new.txt"]}. '
-            f"At most {MAX_EDIT_OPERATIONS} concrete operations; existing paths must come from inventory. "
+            "Existing paths must come from inventory. "
             "Binary files are visible for analysis but must never be selected for text editing. "
             "Only request new files if needed. Never select a path both ways.",
             _selection_prompt(state),
@@ -391,8 +593,8 @@ def select(state: CodingState) -> dict:
             raise ValueError("Invalid selection format")
         selected = paths + creating
         known = {item["path"]: item for item in state["inventory"]}
-        if not 1 <= len(selected) <= MAX_EDIT_OPERATIONS:
-            raise ValueError(f"File selection must contain 1 to {MAX_EDIT_OPERATIONS} paths (got {len(selected)})")
+        if not selected:
+            raise ValueError("File selection must contain at least one path")
         if any(not isinstance(x, str) for x in selected):
             raise ValueError("File selection paths must be strings")
         if len(set(selected)) != len(selected):
@@ -409,19 +611,11 @@ def select(state: CodingState) -> dict:
             target = _file(str(root), path)
             if not target.is_file():
                 raise ValueError(f"File disappeared: {path}")
-            clean = git(root, "diff", "HEAD", "--quiet", "--", path)
-            if clean.returncode != 0:
-                raise ValueError(f"File already has Git changes: {path}")
             originals[path] = _read_text_sections(target)
         for path in creating:
             target = _file(str(root), path)
             if target.exists() or path in known:
                 raise ValueError(f"New path already exists: {path}")
-            ignored = git(root, "check-ignore", "-q", "--", path)
-            if ignored.returncode == 0:
-                raise ValueError(f"New file is gitignored: {path}")
-            if ignored.returncode != 1:
-                raise ValueError(f"Git ignore check failed: {path}")
         return {"selected": selected, "creating": creating, "originals": originals, "analysis": [], "edits": [],
                 "status": "selected", "error": ""}
     except (OSError, ValueError, UnicodeError, httpx.HTTPError,
@@ -438,30 +632,43 @@ def analyze(state: CodingState) -> dict:
         return {"status": "failed", "error": str(exc)}
 
 
-def _edit_position(source: str, edit: dict, available_ranges: set[tuple[str, int, int]]) -> int:
-    required = {"path", "start_line", "end_line", "start_offset", "end_offset", "expected", "replacement"}
+def _edit_position(source: str, edit: dict, available_ranges: set[tuple[str, int, int, int, int, str]]) -> int:
+    required = {"path", "start_line", "end_line", "start_offset", "end_offset", "source_digest", "expected", "replacement"}
     if set(edit) != required:
-        raise ValueError("Each edit must contain path, line/offset range, expected, and replacement")
-    path, start_line, end_line, start_offset, end_offset, expected, replacement = (
+        raise ValueError("Each edit must contain path, line/offset range, source digest, expected, and replacement")
+    path, start_line, end_line, start_offset, end_offset, source_digest, expected, replacement = (
         edit["path"], edit["start_line"], edit["end_line"], edit["start_offset"], edit["end_offset"],
-        edit["expected"], edit["replacement"]
+        edit["source_digest"], edit["expected"], edit["replacement"]
     )
     if (not isinstance(path, str) or not isinstance(start_line, int) or not isinstance(end_line, int)
             or not isinstance(start_offset, int) or not isinstance(end_offset, int)
+            or not isinstance(source_digest, str)
             or not isinstance(expected, str) or not expected or not isinstance(replacement, str)):
         raise ValueError("Invalid edit value types or empty expected text")
-    if (path, start_offset, end_offset) not in available_ranges:
+    if (path, start_line, end_line, start_offset, end_offset, source_digest) not in available_ranges:
         raise ValueError(f"Edit range was not provided for {path}: lines {start_line}-{end_line}")
-    position = source.find(expected)
-    if position < 0 or source.find(expected, position + 1) >= 0:
-        raise ValueError(f"Expected text must occur exactly once in {path}")
-    if position < start_offset or position + len(expected) > end_offset:
-        raise ValueError(f"Expected text is outside the provided range for {path}: lines {start_line}-{end_line}")
-    return position
+    if start_offset < 0 or end_offset < start_offset or end_offset > len(source):
+        raise ValueError(f"Edit range is outside the current source for {path}: offsets {start_offset}-{end_offset}")
+    section = source[start_offset:end_offset]
+    positions: list[int] = []
+    offset = 0
+    while (position := section.find(expected, offset)) >= 0:
+        positions.append(position)
+        offset = position + 1
+    if not positions:
+        raise ValueError(f"Expected text is absent from the selected range for {path}: "
+                         f"lines {start_line}-{end_line}, offsets {start_offset}-{end_offset}")
+    if len(positions) > 1:
+        raise ValueError(f"Expected text occurs {len(positions)} times in the selected range for {path}: "
+                         f"lines {start_line}-{end_line}; choose a narrower range")
+    if code_digest(source) != source_digest:
+        raise ValueError(f"Source digest changed before write for {path}; no file was overwritten")
+    return start_offset + positions[0]
 
 
 def _changes_from_edits(state: CodingState, edits: list[dict]) -> dict[str, str]:
-    available_ranges = {(item["path"], item["start_offset"], item["end_offset"])
+    available_ranges = {(item["path"], item["start_line"], item["end_line"],
+                         item["start_offset"], item["end_offset"], item["source_digest"])
                         for item in state["analysis"]}
     grouped: dict[str, list[tuple[int, dict]]] = {}
     for edit in edits:
@@ -487,12 +694,15 @@ def propose(state: CodingState) -> dict:
     print("[PROPOSE]")
     try:
         sections = state.get("analysis") or _analyze_selected_sources(state)
+        if any("source_digest" not in section for section in sections):
+            # A pre-BUG-008 checkpoint cannot prove positional source identity.
+            sections = _analyze_selected_sources(state)
         result = ask_json(_PROPOSAL_SYSTEM, _analysis_prompt(state, sections))
         edits, new_files = result.get("edits"), result.get("new_files", {})
         if not isinstance(edits, list) or not isinstance(new_files, dict):
             raise ValueError("Proposal must contain an edits list and new_files object")
-        if not 1 <= len(edits) + len(new_files) <= MAX_EDIT_OPERATIONS:
-            raise ValueError(f"Proposal must contain 1 to {MAX_EDIT_OPERATIONS} concrete operations")
+        if not edits and not new_files:
+            raise ValueError("Proposal must contain at least one concrete operation")
         if set(new_files) != set(state["creating"]):
             raise ValueError("Proposed new-file set differs from selected creation paths")
         changes = _changes_from_edits({**state, "analysis": sections}, edits)
@@ -527,10 +737,16 @@ def apply(state: CodingState) -> dict:
                 if target.exists():
                     raise ValueError(f"New file appeared during proposal: {name}")
             else:
-                if not target.is_file() or _read_text_sections(target) != state["originals"][name]:
-                    raise ValueError(f"Source changed during proposal: {name}")
-                if git(root, "diff", "HEAD", "--quiet", "--", name).returncode != 0:
-                    raise ValueError(f"Git state changed: {name}")
+                if not target.is_file():
+                    raise ValueError(f"Source disappeared during proposal: {name}")
+                current = _read_text_sections(target)
+                file_edits = [edit for edit in state.get("edits", [])
+                              if isinstance(edit, dict) and edit.get("path") == name]
+                if file_edits and all("source_digest" in edit for edit in file_edits):
+                    _changes_from_edits({**state, "originals": {**state["originals"], name: current}},
+                                        file_edits)
+                if code_digest(current) != code_digest(state["originals"][name]) or current != state["originals"][name]:
+                    raise ValueError(f"Source digest changed before write for {name}; no file was overwritten")
         for name, content in state["changes"].items():
             target = _file(str(root), name)
             if name in state["creating"]:
@@ -643,7 +859,7 @@ def advance(state: CodingState) -> str:
 
 
 def retry_proposal(state: CodingState) -> str:
-    return "repair" if state["status"] in {"proposal_failed", "verify_failed"} and state["corrections"] < 1 else "end"
+    return "repair" if state["status"] in {"proposal_failed", "verify_failed"} else "end"
 
 
 def repair_proposal(state: CodingState) -> dict:
@@ -661,9 +877,9 @@ def _next_stage(stage: str, state: dict) -> str | None:
     if stage == "propose":
         if status == "proposed":
             return "apply"
-        return "repair_proposal" if status == "proposal_failed" and state.get("corrections", 0) < 1 else None
+        return "repair_proposal" if status == "proposal_failed" else None
     if stage == "verify":
-        return "repair_proposal" if status == "verify_failed" and state.get("corrections", 0) < 1 else None
+        return "repair_proposal" if status == "verify_failed" else None
     return "propose" if stage == "repair_proposal" else None
 
 
@@ -747,8 +963,12 @@ def _resume_state(workspace: str) -> tuple[dict, str]:
     return state, next_stage
 
 
-def run(task: str, workspace: str) -> dict:
-    """Return a truthful run result. No claim of functional correctness."""
+def run(task: str, workspace: str, *, agent_mode: bool | None = None) -> dict:
+    """Run the sole iterative-agent execution path.
+
+    ``agent_mode`` is accepted temporarily for call-site compatibility; it no
+    longer selects a different orchestration path.
+    """
     started = time.monotonic()
     metrics = {"deadline": started + MAX_WALL_SECONDS,
                "model_calls": 0, "input_tokens": 0, "output_tokens": 0}
@@ -756,37 +976,47 @@ def run(task: str, workspace: str) -> dict:
     try:
         if os.environ.get("REAPER_RESUME") == "1":
             initial, start_stage = _resume_state(workspace)
+            if not start_stage.startswith("agent_"):
+                raise ValueError("Legacy static-pipeline checkpoint cannot be resumed by the iterative agent")
         else:
-            start_stage = "inventory"
-            initial = {"workspace": str(Path(workspace).resolve()), "task": task,
-                       "inventory": [], "selected": [], "creating": [], "originals": {},
-                       "analysis": [], "edits": [], "changes": {}, "status": "pending", "error": "", "details": [],
-                       "corrections": 0, "feedback": ""}
-        outcome = build_graph(start_stage).invoke(initial, config={"recursion_limit": 15})
+            start_stage = "agent_prepare"
+            agent = new_agent_state(task, workspace)
+            agent["budgets"] = {**agent["budgets"], "max_wall_seconds": MAX_WALL_SECONDS}
+            initial = {"workspace": str(Path(workspace).resolve()), "task": task, "agent": agent,
+                       "status": "pending", "error": "", "details": [], "last_result": None}
+        # LangGraph requires a recursion guard.  It is deliberately derived
+        # from the wall-time safety budget rather than a per-run work limit.
+        outcome = build_agent_graph(start_stage).invoke(
+            initial, config={"recursion_limit": max(1_000, MAX_WALL_SECONDS * 20)}
+        )
         internal = outcome["status"]
-        if internal == "structurally_verified":
+        if internal == "agent_completed":
             status = "completed"
-        elif internal in {"no_semantic_change", "verify_failed"}:
-            status = "failed"
         else:
             status = "failed"
         error = outcome.get("error", "")
         if "budget exhausted" in error.lower():
             status = "timed_out"
-        return {
+        result = {
             "status": status,
-            "verification_level": "structural" if status == "completed" else "none",
-            "changed_files": [r["path"] for r in outcome.get("details", [])] if status == "completed" else [],
+            "verification_level": "observed_tools" if internal == "agent_completed" else "none",
+            "changed_files": [change["path"] for observation in outcome.get("details", [])
+                              for change in observation.get("result", {}).get("changes", [])
+                              if isinstance(change, dict) and isinstance(change.get("path"), str)],
             "checks": outcome.get("details", []),
-            "corrections": outcome.get("corrections", 0),
             "reason": error,
             "internal_status": internal,
             "usage": {"model_calls": metrics["model_calls"],
                       "input_tokens": metrics["input_tokens"],
                       "output_tokens": metrics["output_tokens"],
                       "elapsed_seconds": round(time.monotonic() - started, 1)},
-            "limitations": ["No functional runtime tests executed", "Cancellation requires process supervisor"],
+            "limitations": ["Tool output is evidence; functional verification requires tools chosen by the agent",
+                            "Cancellation requires the process supervisor"],
         }
+        verification = outcome.get("agent", {}).get("verification", {})
+        result["summary"] = verification.get("summary", "")
+        result["tool_calls"] = outcome.get("agent", {}).get("budgets", {}).get("tool_calls", 0)
+        return result
     except (RunBudgetExceeded, httpx.TimeoutException) as exc:
         return {"status": "timed_out", "reason": str(exc), "changed_files": [],
                 "checks": [], "usage": {"model_calls": metrics["model_calls"],
@@ -817,14 +1047,14 @@ def _git_snapshot(root: Path) -> tuple[str | None, list[str]]:
 _original_run = run
 
 
-def _run_with_provenance(task: str, workspace: str) -> dict:
+def _run_with_provenance(task: str, workspace: str, *, agent_mode: bool | None = None) -> dict:
     from uuid import uuid4
     root = Path(workspace).resolve()
     run_id = uuid4().hex[:12]
     head_before, status_before = _git_snapshot(root)
     print(f"RUN_ID: {run_id}", flush=True)
     _emit_event("run_started", run_id=run_id, workspace=str(root))
-    result = _original_run(task, str(root))
+    result = _original_run(task, str(root), agent_mode=agent_mode)
     head_after, status_after = _git_snapshot(root)
     result["run_id"] = run_id
     result["git_baseline"] = head_before

@@ -22,30 +22,34 @@ class RecoveryEngineTests(unittest.TestCase):
             path.unlink()
         self.directory.rmdir()
 
-    def test_engine_recovery_starts_at_checkpoint_next_stage(self):
+    def test_engine_recovery_starts_at_agent_decision_checkpoint(self):
         store = Store(self.database)
         store.create_run({"run_id": "resume-stage", "workspace": str(self.directory), "model": "model",
                           "task": "change", "timeout": 30, "status": "interrupted", "started_at": "now"})
-        state = {"workspace": str(self.directory), "task": "change", "inventory": [], "selected": ["module.py"],
-                 "creating": [], "originals": {"module.py": "value = 1\n"},
-                 "changes": {"module.py": "value = 2\n"}, "status": "proposed", "error": "",
-                 "details": [], "corrections": 0, "feedback": ""}
-        store.save_checkpoint("resume-stage", stage="propose", next_stage="apply", state=state,
-                              stage_result={"status": "proposed"})
+        state = {"workspace": str(self.directory), "task": "change", "status": "agent_observed", "error": "",
+                 "details": [], "last_result": None,
+                 "agent": {"objective": "change", "project_context": {"workspace": str(self.directory)},
+                           "plan": [], "current_step": 1, "next_action": None, "observations": [],
+                           "baselines": {}, "change_evidence": [],
+                           "verification": {"status": "not_started", "checks": []},
+                           "budgets": {"tool_calls": 1, "max_wall_seconds": 600}}}
+        store.save_checkpoint("resume-stage", stage="agent_observe", next_stage="agent_decide", state=state,
+                              stage_result={"status": "agent_observed"})
         captured = {}
 
         class Graph:
             def invoke(self, received, config):
                 captured["state"] = received
-                return {**received, "status": "structurally_verified", "details": [], "error": ""}
+                return {**received, "status": "agent_completed", "details": [], "error": "",
+                        "agent": {**received["agent"], "verification": {"summary": "resumed"}}}
 
         with patch.dict(os.environ, {"REAPER_DATA_DIR": str(self.directory), "REAPER_API_RUN_ID": "resume-stage",
                                      "REAPER_RESUME": "1"}, clear=False), \
-             patch.object(engine, "build_graph", side_effect=lambda stage: captured.setdefault("stage", stage) and Graph()):
+             patch.object(engine, "build_agent_graph", side_effect=lambda stage: captured.setdefault("stage", stage) and Graph()):
             result = engine._original_run("ignored original task", str(self.directory))
         self.assertEqual(result["status"], "completed", result)
-        self.assertEqual(captured["stage"], "apply")
-        self.assertEqual(captured["state"]["changes"]["module.py"], "value = 2\n")
+        self.assertEqual(captured["stage"], "agent_decide")
+        self.assertEqual(captured["state"]["agent"]["current_step"], 1)
 
 
 class FileSelectionRegressionTests(unittest.TestCase):
@@ -65,6 +69,11 @@ class FileSelectionRegressionTests(unittest.TestCase):
                 encoding="utf-8",
             )
         (self.root / "large.txt").write_text("x" * 20_001, encoding="utf-8")
+        self.duplicate_source = (
+            "def first():\n    return 'shared'\n\n"
+            "def second():\n    return 'shared'\n"
+        )
+        (self.root / "duplicates.py").write_text(self.duplicate_source, encoding="utf-8")
         (self.root / "image.bin").write_bytes(b"\0binary")
 
     def tearDown(self):
@@ -116,7 +125,7 @@ class FileSelectionRegressionTests(unittest.TestCase):
             def edit_for(path, expected, replacement):
                 section = next(section for section in expanded["analysis"]
                                if section["path"] == path and expected in section["content"])
-                return {key: section[key] for key in ("path", "start_line", "end_line", "start_offset", "end_offset")} | {
+                return {key: section[key] for key in ("path", "start_line", "end_line", "start_offset", "end_offset", "source_digest")} | {
                     "expected": expected, "replacement": replacement
                 }
 
@@ -137,6 +146,52 @@ class FileSelectionRegressionTests(unittest.TestCase):
                 self.assertIn(f"new-{marker}", content)
                 self.assertIn("# untouched", content)
 
+            def duplicate_state():
+                return {"workspace": str(self.root), "task": "Update only second", "inventory": [],
+                        "selected": ["duplicates.py"], "creating": [],
+                        "originals": {"duplicates.py": self.duplicate_source}, "analysis": [], "edits": [],
+                        "changes": {}, "status": "selected", "error": "", "details": [],
+                        "corrections": 0, "feedback": ""}
+
+            targeted = duplicate_state()
+            targeted.update(engine.analyze(targeted))
+            second = next(section for section in targeted["analysis"] if section["label"] == "function second")
+            duplicate_edit = {key: second[key] for key in
+                              ("path", "start_line", "end_line", "start_offset", "end_offset", "source_digest")} | {
+                "expected": "    return 'shared'\n", "replacement": "    return 'updated'\n"
+            }
+            with patch.object(engine, "ask_json", return_value={"edits": [duplicate_edit], "new_files": {}}):
+                targeted.update(engine.propose(targeted))
+            self.assertEqual(targeted["status"], "proposed", targeted["error"])
+            targeted.update(engine.apply(targeted))
+            self.assertEqual(targeted["status"], "written", targeted["error"])
+            self.assertEqual((self.root / "duplicates.py").read_text(encoding="utf-8"),
+                             self.duplicate_source.replace("def second():\n    return 'shared'", "def second():\n    return 'updated'"))
+
+            (self.root / "duplicates.py").write_text(self.duplicate_source, encoding="utf-8")
+            conflicted = duplicate_state()
+            conflicted.update(engine.analyze(conflicted))
+            second = next(section for section in conflicted["analysis"] if section["label"] == "function second")
+            conflict_edit = {key: second[key] for key in
+                             ("path", "start_line", "end_line", "start_offset", "end_offset", "source_digest")} | {
+                "expected": "    return 'shared'\n", "replacement": "    return 'updated'\n"
+            }
+            with patch.object(engine, "ask_json", return_value={"edits": [conflict_edit], "new_files": {}}):
+                conflicted.update(engine.propose(conflicted))
+            external = self.duplicate_source.replace("def second():\n    return 'shared'", "def second():\n    return 'external'")
+            (self.root / "duplicates.py").write_text(external, encoding="utf-8")
+            conflicted.update(engine.apply(conflicted))
+            self.assertEqual(conflicted["status"], "failed")
+            self.assertIn("Expected text is absent from the selected range for duplicates.py", conflicted["error"])
+            self.assertEqual((self.root / "duplicates.py").read_text(encoding="utf-8"), external)
+
+            outside_range_change = self.duplicate_source + "# concurrent edit outside target range\n"
+            (self.root / "duplicates.py").write_text(outside_range_change, encoding="utf-8")
+            conflicted.update(engine.apply(conflicted))
+            self.assertEqual(conflicted["status"], "failed")
+            self.assertIn("Source digest changed before write for duplicates.py", conflicted["error"])
+            self.assertEqual((self.root / "duplicates.py").read_text(encoding="utf-8"), outside_range_change)
+
             with patch.object(engine, "ask_json", return_value={"edit": ["image.bin"], "create": []}):
                 binary = engine.select({**state, "status": "inventoried", "error": ""})
             self.assertEqual(binary["error"], "Binary files cannot be edited as UTF-8 text: image.bin")
@@ -148,7 +203,7 @@ class FileSelectionRegressionTests(unittest.TestCase):
 
             state.update(engine.analyze(state))
             section = next(section for section in state["analysis"] if section["path"] == "pyproject.toml")
-            edit = {key: section[key] for key in ("path", "start_line", "end_line", "start_offset", "end_offset")} | {
+            edit = {key: section[key] for key in ("path", "start_line", "end_line", "start_offset", "end_offset", "source_digest")} | {
                 "expected": "version = '0.1.0'", "replacement": "version = '0.2.0'"
             }
             with patch.object(engine, "ask_json", return_value={"edits": [edit], "new_files": {}}):
@@ -161,7 +216,7 @@ class FileSelectionRegressionTests(unittest.TestCase):
 
             with patch.object(engine, "ask_json", return_value={"edit": [], "create": []}):
                 failed = engine.select({**state, "status": "inventoried", "error": ""})
-            self.assertEqual(failed["error"], "File selection must contain 1 to 12 paths (got 0)")
+            self.assertEqual(failed["error"], "File selection must contain at least one path")
 
             with patch.object(engine, "ask_json", return_value={"edit": ["unknown.toml"], "create": []}):
                 failed = engine.select({**state, "status": "inventoried", "error": ""})

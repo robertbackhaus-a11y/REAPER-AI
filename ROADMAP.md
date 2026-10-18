@@ -1,6 +1,6 @@
 # REAPER-AI — Development Roadmap
 
-**Status:** M0–M4 and M5/P01–P03 implemented with documented limitations.
+**Status:** M0–M4, M5/P01–P03, and M6 iterative-agent transition implemented with documented limitations.
 **Architecture baseline:** [ARCHITECTURE.md](ARCHITECTURE.md) (approved)  
 **Target:** Windows 11, local single-user autonomous coding agent  
 **Technology decisions:** Python, embedded LangGraph, Ollama, FastAPI, SSE, custom HTML/CSS/vanilla JavaScript UI  
@@ -34,7 +34,7 @@ This is a new implementation. The former REAPER-AI runner, Main/Worker architect
 | M3 — Local application | **Accepted (A01–A03); qualifications below** | FastAPI, projects, models, structured events |
 | M4 — User interface | Usable lightweight local application | Vanilla JS chat and run-progress UI |
 | M5 — Persistence | Usable conversations and run history | Local store, result retrieval, safe recovery |
-| M6 — Release candidate | Verified end-to-end REAPER-AI | Documentation, installation, real-world acceptance |
+| M6 — Agent transition and release candidate | Iterative tool agent, then verified end-to-end REAPER-AI | Autonomous local dispatcher, documentation, installation, real-world acceptance |
 
 The initial deliverable is **one dependable agent**. Multi-agent delegation and long-term memory are **not prerequisites**.
 
@@ -251,7 +251,37 @@ The initial deliverable is **one dependable agent**. Multi-agent delegation and 
 - **Edit safety:** a proposal returns exact expected snippets and supplied line/character-offset ranges rather than full existing files. Multiple non-overlapping edits are assembled from the saved originals and still pass the existing clean-Git/source preflight before writes.
 - **Focused verification:** one regression flow selects source larger than the context budget across `engine.py`, `tools.py`, and `system_tools.py`, proves each has an analyzed section, applies three targeted edits, and verifies that unrelated content remains intact.
 
-### M6 — Final acceptance and first release
+### M6 — Iterative agent transition, final acceptance and first release
+
+**P01 — Agent state and tool dispatcher**
+
+- Add one serializable agent-state seed to the existing LangGraph/checkpoint state: objective and project context, plan/current step, next action, compact observations, Git/file baselines, change evidence, verification status, and budgets.
+- Define one action/result contract and dispatch existing file, Git, shell, and Python-discovery adapters through it. Results must record success/failure, exit code where applicable, output or structured data, duration, changes, and a precise error.
+- Run tools with the started user's normal permissions; no automatic elevation. Preserve timeouts, explicit errors, and file conflict detection.
+- Keep the current stage pipeline and its API/UI working while the iterative decision loop is not yet present.
+
+**Done when:** the state is checkpointed with an existing run; direct dispatcher calls can list/search/read project files and ranges, inspect Git, discover Python, run `Get-Location`, return command failure/timeout evidence, and block an unapproved shell action.
+
+#### P01 implementation checkpoint — 2026-10-18
+
+- **Implemented:** `reaper_ai.agent` supplies the checkpoint-friendly `AgentState` and central `dispatch_tool`. Existing `tools.py` now provides file listing, line-range reads, and line-oriented text search; `system_tools.py` remains the shell/Python implementation.
+- **Safety:** no shell allow-list, blacklist, risk class, or approval workflow remains. The dispatcher has text writes protected by an observed SHA-256 precondition; conflicts never overwrite an intervening change.
+- **Integration:** state, tool results, and checkpoints use the existing SQLite store. Git is optional and a workspace is project context rather than a filesystem boundary.
+- **Focused verification:** one dispatcher test performs list/read/range/search/write, an absolute-path write, Python discovery, Git status, PowerShell `Get-Location`, a nonzero command, and a timeout.
+
+**P02 — Iterative decision and observation loop**
+
+- Use the P01 state and dispatcher inside LangGraph: decide one next action, execute it, persist a compact observation, and route to a new decision or verification step under the existing budgets/checkpoints.
+- Keep tool execution deterministic and return failures as observations for the next decision.
+- Use the iterative graph as the active API/CLI execution path and add task-specific observed verification before completion.
+
+#### P02 implementation checkpoint — 2026-10-18
+
+- **Implemented graph:** `agent_prepare → agent_decide → agent_execute → agent_observe → agent_decide … → agent_finalize` is the active LangGraph graph. SSE receives the existing phase, model, tool, checkpoint, and verification events.
+- **Decisions and evidence:** Ollama must return JSON for one action or a final report. The engine adds the real workspace context, calls `dispatch_tool`, and persists the normalized result as an observation. Failed tool calls remain visible to the next decision, allowing a correction. A final report without a successful tool result is rejected.
+- **Budgets and recovery:** agent runs retain the wall-time limit, compact result capture, and a LangGraph recursion guard derived from the wall-time budget, but no artificial model, tool, file, or repair-operation cap. SQLite checkpoints are written after every safe agent node. An interrupted agent resumes at the saved `agent_*` next node with its observed tools intact; it does not replay completed actions.
+- **Execution:** shell commands and file operations use the launched user's OS permissions without elevation. Existing text writes require a matching read hash; tool errors remain observations so Sentinel can correct itself.
+- **Focused verification:** a deterministic end-to-end agent test performs text search, a failed missing-file range read, a corrected range read, completion, and restart at the saved next decision without rerunning the three tools. A live `qwen3:8b` read-only run searched `def dispatch_tool`, read `src/reaper_ai/agent.py` lines 152–180, used three model decisions/two successful tool calls, and left Git status unchanged.
 
 **D01 — Representative end-to-end acceptance**
 
@@ -295,7 +325,7 @@ Promote an item only after a real use case justifies it, with an explicit new wo
 - Keep documentation consistent, but **write the README after this roadmap is approved**, as agreed.
 - Never perform Git commit/push/release automatically.
 
-**Next step:** M6/D01 — representative end-to-end acceptance and clean-install preparation; preserve evidence labels and do not create a commit, push, or release without explicit instruction.
+**Next step:** D01 — perform representative end-to-end acceptance of the autonomous iterative agent; do not create a commit, push, or release without explicit instruction.
 
 ## M4 acceptance record
 
@@ -307,6 +337,6 @@ Browser acceptance demonstrated workspace validation, model selection, coding ex
 
 Known limitations are documented in ARCHITECTURE.md. Full functional correctness and browser reconnection have not been established; checkpoint recovery is covered separately by M5/P02 tests.
 
-**Next milestone:** M6 — Final acceptance and first release.
+**Next milestone:** M6/D01 — real-world acceptance of the autonomous iterative agent.
 
 **Release preparation:** v0.2.0 (M3 + M4), subject to Git review and explicit commit/tag instructions.

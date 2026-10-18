@@ -189,13 +189,6 @@ def _validate_workspace(workspace: str) -> Path:
     root = candidate.resolve()
     if not root.is_dir():
         raise HTTPException(status_code=422, detail="Workspace directory does not exist")
-    try:
-        check = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=root,
-                               capture_output=True, text=True, timeout=10)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise HTTPException(status_code=503, detail=f"Git validation unavailable: {exc}") from exc
-    if check.returncode or Path(check.stdout.strip()).resolve() != root:
-        raise HTTPException(status_code=422, detail="Workspace must be a Git repository root")
     return root
 
 
@@ -291,7 +284,8 @@ def start_run(request: StartRequest):
             prior_context = _store.relevant_context(conversation["id"])
             durable_memory = _store.relevant_memory(str(root))
             entry = {"run_id": run_id, "conversation_id": conversation["id"], "workspace": str(root),
-                     "model": model, "task": request.task, "timeout": request.timeout, "status": "running",
+                     "model": model, "task": request.task, "timeout": request.timeout,
+                     "status": "running",
                      "started_at": _utc(), "finished_at": None, "exit_code": None, "result": None,
                      "log_path": str(log_path)}
             _store.create_run(entry)
@@ -352,7 +346,7 @@ def _recovery_record(run_id: str) -> tuple[dict, dict | None, bool, str]:
     if not checkpoint.get("valid"):
         return entry, checkpoint, False, str(checkpoint.get("invalid_reason") or "Checkpoint is invalid")
     state = checkpoint.get("state")
-    valid_stages = {"inventory", "select", "analyze", "propose", "repair_proposal", "apply", "verify"}
+    valid_stages = {"agent_prepare", "agent_decide", "agent_execute", "agent_observe"}
     if not isinstance(state, dict) or state.get("workspace") != entry["workspace"]:
         try:
             _store.invalidate_checkpoint(run_id, "Checkpoint workspace does not match the run")
@@ -364,7 +358,7 @@ def _recovery_record(run_id: str) -> tuple[dict, dict | None, bool, str]:
             _store.invalidate_checkpoint(run_id, "Checkpoint has an unsupported next stage")
         except StorageError as exc:
             raise _storage_failure(exc) from exc
-        return entry, checkpoint, False, "Checkpoint has an unsupported next stage"
+        return entry, checkpoint, False, "Checkpoint belongs to the retired static pipeline or has an unsupported next stage"
     return entry, checkpoint, True, "Explicit user action can resume at the next stage"
 
 
