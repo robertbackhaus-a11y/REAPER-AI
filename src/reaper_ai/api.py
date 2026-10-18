@@ -25,6 +25,12 @@ _active: str | None = None
 _procs: dict[str, subprocess.Popen] = {}
 _MAX_LOG = 128_000
 _store = Store()
+try:
+    _interrupted_on_startup = _store.interrupt_active_runs()
+    _startup_storage_error: str | None = None
+except StorageError as _startup_error:
+    _interrupted_on_startup = []
+    _startup_storage_error = str(_startup_error)
 
 
 def _utc() -> str:
@@ -117,6 +123,9 @@ def _watch(run_id: str, proc: subprocess.Popen) -> None:
             entry["status"] = result.get("status", "failed")
         elif code == 2:
             entry["status"] = "timed_out"
+        elif result is None:
+            entry["status"] = "interrupted"
+            entry["result"] = {"status": "interrupted", "reason": "Engine exited without a terminal result"}
         else:
             entry["status"] = "failed"
         if _active == run_id:
@@ -124,14 +133,15 @@ def _watch(run_id: str, proc: subprocess.Popen) -> None:
         _procs.pop(run_id, None)
         try:
             _store.complete_run(run_id, status=entry["status"], finished_at=entry["finished_at"],
-                                exit_code=code, result=result)
+                                exit_code=code, result=entry["result"])
             _persist_events(run_id, entry["log_path"])
             if entry.get("conversation_id"):
                 _store.add_message(
                     entry["conversation_id"], role="assistant",
-                    content=_terminal_summary(run_id, entry["status"], result), run_id=run_id,
-                    metadata={"status": entry["status"], "result": result},
+                    content=_terminal_summary(run_id, entry["status"], entry["result"]), run_id=run_id,
+                    metadata={"status": entry["status"], "result": entry["result"]},
                 )
+            _store.remember_verified_result(entry)
         except StorageError as exc:
             # The engine outcome remains authoritative even if its history cannot be saved.
             entry["storage_error"] = str(exc)
@@ -139,7 +149,8 @@ def _watch(run_id: str, proc: subprocess.Popen) -> None:
 
 @app.get("/health")
 def health():
-    return {"service": "reaper-ai", "status": "ok"}
+    return {"service": "reaper-ai", "status": "ok", "interrupted_runs": _interrupted_on_startup,
+            "storage_error": _startup_storage_error}
 
 
 OLLAMA_BASE = "http://127.0.0.1:11434"
@@ -200,6 +211,11 @@ class ConversationRequest(BaseModel):
     title: str | None = Field(default=None, max_length=200)
 
 
+class MemoryRequest(BaseModel):
+    content: str = Field(min_length=1, max_length=2_000)
+    workspace: str | None = Field(default=None, max_length=10_000)
+
+
 @app.get("/conversations")
 def list_conversations():
     try:
@@ -225,6 +241,24 @@ def get_conversation(conversation_id: str):
     if conversation is None:
         raise HTTPException(status_code=404, detail="Unknown conversation")
     return conversation
+
+
+@app.get("/memory")
+def list_memory(workspace: str | None = None):
+    try:
+        return {"memory": _store.list_memory(workspace)}
+    except StorageError as exc:
+        raise _storage_failure(exc) from exc
+
+
+@app.post("/memory", status_code=201)
+def add_memory(request: MemoryRequest):
+    workspace = str(_validate_workspace(request.workspace)) if request.workspace else None
+    try:
+        return _store.add_memory(content=request.content, kind="user_decision", workspace=workspace,
+                                 verification="user_confirmed")
+    except StorageError as exc:
+        raise _storage_failure(exc) from exc
 
 
 @app.post("/runs", status_code=202)
@@ -255,6 +289,7 @@ def start_run(request: StartRequest):
                     workspace=str(root), model=model, title=request.task[:120]
                 )
             prior_context = _store.relevant_context(conversation["id"])
+            durable_memory = _store.relevant_memory(str(root))
             entry = {"run_id": run_id, "conversation_id": conversation["id"], "workspace": str(root),
                      "model": model, "task": request.task, "timeout": request.timeout, "status": "running",
                      "started_at": _utc(), "finished_at": None, "exit_code": None, "result": None,
@@ -269,12 +304,18 @@ def start_run(request: StartRequest):
                 "\n\nRelevant prior conversation context follows. It is limited to user intent and "
                 "observed prior run records; re-check repository facts before relying on it.\n" + prior_context
             )
+        if durable_memory:
+            engine_task += (
+                "\n\nRelevant durable memory follows. User decisions and observed results are advisory; "
+                "re-check repository facts before relying on them.\n" + durable_memory
+            )
         cmd = [sys.executable, "-u", "-m", "reaper_ai.supervisor", "--workspace", str(root),
                "--task", engine_task, "--timeout", str(request.timeout)]
         try:
             with log_path.open("wb") as output:
                 env = os.environ.copy()
                 env["REAPER_MODEL"] = model
+                env["REAPER_API_RUN_ID"] = run_id
                 env["PYTHONUNBUFFERED"] = "1"
                 proc = subprocess.Popen(cmd, cwd=str(Path(__file__).resolve().parents[2]),
                                         stdout=output, stderr=subprocess.STDOUT, env=env)
@@ -295,6 +336,89 @@ def start_run(request: StartRequest):
 @app.get("/runs/{run_id}")
 def get_run(run_id: str):
     return _public(_entry(run_id))
+
+
+def _recovery_record(run_id: str) -> tuple[dict, dict | None, bool, str]:
+    entry = _entry(run_id)
+    try:
+        checkpoint = _store.get_checkpoint(run_id)
+    except StorageError as exc:
+        raise _storage_failure(exc) from exc
+    allowed = {"interrupted", "cancelled", "timed_out"}
+    if entry["status"] not in allowed:
+        return entry, checkpoint, False, f"Run status {entry['status']} cannot be resumed"
+    if checkpoint is None:
+        return entry, None, False, "No checkpoint was recorded before interruption"
+    if not checkpoint.get("valid"):
+        return entry, checkpoint, False, str(checkpoint.get("invalid_reason") or "Checkpoint is invalid")
+    state = checkpoint.get("state")
+    valid_stages = {"inventory", "select", "propose", "repair_proposal", "apply", "verify"}
+    if not isinstance(state, dict) or state.get("workspace") != entry["workspace"]:
+        try:
+            _store.invalidate_checkpoint(run_id, "Checkpoint workspace does not match the run")
+        except StorageError as exc:
+            raise _storage_failure(exc) from exc
+        return entry, checkpoint, False, "Checkpoint workspace does not match the run"
+    if checkpoint.get("next_stage") not in valid_stages:
+        try:
+            _store.invalidate_checkpoint(run_id, "Checkpoint has an unsupported next stage")
+        except StorageError as exc:
+            raise _storage_failure(exc) from exc
+        return entry, checkpoint, False, "Checkpoint has an unsupported next stage"
+    return entry, checkpoint, True, "Explicit user action can resume at the next stage"
+
+
+@app.get("/runs/{run_id}/recovery")
+def get_recovery(run_id: str):
+    entry, checkpoint, can_resume, reason = _recovery_record(run_id)
+    summary = None
+    if checkpoint is not None:
+        summary = {key: checkpoint.get(key) for key in
+                   ("format_version", "stage", "next_stage", "saved_at", "valid", "invalid_reason")}
+    return {"run_id": run_id, "status": entry["status"], "can_resume": can_resume,
+            "reason": reason, "checkpoint": summary}
+
+
+@app.post("/runs/{run_id}/resume", status_code=202)
+def resume_run(run_id: str):
+    global _active
+    if os.name != "nt":
+        raise HTTPException(status_code=501, detail="Windows supervisor required")
+    entry, checkpoint, can_resume, reason = _recovery_record(run_id)
+    if not can_resume:
+        raise HTTPException(status_code=409, detail=f"Recovery is unavailable: {reason}")
+    root = _validate_workspace(entry["workspace"])
+    if entry["model"] not in _installed_models():
+        raise HTTPException(status_code=422, detail=f"Model not installed: {entry['model']}")
+    log_path = Path(tempfile.gettempdir()) / f"reaper-api-{run_id}-recovery.log"
+    cmd = [sys.executable, "-u", "-m", "reaper_ai.supervisor", "--workspace", str(root),
+           "--task", entry["task"], "--timeout", str(entry["timeout"])]
+    with _lock:
+        if _active is not None:
+            raise HTTPException(status_code=409, detail=f"Run {_active} is still active")
+        try:
+            _store.resume_run(run_id)
+            with log_path.open("wb") as output:
+                env = os.environ.copy()
+                env["REAPER_MODEL"] = entry["model"]
+                env["REAPER_API_RUN_ID"] = run_id
+                env["REAPER_RESUME"] = "1"
+                env["PYTHONUNBUFFERED"] = "1"
+                proc = subprocess.Popen(cmd, cwd=str(Path(__file__).resolve().parents[2]),
+                                        stdout=output, stderr=subprocess.STDOUT, env=env)
+        except OSError as exc:
+            try:
+                _store.update_run_status(run_id, "interrupted")
+            except StorageError:
+                pass
+            raise HTTPException(status_code=500, detail=f"Recovery supervisor could not start: {exc}") from exc
+        entry.update({"workspace": str(root), "status": "running", "finished_at": None, "exit_code": None,
+                      "result": None, "log_path": str(log_path), "recovery_checkpoint": checkpoint["saved_at"]})
+        _runs[run_id] = entry
+        _procs[run_id] = proc
+        _active = run_id
+    threading.Thread(target=_watch, args=(run_id, proc), daemon=True).start()
+    return _public(entry)
 
 
 @app.get("/runs/{run_id}/log")

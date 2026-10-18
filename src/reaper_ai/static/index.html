@@ -15,6 +15,7 @@
       <div class="field"><label for="workspace">Git-Workspace (absoluter Pfad)</label><div class="path-row"><input id="workspace" spellcheck="false" placeholder="C:\\tools\\src\\my-project"><button id="validate" class="secondary">Prüfen</button></div><small id="project-status" class="muted">Noch nicht geprüft</small></div>
       <div class="field"><label for="model">Ollama-Modell</label><div class="path-row"><select id="model"><option>Modelle laden …</option></select><button id="reload" class="secondary" title="Modelle neu laden">↻</button></div></div>
       <div class="field"><label for="timeout">Zeitlimit (Sekunden)</label><input id="timeout" type="number" value="660" min="1" max="3600"></div>
+      <div class="field"><label for="memory">Projektwissen</label><div class="path-row"><input id="memory" maxlength="2000" placeholder="Bestätigte Entscheidung merken …"><button id="save-memory" class="secondary">Merken</button></div><small id="memory-status" class="muted">Nur explizit gespeicherte Entscheidungen</small></div>
       <div class="sidebar-foot"><span class="dot" id="api-dot"></span><span id="api-status">Verbinde …</span><a href="/docs" target="_blank" rel="noopener">API</a></div>
     </aside>
     <main class="main">

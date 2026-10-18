@@ -1,6 +1,6 @@
 # REAPER-AI — Development Roadmap
 
-**Status:** M0–M4 and M5/P01 implemented with documented limitations; P02 and P03 remain separate work packages.
+**Status:** M0–M4 and M5/P01–P03 implemented with documented limitations.
 **Architecture baseline:** [ARCHITECTURE.md](ARCHITECTURE.md) (approved)  
 **Target:** Windows 11, local single-user autonomous coding agent  
 **Technology decisions:** Python, embedded LangGraph, Ollama, FastAPI, SSE, custom HTML/CSS/vanilla JavaScript UI  
@@ -220,6 +220,14 @@ The initial deliverable is **one dependable agent**. Multi-agent delegation and 
 
 **Done when:** restart/recovery semantics are documented and tested. If resume is not needed, explicitly omit it from the first release.
 
+#### P02 implementation and acceptance checkpoint — 2026-10-18
+
+- **Checkpoint boundary:** the existing SQLite store now saves one versioned, digest-protected full engine-state snapshot after every completed nonterminal stage, including the stage result and the next LangGraph stage. The next stage, rather than the completed stage, is used for recovery.
+- **Interruption and safety:** API startup marks stale `running`/`cancelling` records as `interrupted`; it never starts them. Recovery is available only through an explicit API/UI action for interrupted, cancelled, or timed-out runs with a valid checkpoint. Missing, damaged, unsupported, or workspace-inconsistent state is rejected clearly.
+- **Control surface:** `GET /runs/{run_id}/recovery` explains recovery availability; `POST /runs/{run_id}/resume` starts a supervised continuation. The browser surfaces the checkpoint status and continuation control in conversation history, including runs interrupted before a terminal message was stored.
+- **Scope:** this is a single-user, stage-boundary continuation mechanism built on the P01 database, not automatic process restoration, event sourcing, or P03 durable memory.
+- **Focused verification:** tests cover SQLite checkpoint reload and digest invalidation, stale-run detection after a simulated restart, recovery API availability, and an interrupted proposal checkpoint whose continuation begins at `apply` without rerunning proposal.
+
 **P03 — Optional durable memory (decision gate)**
 
 - Evaluate whether Basic Memory gives a measurable benefit beyond conversation/run records.
@@ -227,6 +235,14 @@ The initial deliverable is **one dependable agent**. Multi-agent delegation and 
 - Do not put ephemeral graph state or unverified completion claims in long-term memory.
 
 **Done when:** there is a documented keep/defer decision. Basic Memory integration is not required to ship the initial agent.
+
+#### P03 implementation and decision checkpoint — 2026-10-18
+
+- **Decision:** Do not add the optional Basic Memory integration for the initial agent. The repository has no existing RAG/vector stack, and no measured retrieval need justifies a new dependency or duplicate store. Re-evaluate that decision only when a concrete retrieval requirement exceeds scoped SQLite lookup.
+- **Implemented minimum:** the existing SQLite store now keeps scoped durable-memory records for explicit user-confirmed decisions and mechanically summarized, observed results from completed runs. Records retain workspace, source conversation/run IDs, verification type, and creation time.
+- **Write boundary:** ordinary messages, assistant/model prose, ephemeral graph state, checkpoints, and failed/partial completion claims are not promoted to durable knowledge. A completed run contributes only its recorded verification level, changed-file evidence, and check count.
+- **Read boundary:** memory is loaded on demand when a run starts, for its workspace plus explicitly global user decisions. It is advisory context; the engine is instructed to re-check repository facts. The browser offers an explicit project-knowledge action; `GET/POST /memory` provide the equivalent local API.
+- **Focused verification:** one persistence/restart test proves source attribution, workspace isolation, retrieval after reopening SQLite, and exclusion of assistant prose; the existing API persistence test covers the explicit user-decision endpoint.
 
 ### M6 — Final acceptance and first release
 
@@ -272,7 +288,7 @@ Promote an item only after a real use case justifies it, with an explicit new wo
 - Keep documentation consistent, but **write the README after this roadmap is approved**, as agreed.
 - Never perform Git commit/push/release automatically.
 
-**Next step:** M4/U01 — minimal HTML/CSS/vanilla JS UI served by FastAPI; preserve evidence labels and align API/engine run identity. No automatic Git commit or push.
+**Next step:** M6/D01 — representative end-to-end acceptance and clean-install preparation; preserve evidence labels and do not create a commit, push, or release without explicit instruction.
 
 ## M4 acceptance record
 
@@ -282,8 +298,8 @@ Promote an item only after a real use case justifies it, with an explicit new wo
 
 Browser acceptance demonstrated workspace validation, model selection, coding execution, SSE timeline, structural verification, terminal status and Git diff rendering.
 
-Known limitations are documented in ARCHITECTURE.md. Full functional correctness, browser reconnection and recovery have not been established.
+Known limitations are documented in ARCHITECTURE.md. Full functional correctness and browser reconnection have not been established; checkpoint recovery is covered separately by M5/P02 tests.
 
-**Next milestone:** M5 — Local persistence and context.
+**Next milestone:** M6 — Final acceptance and first release.
 
 **Release preparation:** v0.2.0 (M3 + M4), subject to Git review and explicit commit/tag instructions.

@@ -19,6 +19,7 @@ import httpx
 from langgraph.graph import END, START, StateGraph
 
 from reaper_ai.tools import _file
+from reaper_ai.persistence import StorageError, Store
 
 OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
 MODEL = os.environ.get("REAPER_MODEL", "qwen3.6:35b")
@@ -373,14 +374,47 @@ def repair_proposal(state: CodingState) -> dict:
             "feedback": state["error"], "status": "selected", "error": ""}
 
 
+def _next_stage(stage: str, state: dict) -> str | None:
+    status = state.get("status")
+    if stage in {"inventory", "select", "apply"}:
+        return {"inventory": "select", "select": "propose", "apply": "verify"}.get(stage) \
+            if status not in {"failed", "no_semantic_change", "proposal_failed"} else None
+    if stage == "propose":
+        if status == "proposed":
+            return "apply"
+        return "repair_proposal" if status == "proposal_failed" and state.get("corrections", 0) < 1 else None
+    if stage == "verify":
+        return "repair_proposal" if status == "verify_failed" and state.get("corrections", 0) < 1 else None
+    return "propose" if stage == "repair_proposal" else None
 
-def build_graph():
+
+def _checkpointed(stage: str, function):
+    """Persist a complete state only after a node returned normally."""
+    def wrapped(state: CodingState) -> dict:
+        update = function(state)
+        run_id = os.environ.get("REAPER_API_RUN_ID")
+        next_stage = _next_stage(stage, {**state, **update})
+        if not run_id or next_stage is None:
+            return update
+        try:
+            Store().save_checkpoint(run_id, stage=stage, next_stage=next_stage,
+                                    state={**state, **update}, stage_result=update)
+            _emit_event("checkpoint_saved", stage=stage, next_stage=next_stage)
+        except StorageError as exc:
+            return {"status": "failed", "error": f"Checkpoint could not be saved: {exc}"}
+        return update
+    return wrapped
+
+
+def build_graph(start_stage: str = "inventory"):
+    if start_stage not in {"inventory", "select", "propose", "repair_proposal", "apply", "verify"}:
+        raise ValueError(f"Unsupported checkpoint stage: {start_stage}")
     graph = StateGraph(CodingState)
     for name, function in (("inventory", inventory), ("select", select),
                            ("propose", propose), ("repair_proposal", repair_proposal),
                            ("apply", apply), ("verify", verify)):
-        graph.add_node(name, function)
-    graph.add_edge(START, "inventory")
+        graph.add_node(name, _checkpointed(name, function))
+    graph.add_edge(START, start_stage)
     graph.add_conditional_edges("inventory", advance, {"next": "select", "end": END})
     graph.add_conditional_edges("select", advance, {"next": "propose", "end": END})
     graph.add_conditional_edges("propose", lambda state: "next" if state["status"] == "proposed" else retry_proposal(state),
@@ -392,6 +426,47 @@ def build_graph():
     return graph.compile()
 
 
+def _resume_state(workspace: str) -> tuple[dict, str]:
+    run_id = os.environ.get("REAPER_API_RUN_ID")
+    if not run_id:
+        raise ValueError("Recovery run has no API run ID")
+    checkpoint = Store().get_checkpoint(run_id)
+    if checkpoint is None:
+        raise ValueError("No checkpoint is available for this run")
+    if not checkpoint.get("valid"):
+        raise ValueError("Checkpoint is not recoverable: " + str(checkpoint.get("invalid_reason") or "invalid"))
+    state = checkpoint.get("state")
+    next_stage = checkpoint.get("next_stage")
+    if not isinstance(state, dict) or not isinstance(next_stage, str):
+        raise ValueError("Checkpoint is incomplete")
+    root = Path(workspace).resolve()
+    if state.get("workspace") != str(root):
+        raise ValueError("Checkpoint workspace does not match the requested repository")
+    if next_stage in {"propose", "apply", "verify", "repair_proposal"}:
+        originals = state.get("originals")
+        changes = state.get("changes")
+        creating = state.get("creating")
+        if not isinstance(originals, dict) or not isinstance(changes, dict) or not isinstance(creating, list):
+            raise ValueError("Checkpoint lacks the required stage state")
+        # Before proposal/apply or after a rolled-back verification failure, inputs must be untouched.
+        expect_originals = next_stage in {"propose", "apply", "repair_proposal"}
+        for name, original in originals.items():
+            target = _file(str(root), name)
+            if not target.is_file() or (expect_originals and target.read_text(encoding="utf-8") != original):
+                raise ValueError(f"Checkpoint source no longer matches: {name}")
+        for name in creating:
+            target = _file(str(root), name)
+            if expect_originals and target.exists():
+                raise ValueError(f"Checkpoint creation path is no longer empty: {name}")
+        if next_stage == "verify":
+            for name, expected in changes.items():
+                target = _file(str(root), name)
+                if not target.is_file() or target.read_text(encoding="utf-8") != expected:
+                    raise ValueError(f"Checkpointed write no longer matches: {name}")
+    _emit_event("recovery_started", run_id=run_id, stage=checkpoint["stage"], next_stage=next_stage)
+    return state, next_stage
+
+
 def run(task: str, workspace: str) -> dict:
     """Return a truthful run result. No claim of functional correctness."""
     started = time.monotonic()
@@ -399,12 +474,15 @@ def run(task: str, workspace: str) -> dict:
                "model_calls": 0, "input_tokens": 0, "output_tokens": 0}
     token = _RUN.set(metrics)
     try:
-        outcome = build_graph().invoke({
-            "workspace": str(Path(workspace).resolve()), "task": task,
-            "inventory": [], "selected": [], "creating": [], "originals": {},
-            "changes": {}, "status": "pending", "error": "", "details": [],
-            "corrections": 0, "feedback": "",
-        }, config={"recursion_limit": 15})
+        if os.environ.get("REAPER_RESUME") == "1":
+            initial, start_stage = _resume_state(workspace)
+        else:
+            start_stage = "inventory"
+            initial = {"workspace": str(Path(workspace).resolve()), "task": task,
+                       "inventory": [], "selected": [], "creating": [], "originals": {},
+                       "changes": {}, "status": "pending", "error": "", "details": [],
+                       "corrections": 0, "feedback": ""}
+        outcome = build_graph(start_stage).invoke(initial, config={"recursion_limit": 15})
         internal = outcome["status"]
         if internal == "structurally_verified":
             status = "completed"
@@ -474,7 +552,7 @@ def _run_with_provenance(task: str, workspace: str) -> dict:
     result["git_status_before"] = status_before
     result["git_status_after"] = status_after
     result["git_status_changed"] = status_before != status_after
-    result["resumable"] = False  # No persistent per-run receipts/checkpoints yet.
+    result["resumable"] = False  # Terminal results are never resumed automatically.
     _emit_event("run_completed", run_id=run_id, status=result.get("status", "failed"),
                 result=result)
     return result

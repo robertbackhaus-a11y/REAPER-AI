@@ -1,12 +1,9 @@
-"""Small SQLite store for local conversation and completed-run history.
-
-The store deliberately contains only API-facing records.  It is not a
-LangGraph checkpoint store and it never attempts to resume a run.
-"""
+"""Small SQLite store for local conversation, run history, and recovery checkpoints."""
 
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import sqlite3
 import uuid
@@ -21,6 +18,7 @@ class StorageError(RuntimeError):
 
 
 _MAX_EVENT_BYTES = 32_000
+_CHECKPOINT_VERSION = 1
 
 
 def utc_now() -> str:
@@ -123,6 +121,32 @@ class Store:
                 result_json TEXT NOT NULL,
                 PRIMARY KEY (run_id, sequence)
             );
+            CREATE TABLE IF NOT EXISTS checkpoints (
+                run_id TEXT PRIMARY KEY REFERENCES runs(run_id) ON DELETE CASCADE,
+                format_version INTEGER NOT NULL,
+                stage TEXT NOT NULL,
+                next_stage TEXT NOT NULL,
+                saved_at TEXT NOT NULL,
+                state_json TEXT NOT NULL,
+                stage_result_json TEXT NOT NULL,
+                state_digest TEXT NOT NULL,
+                valid INTEGER NOT NULL DEFAULT 1,
+                invalid_reason TEXT
+            );
+            CREATE TABLE IF NOT EXISTS durable_memory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                workspace TEXT,
+                kind TEXT NOT NULL CHECK (kind IN ('user_decision', 'verified_result')),
+                content TEXT NOT NULL,
+                source_run_id TEXT REFERENCES runs(run_id) ON DELETE SET NULL,
+                source_conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
+                verification TEXT NOT NULL CHECK (verification IN ('user_confirmed', 'observed')),
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS durable_memory_scope_created
+                ON durable_memory(workspace, created_at DESC);
+            CREATE UNIQUE INDEX IF NOT EXISTS durable_memory_run_result
+                ON durable_memory(source_run_id) WHERE kind = 'verified_result';
             """
         )
 
@@ -271,6 +295,75 @@ class Store:
             )
         return "\n".join(lines)[:6_000]
 
+    def add_memory(self, *, content: str, kind: str, workspace: str | None = None,
+                   source_run_id: str | None = None, source_conversation_id: str | None = None,
+                   verification: str) -> dict:
+        if kind not in {"user_decision", "verified_result"}:
+            raise StorageError(f"Unsupported durable-memory kind: {kind}")
+        if verification not in {"user_confirmed", "observed"}:
+            raise StorageError(f"Unsupported durable-memory verification: {verification}")
+        item = {"workspace": workspace, "kind": kind, "content": content.strip()[:2_000],
+                "source_run_id": source_run_id, "source_conversation_id": source_conversation_id,
+                "verification": verification, "created_at": utc_now()}
+        if not item["content"]:
+            raise StorageError("Durable-memory content is empty")
+        try:
+            with self._connect() as connection:
+                cursor = connection.execute(
+                    "INSERT INTO durable_memory(workspace, kind, content, source_run_id, source_conversation_id, "
+                    "verification, created_at) VALUES(:workspace, :kind, :content, :source_run_id, "
+                    ":source_conversation_id, :verification, :created_at)", item
+                )
+                item["id"] = cursor.lastrowid
+        except sqlite3.IntegrityError as exc:
+            raise StorageError(f"Could not save durable memory: {exc}") from exc
+        except sqlite3.Error as exc:
+            raise StorageError(f"Could not save durable memory: {exc}") from exc
+        return item
+
+    def remember_verified_result(self, run: dict) -> dict | None:
+        """Promote only an observed completed result, never model-generated prose."""
+        result = run.get("result")
+        if run.get("status") != "completed" or not isinstance(result, dict):
+            return None
+        changed = result.get("changed_files") if isinstance(result.get("changed_files"), list) else []
+        checks = result.get("checks") if isinstance(result.get("checks"), list) else []
+        level = result.get("verification_level", "unknown")
+        summary = (f"Observed completed run {run['run_id']}: verification={level}; "
+                   f"changed_files={', '.join(str(path) for path in changed[:20]) or 'none'}; "
+                   f"recorded_checks={len(checks)}.")
+        try:
+            return self.add_memory(workspace=run.get("workspace"), kind="verified_result", content=summary,
+                                   source_run_id=run["run_id"],
+                                   source_conversation_id=run.get("conversation_id"), verification="observed")
+        except StorageError as exc:
+            if "UNIQUE constraint failed" in str(exc):
+                return None
+            raise
+
+    def list_memory(self, workspace: str | None = None, limit: int = 20) -> list[dict]:
+        try:
+            with self._connect() as connection:
+                if workspace is None:
+                    rows = connection.execute(
+                        "SELECT * FROM durable_memory ORDER BY created_at DESC LIMIT ?", (limit,)
+                    ).fetchall()
+                else:
+                    rows = connection.execute(
+                        "SELECT * FROM durable_memory WHERE workspace = ? OR workspace IS NULL "
+                        "ORDER BY created_at DESC LIMIT ?", (workspace, limit)
+                    ).fetchall()
+        except sqlite3.Error as exc:
+            raise StorageError(f"Could not load durable memory: {exc}") from exc
+        return [dict(row) for row in rows]
+
+    def relevant_memory(self, workspace: str, limit: int = 6) -> str:
+        lines = []
+        for item in reversed(self.list_memory(workspace, limit)):
+            label = "User-confirmed decision" if item["kind"] == "user_decision" else "Observed prior result"
+            lines.append(f"{label}: {item['content']}")
+        return "\n".join(lines)[:6_000]
+
     def create_run(self, entry: dict) -> None:
         values = {
             "run_id": entry["run_id"], "conversation_id": entry.get("conversation_id"),
@@ -325,6 +418,108 @@ class Store:
                 )
         except sqlite3.Error as exc:
             raise StorageError(f"Could not save run event: {exc}") from exc
+
+    def save_checkpoint(self, run_id: str, *, stage: str, next_stage: str, state: dict,
+                        stage_result: dict) -> dict:
+        """Atomically replace the one recoverable boundary for a run."""
+        state_json = self._json(state)
+        result_json = self._json(stage_result)
+        digest = hashlib.sha256(state_json.encode("utf-8")).hexdigest()
+        checkpoint = {"run_id": run_id, "format_version": _CHECKPOINT_VERSION, "stage": stage,
+                      "next_stage": next_stage, "saved_at": utc_now(), "state_json": state_json,
+                      "stage_result_json": result_json, "state_digest": digest}
+        try:
+            with self._connect() as connection:
+                connection.execute(
+                    "INSERT INTO checkpoints(run_id, format_version, stage, next_stage, saved_at, state_json, "
+                    "stage_result_json, state_digest, valid, invalid_reason) VALUES(:run_id, :format_version, "
+                    ":stage, :next_stage, :saved_at, :state_json, :stage_result_json, :state_digest, 1, NULL) "
+                    "ON CONFLICT(run_id) DO UPDATE SET format_version=excluded.format_version, "
+                    "stage=excluded.stage, next_stage=excluded.next_stage, saved_at=excluded.saved_at, "
+                    "state_json=excluded.state_json, stage_result_json=excluded.stage_result_json, "
+                    "state_digest=excluded.state_digest, valid=1, invalid_reason=NULL",
+                    checkpoint,
+                )
+        except sqlite3.Error as exc:
+            raise StorageError(f"Could not save checkpoint: {exc}") from exc
+        return {key: checkpoint[key] for key in ("run_id", "format_version", "stage", "next_stage", "saved_at")}
+
+    def get_checkpoint(self, run_id: str) -> dict | None:
+        try:
+            with self._connect() as connection:
+                row = connection.execute("SELECT * FROM checkpoints WHERE run_id = ?", (run_id,)).fetchone()
+        except sqlite3.Error as exc:
+            raise StorageError(f"Could not load checkpoint: {exc}") from exc
+        if row is None:
+            return None
+        checkpoint = dict(row)
+        if not checkpoint["valid"]:
+            checkpoint["state"] = None
+            checkpoint["stage_result"] = None
+            return checkpoint
+        if checkpoint["format_version"] != _CHECKPOINT_VERSION:
+            self.invalidate_checkpoint(run_id, "Unsupported checkpoint format")
+            checkpoint["valid"] = 0
+            checkpoint["invalid_reason"] = "Unsupported checkpoint format"
+            checkpoint["state"] = None
+            checkpoint["stage_result"] = None
+            return checkpoint
+        digest = hashlib.sha256(checkpoint["state_json"].encode("utf-8")).hexdigest()
+        if digest != checkpoint["state_digest"]:
+            self.invalidate_checkpoint(run_id, "Checkpoint integrity check failed")
+            checkpoint["valid"] = 0
+            checkpoint["invalid_reason"] = "Checkpoint integrity check failed"
+            checkpoint["state"] = None
+            checkpoint["stage_result"] = None
+            return checkpoint
+        try:
+            checkpoint["state"] = json.loads(checkpoint["state_json"])
+            checkpoint["stage_result"] = json.loads(checkpoint["stage_result_json"])
+        except json.JSONDecodeError:
+            self.invalidate_checkpoint(run_id, "Checkpoint JSON is invalid")
+            checkpoint["valid"] = 0
+            checkpoint["invalid_reason"] = "Checkpoint JSON is invalid"
+            checkpoint["state"] = None
+            checkpoint["stage_result"] = None
+        return checkpoint
+
+    def invalidate_checkpoint(self, run_id: str, reason: str) -> None:
+        try:
+            with self._connect() as connection:
+                connection.execute("UPDATE checkpoints SET valid = 0, invalid_reason = ? WHERE run_id = ?",
+                                   (reason[:500], run_id))
+        except sqlite3.Error as exc:
+            raise StorageError(f"Could not invalidate checkpoint: {exc}") from exc
+
+    def interrupt_active_runs(self) -> list[str]:
+        """Mark stale in-progress rows on API startup; never start them again."""
+        now = utc_now()
+        try:
+            with self._connect() as connection:
+                rows = connection.execute(
+                    "SELECT run_id FROM runs WHERE status IN ('running', 'cancelling')"
+                ).fetchall()
+                ids = [row["run_id"] for row in rows]
+                connection.execute(
+                    "UPDATE runs SET status = 'interrupted', finished_at = ?, "
+                    "result_json = COALESCE(result_json, ?) WHERE status IN ('running', 'cancelling')",
+                    (now, self._json({"status": "interrupted", "reason": "API restarted before terminal result"})),
+                )
+        except sqlite3.Error as exc:
+            raise StorageError(f"Could not mark interrupted runs: {exc}") from exc
+        return ids
+
+    def resume_run(self, run_id: str) -> None:
+        try:
+            with self._connect() as connection:
+                cursor = connection.execute(
+                    "UPDATE runs SET status = 'running', finished_at = NULL, exit_code = NULL, result_json = NULL "
+                    "WHERE run_id = ?", (run_id,)
+                )
+                if cursor.rowcount != 1:
+                    raise StorageError("Run does not exist")
+        except sqlite3.Error as exc:
+            raise StorageError(f"Could not mark run for recovery: {exc}") from exc
 
     @classmethod
     def _run_from_row(cls, row: sqlite3.Row) -> dict:

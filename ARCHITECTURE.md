@@ -19,7 +19,7 @@ REAPER-AI runs locally and does not commit or push changes automatically.
 
 # REAPER-AI — Architecture
 
-**Status:** M0–M4 and M5/P01 implemented with documented acceptance limits; P02 recovery and P03 memory remain separate decisions.
+**Status:** M0–M4 and M5/P01–P03 implemented with documented acceptance limits; the optional external Basic Memory integration is deferred.
 **Scope:** Local, single-user autonomous coding agent  
 **Language:** English for repository documentation; user interaction follows the user's language.
 
@@ -48,10 +48,10 @@ The former REAPER-AI v0.x implementation is **not** an architectural baseline. T
 | Core application | **Python** | Direct integration of graphs, tools, Git, subprocesses |
 | User interface | **Custom lightweight browser UI (HTML/CSS/JavaScript)** | Full control, minimal dependencies; Chainlit is not used |
 | API/server | **FastAPI, embedded local HTTP/SSE service** | Serve the custom UI and expose sessions, runs, projects, cancellation, and structured events |
-| Long-term knowledge | **Basic Memory candidate, optional** | Store durable decisions, not transient execution state |
+| Long-term knowledge | **Scoped SQLite durable memory** | Explicit user decisions and observed completed-run evidence; external Basic Memory deferred |
 | Source-of-truth | **Repository and tool results** | Current files, Git state, exit codes, and test results outrank memory |
 | Conversation/run history | **SQLite via Python stdlib** | One local file, no ORM or server; records conversations, runs, results, and bounded structured events |
-| Persistent execution | **Deferred to P02** | No checkpoint/resume mechanism is introduced by the history store |
+| Persistent execution | **SQLite stage checkpoints with explicit recovery** | Continue only after user action from the next verified stage; no automatic replay |
 | Git safety | **Never commit/push automatically** | Changes remain reviewable and under user control |
 
 LangGraph is already installed in the local development environment and is used **as an embedded Python library**, not as a hosted LangGraph server/platform. The custom UI is served locally through FastAPI; **Chainlit is excluded**. No LangSmith or other cloud dependency is required.
@@ -86,8 +86,8 @@ LangGraph is already installed in the local development environment and is used 
                Local project workspace
 
       Ollama: model inference for graph nodes
-      Optional Basic Memory: durable knowledge only
-      Local run store: conversation metadata, events, results
+      SQLite durable memory: scoped, verified knowledge only
+      Local run store: conversation metadata, events, results, checkpoints
 ```
 
 These are **logical responsibilities**, not separate network services or separate LLM agents. One local Python application may contain them all. The executor may run in a child process for cancellation and containment; that does not imply a distributed system.
@@ -264,9 +264,17 @@ Three separate scopes:
 |---|---|---|
 | Conversation | User requests, preferences, decisions, short verified result summaries | User intent and interaction history |
 | Execution state | Current plan, progress, tools, changes, checks, graph checkpoints | Authority for this run's actual progress |
-| Long-term memory | Durable facts, decisions, known constraints, lessons | Advisory; may be stale |
+| Long-term memory | User-confirmed decisions and observed, completed-run evidence | Advisory; may be stale |
 
-Memory retrieval is **on demand**. Repository and environment facts must be rechecked when correctness depends on their current state. Memory writes occur only for useful durable findings and must identify unsuccessful/partial outcomes accurately. The agent must not write that an implementation succeeded before verification.
+P03 keeps long-term memory in the existing SQLite file, rather than adding Basic Memory, embeddings, or a vector store. The repository has no existing RAG stack and no measured retrieval need that warrants those dependencies. Revisit this only if scoped lookup no longer satisfies a concrete user need.
+
+Memory retrieval is **on demand**, when a run starts, scoped to its workspace plus deliberately global user decisions. Repository and environment facts must be rechecked when correctness depends on their current state. Memory writes are deliberately narrow:
+
+- An explicit browser/API action can store a `user_decision` with `user_confirmed` verification.
+- A `completed` run can store one `verified_result` with `observed` verification. Its content is a mechanical summary of the saved verification level, changed-file evidence, and check count.
+- Model/assistant prose, ordinary messages, transient graph state, checkpoints, and unsuccessful or partial completion claims are never auto-promoted to durable memory.
+
+Each memory row records its optional workspace and source conversation/run IDs, kind, verification label, and creation time. The API offers `GET /memory` and `POST /memory`; the UI sends an explicit project-scoped decision. Memory stays advisory and source facts outrank it.
 
 Conversation history should not be reconstructed by concatenating model-generated success claims. Store status and evidence references separately, and supply only the relevant context to new runs.
 
@@ -316,7 +324,11 @@ The schema keeps conversations and messages separate from run records. A run lin
 
 SQLite failures before a run starts reject the request clearly; a post-run history-write failure is exposed on the live run as `storage_error` without replacing the observed engine outcome. Raw supervisor logs are transient and are not promoted to an unbounded database archive.
 
-For a follow-up in the selected conversation, the API supplies a bounded context made only from prior user requests and structured, observed run metadata; stored assistant/model prose is excluded and repository facts must still be rechecked. This is **not** checkpointing or recovery: P01 never resumes a process or replays commands after restart. P02 must decide whether LangGraph-compatible checkpoints are needed and document interrupted-run semantics. P03 remains the separate decision about durable memory beyond the active conversation.
+For a follow-up in the selected conversation, the API supplies a bounded context made only from prior user requests and structured, observed run metadata; stored assistant/model prose is excluded and repository facts must still be rechecked.
+
+P02 extends the same SQLite store with one versioned, digest-protected checkpoint per run. The engine writes it only after a stage returns a consistent state and records its stage result alongside the full state. The checkpoint states the next LangGraph node, allowing a recovery to begin there rather than replaying completed stages. On startup, stale `running` or `cancelling` database rows become visibly `interrupted`; they remain idle until the user explicitly calls the recovery API or presses the UI control.
+
+Recovery accepts only `interrupted`, `cancelled`, or `timed_out` runs with a valid checkpoint. It validates format, integrity digest, workspace identity, and the saved source/write preconditions before invoking the saved next stage. A missing, corrupt, incompatible, or inconsistent checkpoint is surfaced as non-recoverable, never silently substituted or replayed. P02 is intentionally not general checkpointing infrastructure or automatic process restoration. P03 durable memory remains separate from checkpoint data and never uses it as knowledge.
 
 ## 12. Operational boundaries
 
@@ -340,11 +352,10 @@ Potential future capabilities are evaluated only after the core can complete rep
 The following items are intentionally **not settled** by this document:
 
 1. **Inference adapter:** direct Ollama client or LangChain-compatible adapter, based on reliable tool-call behavior with the selected models.
-2. **Checkpointing/recovery:** whether P02 needs LangGraph-compatible checkpoints and which interrupted-run semantics are safe.
-3. **Execution isolation:** CLI engine runs under a managed Windows child-process supervisor; synthetic timeout and full process-tree termination have been verified. API-driven cancellation and abnormal-exit paths remain to be integrated and checked in M3.
+2. **Execution isolation:** CLI engine runs under a managed Windows child-process supervisor; synthetic timeout and full process-tree termination have been verified. API-driven cancellation and abnormal-exit paths remain to be integrated and checked in M3.
 4. **File editing implementation:** patch-based edit tool and precondition strategy to prevent accidental overwrites.
 5. **Verification policy:** task-specific minimum checks and success criteria, without a heavyweight universal test pipeline.
-6. **Memory:** whether Basic Memory demonstrably helps enough to justify its initial integration; no memory-first requirement.
+6. **Memory (resolved for initial release):** Basic Memory is deferred. Scoped SQLite memory is sufficient for explicit user decisions and observed completed-run evidence; reconsider only with a measured need for richer retrieval.
 
 These decisions must be resolved before production implementation; they do not block agreement on the execution architecture.
 
@@ -363,9 +374,9 @@ The architecture is viable only if a prototype can demonstrate all of the follow
 
 ---
 
-**Architectural direction:** Build REAPER-AI from scratch around embedded **LangGraph + local Ollama + evidence-producing tools**. The custom lightweight UI and local FastAPI/SSE boundary are selected; choose the persistence implementation after validating the execution contract. Do not recreate the v0.x free-running stage runner.
+**Architectural direction:** Build REAPER-AI from scratch around embedded **LangGraph + local Ollama + evidence-producing tools**. The custom lightweight UI, local FastAPI/SSE boundary, and single-file SQLite persistence are selected and implemented. Do not recreate the v0.x free-running stage runner.
 
-## Implementation status — M4 and M5/P01
+## Implementation status — M4 and M5/P01–P03
 
 The lightweight browser UI is implemented with HTML, CSS and vanilla JavaScript, served locally by FastAPI.
 
@@ -379,7 +390,7 @@ Limitations:
 - Structural verification does not establish functional correctness.
 - The displayed Git diff reflects the current workspace, not an immutable run snapshot.
 - Browser cancellation and reconnection have not been separately verified.
-- Persistent sessions and completed run history are implemented in SQLite (M5/P01); recovery remains P02 scope.
+- Persistent sessions, completed run history, explicit stage-checkpoint recovery, and scoped durable memory are implemented in SQLite (M5/P01–P03).
 - Run-result presentation and public run-ID consistency require refinement.
 
-M5/P01 verification is covered by focused storage/API tests for conversation/message/run association, persisted stage results/events, and lookup after a fresh in-memory API registry. No real checkpoint/restart-resume claim is made.
+M5/P01–P03 verification is covered by focused storage/API tests for conversation/message/run association, persisted stage results/events, checkpoint integrity, stale-run detection, restart from the checkpoint's next stage, and durable-memory scope/source/restart behavior. This does not claim automatic resumption, general process restoration, or semantic fact retrieval.
