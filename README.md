@@ -21,6 +21,8 @@ Open <http://127.0.0.1:8000/>. For development, install with `pip install -e .` 
 
 Choose an absolute Git repository root, an installed Ollama model, and a bounded timeout in the browser. REAPER-AI does not automatically commit, push, tag, publish, deploy, or delete repository data.
 
+Each run may select at most three tracked existing Python, TOML, Markdown, or `VERSION` files; new files remain Python-only. Configuration files are parsed as TOML before they are written, while the existing workspace, path, clean-Git-state, and file-specific-diff checks remain in force.
+
 ## Local history
 
 M5/P01 uses Python's built-in SQLite support; no server, ORM, or background service is required. By default, the database is stored at `%LOCALAPPDATA%\REAPER-AI\reaper-ai.sqlite3`. Set `REAPER_DATA_DIR` to choose another **directory**; `reaper-ai.sqlite3` is created within it. Application data stays outside both this source checkout and target workspaces. SQLite files are ignored by Git.

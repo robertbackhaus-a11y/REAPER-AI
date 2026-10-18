@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import time
+import tomllib
 from contextvars import ContextVar
 import subprocess
 from pathlib import Path
@@ -28,6 +29,8 @@ MAX_SOURCE_CHARS = 20_000
 MAX_MODEL_CALLS = 4  # selection + proposal + at most one repair
 MAX_WALL_SECONDS = 600
 _MAX_REPLY_CHARS = 80_000
+_EDITABLE_EXISTING_SUFFIXES = {".py", ".toml", ".md"}
+_EDITABLE_EXISTING_NAMES = {"VERSION"}
 _RUN = ContextVar("reaper_run_metrics", default=None)
 
 
@@ -76,6 +79,25 @@ def git(root: Path, *args: str) -> subprocess.CompletedProcess:
     )
 
 
+def _is_python_path(path: str) -> bool:
+    return Path(path).suffix.lower() == ".py"
+
+
+def _is_editable_existing_path(path: str) -> bool:
+    item = Path(path)
+    return item.name in _EDITABLE_EXISTING_NAMES or item.suffix.lower() in _EDITABLE_EXISTING_SUFFIXES
+
+
+def _validate_text_syntax(path: str, content: str) -> str:
+    if _is_python_path(path):
+        ast.parse(content, filename=path)
+        return "ok"
+    if Path(path).suffix.lower() == ".toml":
+        tomllib.loads(content)
+        return "ok"
+    return "not_applicable"
+
+
 def ask_json(system: str, user: str) -> dict:
     metrics = _budget()
     timeout = 300.0
@@ -122,7 +144,7 @@ def inventory(state: CodingState) -> dict:
         top = git(root, "rev-parse", "--show-toplevel")
         if top.returncode or Path(top.stdout.strip()).resolve() != root:
             raise ValueError("Workspace must be the root of a Git repository")
-        files = git(root, "ls-files", "--cached", "--", "*.py")
+        files = git(root, "ls-files", "--cached", "--", "*.py", "*.toml", "*.md", "VERSION")
         if files.returncode:
             raise ValueError(files.stderr.strip())
         candidates = []
@@ -133,19 +155,25 @@ def inventory(state: CodingState) -> dict:
             source = target.read_text(encoding="utf-8")
             if len(source) > MAX_SOURCE_CHARS:
                 continue
-            try:
-                tree = ast.parse(source)
-            except SyntaxError:
+            relative = target.relative_to(root).as_posix()
+            if not _is_editable_existing_path(relative):
                 continue
-            symbols = [node.name for node in tree.body if isinstance(
-                node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
-            candidates.append({"path": target.relative_to(root).as_posix(),
-                               "symbols": symbols[:30],
-                               "description": (ast.get_docstring(tree) or "")[:160]})
+            if _is_python_path(relative):
+                try:
+                    tree = ast.parse(source)
+                except SyntaxError:
+                    continue
+                symbols = [node.name for node in tree.body if isinstance(
+                    node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
+                description = (ast.get_docstring(tree) or "")[:160]
+            else:
+                symbols = []
+                description = "Tracked configuration or documentation file"
+            candidates.append({"path": relative, "symbols": symbols[:30], "description": description})
         if not candidates:
-            raise ValueError("No eligible tracked Python files")
+            raise ValueError("No eligible tracked editable files")
         if len(candidates) > 100:
-            raise ValueError("Repository inventory too large (>100 Python files)")
+            raise ValueError("Repository inventory too large (>100 editable files)")
         return {"inventory": candidates, "status": "inventoried", "error": ""}
     except (OSError, ValueError, UnicodeError, subprocess.TimeoutExpired, RunBudgetExceeded) as exc:
         return {"status": "failed", "error": str(exc)}
@@ -156,7 +184,7 @@ def select(state: CodingState) -> dict:
     print("[SELECT]")
     try:
         result = ask_json(
-            "Select existing Python files to edit AND new Python paths to create. "
+            "Select existing tracked editable files to edit AND new Python paths to create. "
             'Return JSON {"edit":["existing.py"],"create":["new.py"]}. '
             "At most 3 paths total; existing paths must come from inventory. "
             "Only request new files if needed. Never select a path both ways.",
@@ -168,11 +196,15 @@ def select(state: CodingState) -> dict:
             raise ValueError("Invalid selection format")
         selected = paths + creating
         known = {x["path"] for x in state["inventory"]}
-        if (not 1 <= len(selected) <= MAX_FILES
-                or any(not isinstance(x, str) for x in selected)
-                or len(set(selected)) != len(selected)
-                or any(x not in known for x in paths)):
-            raise ValueError("Invalid file selection")
+        if not 1 <= len(selected) <= MAX_FILES:
+            raise ValueError(f"File selection must contain 1 to {MAX_FILES} paths (got {len(selected)})")
+        if any(not isinstance(x, str) for x in selected):
+            raise ValueError("File selection paths must be strings")
+        if len(set(selected)) != len(selected):
+            raise ValueError("File selection contains duplicate paths")
+        unknown = sorted(path for path in paths if path not in known)
+        if unknown:
+            raise ValueError("Selected existing paths are not in the inventory: " + ", ".join(unknown))
         root = Path(state["workspace"]).resolve()
         originals = {}
         for path in paths:
@@ -204,7 +236,7 @@ def propose(state: CodingState) -> dict:
     print("[PROPOSE]")
     try:
         result = ask_json(
-            "Implement the task in the selected existing AND new Python files. "
+            "Implement the task in the selected existing editable files AND new Python files. "
             'Return JSON {"changes":{"relative.py":"complete updated source"}}. '
             "Include every selected file, even if it requires no change. "
             "Retain unrelated behavior in existing files; provide full source for new files. "
@@ -222,16 +254,25 @@ def propose(state: CodingState) -> dict:
                 raise ValueError(f"Invalid proposed content: {name}")
             if len(content) > MAX_SOURCE_CHARS * 2:
                 raise ValueError(f"Proposed content too large: {name}")
-            new_tree = ast.parse(content, filename=name)
-            old_tree = ast.parse(state["originals"][name], filename=name) if name in state["originals"] else None
-            if old_tree is None or ast.dump(new_tree, include_attributes=False) != ast.dump(old_tree, include_attributes=False):
+            _validate_text_syntax(name, content)
+            if name in state["creating"]:
+                meaningful = True
+            elif _is_python_path(name):
+                new_tree = ast.parse(content, filename=name)
+                old_tree = ast.parse(state["originals"][name], filename=name)
+                if ast.dump(new_tree, include_attributes=False) != ast.dump(old_tree, include_attributes=False):
+                    meaningful = True
+            elif content != state["originals"][name]:
                 meaningful = True
         if not meaningful:
-            return {"status": "no_semantic_change", "error": "No Python AST change; task completion not proven"}
-        # Reject cosmetic-only modifications to otherwise unchanged files.
+            return {"status": "no_semantic_change", "error": "No meaningful selected-file change; task completion not proven"}
+        # Reject cosmetic-only Python modifications and unchanged text files.
         changes = {name: content for name, content in changes.items()
-                   if name in state["creating"] or ast.dump(ast.parse(content), include_attributes=False)
-                   != ast.dump(ast.parse(state["originals"][name]), include_attributes=False)}
+                   if name in state["creating"] or (
+                       ast.dump(ast.parse(content), include_attributes=False)
+                       != ast.dump(ast.parse(state["originals"][name]), include_attributes=False)
+                       if _is_python_path(name) else content != state["originals"][name]
+                   )}
         return {"changes": changes, "status": "proposed", "error": ""}
     except (ValueError, SyntaxError, httpx.HTTPError, json.JSONDecodeError, RunBudgetExceeded) as exc:
         return {"status": "proposal_failed", "error": str(exc)}
@@ -304,6 +345,8 @@ def _check_local_imports(state: CodingState) -> None:
     root = Path(state["workspace"]).resolve()
     changes = state["changes"]
     for name, content in changes.items():
+        if not _is_python_path(name):
+            continue
         tree = ast.parse(content, filename=name)
         for node in ast.walk(tree):
             if not isinstance(node, ast.ImportFrom) or node.level or not node.module:
@@ -334,7 +377,7 @@ def verify(state: CodingState) -> dict:
             actual = _file(str(root), name).read_text(encoding="utf-8")
             if actual != expected:
                 raise ValueError(f"Written content mismatch: {name}")
-            ast.parse(actual, filename=name)
+            syntax = _validate_text_syntax(name, actual)
             if name in state["creating"]:
                 record = git(root, "status", "--porcelain", "--untracked-files=all", "--", name)
                 if record.returncode or not record.stdout.startswith("?? "):
@@ -345,8 +388,8 @@ def verify(state: CodingState) -> dict:
                 if diff.returncode or not diff.stdout.strip():
                     raise ValueError(f"Missing file-specific Git diff: {name}")
                 proof = "diff"
-            details.append({"path": name, "syntax": "ok", "git": proof})
-            print(f"FILE: {name} | SYNTAX: OK | GIT: {proof}")
+            details.append({"path": name, "syntax": syntax, "git": proof})
+            print(f"FILE: {name} | SYNTAX: {syntax.upper()} | GIT: {proof}")
         _check_local_imports(state)
         print("LOCAL IMPORTS: OK (changed files only)")
         _emit_event("verification_completed", status="structurally_verified", checks=details)

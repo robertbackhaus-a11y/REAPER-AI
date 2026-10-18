@@ -1,4 +1,5 @@
 import os
+import subprocess
 import unittest
 import uuid
 from pathlib import Path
@@ -45,3 +46,60 @@ class RecoveryEngineTests(unittest.TestCase):
         self.assertEqual(captured["stage"], "apply")
         self.assertEqual(captured["state"]["changes"]["module.py"], "value = 2\n")
         self.assertEqual(result["status"], "completed")
+
+
+class FileSelectionRegressionTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path.cwd() / f".reaper-ai-selection-{uuid.uuid4().hex}"
+        self.root.mkdir()
+        (self.root / "module.py").write_text("value = 1\n", encoding="utf-8")
+        (self.root / "pyproject.toml").write_text(
+            "[project]\nname = 'sample'\nversion = '0.1.0'\n", encoding="utf-8"
+        )
+
+    def tearDown(self):
+        for path in self.root.iterdir():
+            path.unlink()
+        self.root.rmdir()
+
+    def test_tracked_toml_is_selected_edited_and_empty_selection_is_explained(self):
+        state = {"workspace": str(self.root), "task": "Set version to 0.2.0", "inventory": [],
+                 "selected": [], "creating": [], "originals": {}, "changes": {}, "status": "pending",
+                 "error": "", "details": [], "corrections": 0, "feedback": ""}
+
+        def fake_git(root, *args):
+            if args[:2] == ("rev-parse", "--show-toplevel"):
+                return subprocess.CompletedProcess(args, 0, str(root) + "\n", "")
+            if args[:2] == ("ls-files", "--cached"):
+                return subprocess.CompletedProcess(args, 0, "module.py\npyproject.toml\n", "")
+            if args[:3] == ("diff", "HEAD", "--quiet"):
+                return subprocess.CompletedProcess(args, 0, "", "")
+            if args[:4] == ("--no-pager", "diff", "--no-ext-diff", "HEAD"):
+                return subprocess.CompletedProcess(args, 0, "diff --git a/pyproject.toml b/pyproject.toml\n", "")
+            raise AssertionError(f"Unexpected Git call: {args}")
+
+        with patch.object(engine, "git", side_effect=fake_git):
+            state.update(engine.inventory(state))
+            self.assertIn("pyproject.toml", [item["path"] for item in state["inventory"]])
+
+            with patch.object(engine, "ask_json", return_value={"edit": ["pyproject.toml"], "create": []}):
+                state.update(engine.select(state))
+            self.assertEqual(state["status"], "selected")
+            self.assertIn("version = '0.1.0'", state["originals"]["pyproject.toml"])
+
+            changed = "[project]\nname = 'sample'\nversion = '0.2.0'\n"
+            with patch.object(engine, "ask_json", return_value={"changes": {"pyproject.toml": changed}}):
+                state.update(engine.propose(state))
+            self.assertEqual(state["status"], "proposed")
+            state.update(engine.apply(state))
+            state.update(engine.verify(state))
+            self.assertEqual(state["status"], "structurally_verified")
+            self.assertEqual(state["details"], [{"path": "pyproject.toml", "syntax": "ok", "git": "diff"}])
+
+            with patch.object(engine, "ask_json", return_value={"edit": [], "create": []}):
+                failed = engine.select({**state, "status": "inventoried", "error": ""})
+            self.assertEqual(failed["error"], "File selection must contain 1 to 3 paths (got 0)")
+
+            with patch.object(engine, "ask_json", return_value={"edit": ["unknown.toml"], "create": []}):
+                failed = engine.select({**state, "status": "inventoried", "error": ""})
+            self.assertEqual(failed["error"], "Selected existing paths are not in the inventory: unknown.toml")
