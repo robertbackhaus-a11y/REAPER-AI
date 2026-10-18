@@ -1,6 +1,6 @@
 # REAPER-AI — Architecture
 
-**Status:** Implementation in progress — CLI engine and M2 reliability baseline implemented; M3 API/UI not yet implemented  
+**Status:** Implementation in progress — M0–M3 implemented with documented acceptance limits; M4 UI next  
 **Scope:** Local, single-user autonomous coding agent  
 **Language:** English for repository documentation; user interaction follows the user's language.
 
@@ -250,6 +250,16 @@ Memory retrieval is **on demand**. Repository and environment facts must be rech
 
 Conversation history should not be reconstructed by concatenating model-generated success claims. Store status and evidence references separately, and supply only the relevant context to new runs.
 
+<!-- M3 ACCEPTANCE CHECKPOINT (2026-10-18) -->
+### M3 implementation and acceptance checkpoint — 2026-10-18
+
+- **A01 (FastAPI/run control):** Local FastAPI starts successfully. `POST /runs` and `GET /runs/{run_id}` were exercised using the existing Windows supervisor and LangGraph engine; the API returned a terminal `completed` result and process exit code 0. A separate request to `POST /runs/{run_id}/cancel` transitioned from `cancelling` to `cancelled`; the observed Git working-tree status remained unchanged. The API cancellation exercise did **not** independently verify termination of each descendant; that was separately verified by the M2 R04 synthetic timeout probe.
+- **A02 (models/projects):** `GET /models` returned the Ollama-installed models `qwen3.6:35b`, `qwen3.8-q5:latest`, and `qwen3:8b`. `POST /projects/validate` confirmed a temporary local Git repository. An API-triggered task used the requested `qwen3.6:35b` model.
+- **A03 (events/SSE):** `GET /runs/{run_id}/events` returned 13 structured SSE events, including `run_started`, `phase_changed`, `model_activity`, `files_changed`, `verification_completed`, and `run_completed`. A real Git diff added `subtract(a, b)` to the sample repository; verification was **structural** (Python syntax + Git evidence), **not** a runtime functional test of that specific change.
+- **Identity caveat:** The public API run ID and engine-generated provenance `run_id` differ. The event stream carries the public `api_run_id` alongside engine metadata; agree on one canonical externally visible ID and retain an internal ID only when useful before M4.
+- **Recovery/retention caveat:** A01 retains run details in memory; completed history does not survive an API restart. Persistent storage and recovery are M5 scope, not delivered in M3.
+- **Acceptance boundaries:** The observed API cancel flow completed quickly, but the remaining exceptional cancellation/restart paths and all prospective engine verification scenarios have **not** been exhaustively tested. The architecture sections below describe targets where not already implemented.
+
 ## 10. UI, API, and streaming
 
 ### Selected frontend: lightweight custom browser UI
@@ -333,3 +343,20 @@ The architecture is viable only if a prototype can demonstrate all of the follow
 ---
 
 **Architectural direction:** Build REAPER-AI from scratch around embedded **LangGraph + local Ollama + evidence-producing tools**. The custom lightweight UI and local FastAPI/SSE boundary are selected; choose the persistence implementation after validating the execution contract. Do not recreate the v0.x free-running stage runner.
+
+## Implementation status — M4
+
+The lightweight browser UI is implemented with HTML, CSS and vanilla JavaScript, served locally by FastAPI.
+
+Verified in a real browser coding run:
+- Git workspace validation and Ollama model selection.
+- Coding task execution through the API and LangGraph engine.
+- Structured SSE progress events and terminal run status.
+- Display of structural verification results and current Git diff.
+
+Limitations:
+- Structural verification does not establish functional correctness.
+- The displayed Git diff reflects the current workspace, not an immutable run snapshot.
+- Browser cancellation and reconnection have not been separately verified.
+- Persistent sessions, run history and recovery remain M5 scope.
+- Run-result presentation and public run-ID consistency require refinement.

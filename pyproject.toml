@@ -11,6 +11,8 @@ license = "MIT"
 dependencies = [
     "langgraph>=1.2,<2",
     "httpx>=0.28,<1",
+    "fastapi>=0.115,<1",
+    "uvicorn>=0.30,<1",
 ]
 
 [tool.hatch.build.targets.wheel]

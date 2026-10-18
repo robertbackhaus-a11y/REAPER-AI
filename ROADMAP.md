@@ -1,6 +1,6 @@
 # REAPER-AI — Development Roadmap
 
-**Status:** Implementation in progress — M0/M1 working baseline, M2 qualified acceptance; M3 next  
+**Status:** Implementation in progress — M0–M3 completed with documented limitations; M4 next  
 **Architecture baseline:** [ARCHITECTURE.md](ARCHITECTURE.md) (approved)  
 **Target:** Windows 11, local single-user autonomous coding agent  
 **Technology decisions:** Python, embedded LangGraph, Ollama, FastAPI, SSE, custom HTML/CSS/vanilla JavaScript UI  
@@ -31,7 +31,7 @@ This is a new implementation. The former REAPER-AI runner, Main/Worker architect
 | M0 — Foundation | Implemented working baseline; original individual acceptance items not all audited | Installable minimal project skeleton |
 | M1 — Engine proof | Implemented; coding E2E evidence recorded | CLI-only inspect → edit → verify flow |
 | M2 — Reliability | Qualified acceptance; verified coding function and synthetic process-tree timeout; limitations below | Evidence, repair, safety, process containment |
-| M3 — Local application | **Next / not started** | FastAPI, projects, models, structured events |
+| M3 — Local application | **Accepted (A01–A03); qualifications below** | FastAPI, projects, models, structured events |
 | M4 — User interface | Usable lightweight local application | Vanilla JS chat and run-progress UI |
 | M5 — Persistence | Usable conversations and run history | Local store, result retrieval, safe recovery |
 | M6 — Release candidate | Verified end-to-end REAPER-AI | Documentation, installation, real-world acceptance |
@@ -168,6 +168,16 @@ The initial deliverable is **one dependable agent**. Multi-agent delegation and 
 
 **Gate M3:** the API can start/cancel work and report actual progress, results and errors independently of a browser.
 
+<!-- M3 ACCEPTANCE CHECKPOINT (2026-10-18) -->
+#### M3 implementation and acceptance checkpoint — 2026-10-18
+
+- **A01 — Accepted for current scope:** FastAPI exposes health, run start/status/log and cancellation. A real local Ollama coding request completed through the API (`exit_code: 0`) and generated a genuine Git diff. The API cancellation endpoint returned `cancelling` followed by `cancelled`; Git status was unchanged.
+- **A02 — Accepted for current scope:** Installed models discovered dynamically (`qwen3.6:35b`, `qwen3.8-q5:latest`, `qwen3:8b`); workspace validation passed against a temporary Git repository; run-specific model choice reached the engine.
+- **A03 — Accepted for current scope:** SSE returned 13 structured events ending in `run_completed`, with phase/model/file/verification information. Final evidence was syntax/Git **structural** verification, not a functional runtime test.
+- **Resolve before M4:** Public API `run_id` and engine provenance `run_id` are different values. Normalize the externally exposed identifier/event payload without losing internal correlation.
+- **Deferred/limitations:** Run registry and logs are in memory (M5 persistence pending); exceptional process/cancel paths not comprehensively covered; API cancellation verified status transition but not descendant termination in that same trial (full process-tree timeout proven separately at M2). Do not upgrade structural evidence into a functional-correctness claim.
+- **Next:** M4/U01 — serve a small HTML/CSS/vanilla JS interface with project/model choice, task submission and current run status. U02 adds event/diff/error visibility. No framework, second service, or automatic Git publication.
+
 ### M4 — Lightweight interface
 
 **U01 — Custom chat and project/model controls**
@@ -254,4 +264,18 @@ Promote an item only after a real use case justifies it, with an explicit new wo
 - Keep documentation consistent, but **write the README after this roadmap is approved**, as agreed.
 - Never perform Git commit/push/release automatically.
 
-**Next step:** implement M3/A01 as a minimal local FastAPI API for runs, using the existing engine/supervisor. M2 limitations above remain explicitly open. No automatic Git commit or push.
+**Next step:** M4/U01 — minimal HTML/CSS/vanilla JS UI served by FastAPI; preserve evidence labels and align API/engine run identity. No automatic Git commit or push.
+
+## M4 acceptance record
+
+**M4/U01 — Lightweight interface:** Completed for the tested coding workflow.
+
+**M4/U02 — Execution transparency:** Completed for the tested coding workflow.
+
+Browser acceptance demonstrated workspace validation, model selection, coding execution, SSE timeline, structural verification, terminal status and Git diff rendering.
+
+Known limitations are documented in ARCHITECTURE.md. Full functional correctness, browser reconnection and recovery have not been established.
+
+**Next milestone:** M5 — Local persistence and context.
+
+**Release preparation:** v0.2.0 (M3 + M4), subject to Git review and explicit commit/tag instructions.

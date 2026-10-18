@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>REAPER-AI</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="brand"><span class="brand-icon">R</span><div><strong>REAPER-AI</strong><small>Local engineering agent</small></div></div>
+      <div class="field"><label for="workspace">Git-Workspace (absoluter Pfad)</label><div class="path-row"><input id="workspace" spellcheck="false" placeholder="C:\\tools\\src\\my-project"><button id="validate" class="secondary">Prüfen</button></div><small id="project-status" class="muted">Noch nicht geprüft</small></div>
+      <div class="field"><label for="model">Ollama-Modell</label><div class="path-row"><select id="model"><option>Modelle laden …</option></select><button id="reload" class="secondary" title="Modelle neu laden">↻</button></div></div>
+      <div class="field"><label for="timeout">Zeitlimit (Sekunden)</label><input id="timeout" type="number" value="660" min="1" max="3600"></div>
+      <div class="sidebar-foot"><span class="dot" id="api-dot"></span><span id="api-status">Verbinde …</span><a href="/docs" target="_blank" rel="noopener">API</a></div>
+    </aside>
+    <main class="main">
+      <header><div><h1>Workspace</h1><p>Ein lokaler Lauf zur Zeit · Keine automatischen Git-Commits</p></div><span id="run-status" class="status">Bereit</span></header>
+      <div class="thread" id="thread"><div class="welcome"><h2>Was soll REAPER ändern?</h2><p>Projekt prüfen, Auftrag eingeben und starten. Ergebnisse sind nachprüfbar über Run-Status und Git-Diff.</p></div></div>
+      <section class="bottom">
+        <div id="activity" class="activity" aria-live="polite"></div>
+        <div class="composer"><textarea id="task" rows="3" placeholder="Coding-Auftrag beschreiben …" maxlength="20000"></textarea><div class="actions"><span id="hint">Strg+Enter zum Starten</span><button id="cancel" class="secondary" disabled>Abbrechen</button><button id="start">Run starten</button></div></div>
+      </section>
+    </main>
+  </div>
+</body>
+</html>

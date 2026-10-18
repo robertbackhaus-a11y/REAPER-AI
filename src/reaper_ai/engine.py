@@ -8,6 +8,7 @@ import argparse
 import ast
 import hashlib
 import json
+import os
 import time
 from contextvars import ContextVar
 import subprocess
@@ -20,13 +21,20 @@ from langgraph.graph import END, START, StateGraph
 from reaper_ai.tools import _file
 
 OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
-MODEL = "qwen3.6:35b"
+MODEL = os.environ.get("REAPER_MODEL", "qwen3.6:35b")
 MAX_FILES = 3
 MAX_SOURCE_CHARS = 20_000
 MAX_MODEL_CALLS = 4  # selection + proposal + at most one repair
 MAX_WALL_SECONDS = 600
 _MAX_REPLY_CHARS = 80_000
 _RUN = ContextVar("reaper_run_metrics", default=None)
+
+
+# REAPER-AI A03 STRUCTURED EVENTS
+# Dedicated machine-readable channel. Human-readable progress is not parsed.
+def _emit_event(kind: str, **payload) -> None:
+    event = {"type": kind, "timestamp": time.time(), **payload}
+    print("REAPER_EVENT:", json.dumps(event, ensure_ascii=False), flush=True)
 
 
 class RunBudgetExceeded(RuntimeError):
@@ -73,6 +81,7 @@ def ask_json(system: str, user: str) -> dict:
     if metrics is not None:
         metrics["model_calls"] += 1
         timeout = max(0.1, min(timeout, metrics["deadline"] - time.monotonic()))
+    _emit_event("model_activity", status="started", model=MODEL)
     with httpx.Client(timeout=timeout) as client:
         response = client.post(OLLAMA_URL, json={
             "model": MODEL,
@@ -88,6 +97,9 @@ def ask_json(system: str, user: str) -> dict:
     if metrics is not None:
         metrics["input_tokens"] += payload.get("prompt_eval_count") or 0
         metrics["output_tokens"] += payload.get("eval_count") or 0
+    _emit_event("model_activity", status="completed", model=MODEL,
+                input_tokens=payload.get("prompt_eval_count") or 0,
+                output_tokens=payload.get("eval_count") or 0)
     raw = payload["message"]["content"]
     if len(raw) > _MAX_REPLY_CHARS:
         raise ValueError("Model output exceeds 80,000 characters")
@@ -102,6 +114,7 @@ def code_digest(text: str) -> str:
 
 
 def inventory(state: CodingState) -> dict:
+    _emit_event("phase_changed", phase="inventory")
     print("[INVENTORY]")
     try:
         root = Path(state["workspace"]).resolve()
@@ -138,6 +151,7 @@ def inventory(state: CodingState) -> dict:
 
 
 def select(state: CodingState) -> dict:
+    _emit_event("phase_changed", phase="select")
     print("[SELECT]")
     try:
         result = ask_json(
@@ -185,6 +199,7 @@ def select(state: CodingState) -> dict:
 
 
 def propose(state: CodingState) -> dict:
+    _emit_event("phase_changed", phase="propose")
     print("[PROPOSE]")
     try:
         result = ask_json(
@@ -222,6 +237,7 @@ def propose(state: CodingState) -> dict:
 
 
 def apply(state: CodingState) -> dict:
+    _emit_event("phase_changed", phase="apply")
     print("[APPLY]")
     root = Path(state["workspace"]).resolve()
     written = []
@@ -246,6 +262,7 @@ def apply(state: CodingState) -> dict:
             else:
                 target.write_text(content, encoding="utf-8", newline="")
             written.append(name)
+        _emit_event("files_changed", files=written)
         return {"status": "written", "error": ""}
     except (OSError, ValueError, subprocess.TimeoutExpired, RunBudgetExceeded) as exc:
         # Best-effort rollback; never clobber concurrent external changes.
@@ -307,6 +324,7 @@ def _check_local_imports(state: CodingState) -> None:
 
 
 def verify(state: CodingState) -> dict:
+    _emit_event("phase_changed", phase="verify")
     print("[VERIFY]")
     root = Path(state["workspace"]).resolve()
     details = []
@@ -330,8 +348,10 @@ def verify(state: CodingState) -> dict:
             print(f"FILE: {name} | SYNTAX: OK | GIT: {proof}")
         _check_local_imports(state)
         print("LOCAL IMPORTS: OK (changed files only)")
+        _emit_event("verification_completed", status="structurally_verified", checks=details)
         return {"details": details, "status": "structurally_verified", "error": ""}
     except (OSError, ValueError, SyntaxError, subprocess.TimeoutExpired, RunBudgetExceeded) as exc:
+        _emit_event("verification_completed", status="failed", reason=str(exc), checks=details)
         rollback_error = _restore_written(state)
         error = str(exc) + (f"; rollback incomplete: {rollback_error}" if rollback_error else "")
         return {"details": details, "status": "failed" if rollback_error else "verify_failed",
@@ -347,6 +367,7 @@ def retry_proposal(state: CodingState) -> str:
 
 
 def repair_proposal(state: CodingState) -> dict:
+    _emit_event("phase_changed", phase="repair")
     print("[REPAIR PROPOSAL]")
     return {"corrections": state["corrections"] + 1,
             "feedback": state["error"], "status": "selected", "error": ""}
@@ -444,6 +465,7 @@ def _run_with_provenance(task: str, workspace: str) -> dict:
     run_id = uuid4().hex[:12]
     head_before, status_before = _git_snapshot(root)
     print(f"RUN_ID: {run_id}", flush=True)
+    _emit_event("run_started", run_id=run_id, workspace=str(root))
     result = _original_run(task, str(root))
     head_after, status_after = _git_snapshot(root)
     result["run_id"] = run_id
@@ -453,6 +475,8 @@ def _run_with_provenance(task: str, workspace: str) -> dict:
     result["git_status_after"] = status_after
     result["git_status_changed"] = status_before != status_after
     result["resumable"] = False  # No persistent per-run receipts/checkpoints yet.
+    _emit_event("run_completed", run_id=run_id, status=result.get("status", "failed"),
+                result=result)
     return result
 
 
