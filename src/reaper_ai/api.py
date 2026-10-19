@@ -13,7 +13,7 @@ from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from reaper_ai.persistence import StorageError, Store
@@ -236,6 +236,20 @@ def get_conversation(conversation_id: str):
     return conversation
 
 
+@app.delete("/conversations/{conversation_id}", status_code=204)
+def delete_conversation(conversation_id: str):
+    with _lock:
+        if any(entry.get("conversation_id") == conversation_id and entry.get("status") in {"running", "cancelling"}
+               for entry in _runs.values()):
+            raise HTTPException(status_code=409, detail="Conversation has an active run")
+    try:
+        if not _store.delete_conversation(conversation_id):
+            raise HTTPException(status_code=404, detail="Unknown conversation")
+    except StorageError as exc:
+        raise _storage_failure(exc) from exc
+    return Response(status_code=204)
+
+
 @app.get("/memory")
 def list_memory(workspace: str | None = None):
     try:
@@ -327,6 +341,13 @@ def start_run(request: StartRequest):
         _active = run_id
     threading.Thread(target=_watch, args=(run_id, proc), daemon=True).start()
     return _public(_runs[run_id])
+
+
+@app.get("/runs/active")
+def get_active_run():
+    with _lock:
+        entry = _runs.get(_active) if _active else None
+        return {"run": _public(entry) if entry is not None else None}
 
 
 @app.get("/runs/{run_id}")

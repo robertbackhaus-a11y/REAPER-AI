@@ -215,6 +215,15 @@ class Store:
             raise StorageError(f"Could not list conversations: {exc}") from exc
         return [dict(row) for row in rows]
 
+    def delete_conversation(self, conversation_id: str) -> bool:
+        """Delete one conversation and its messages while retaining its run records."""
+        try:
+            with self._connect() as connection:
+                cursor = connection.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
+                return cursor.rowcount == 1
+        except sqlite3.Error as exc:
+            raise StorageError(f"Could not delete conversation: {exc}") from exc
+
     def add_message(
         self, conversation_id: str, *, role: str, content: str, run_id: str | None = None,
         metadata: dict | None = None,
