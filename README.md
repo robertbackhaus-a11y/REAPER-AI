@@ -2,7 +2,7 @@
 
 **Local, single-user AI coding agent.** REAPER-AI turns engineering requests into observable work: it iteratively inspects files, makes changes, runs checks, and reports the evidence actually produced. A model assertion is never treated as proof of success.
 
-> **Status:** Development work after the v0.2.0 FastAPI/UI baseline adds M5/P01 history, M5/P02 explicit checkpoint recovery, M5/P03 scoped durable memory, and the M6/P01–P06 iterative tool-agent work. The optional external Basic Memory integration is deferred.
+> **Version 0.4.0:** M5/P01–P03 local history, explicit recovery, and scoped durable memory, plus the completed M6/P01–P06 iterative tool-agent work. The optional external Basic Memory integration is deferred.
 
 ## Requirements and installation
 
@@ -18,6 +18,10 @@ ollama pull qwen3.6:35b
 ```
 
 Open <http://127.0.0.1:8000/>. For development, install with `pip install -e .` instead.
+
+## Ollama configuration
+
+REAPER-AI uses the local Ollama API at `http://127.0.0.1:11434`. Start Ollama before opening the application and install a model with `ollama pull <model>`. The browser lists installed models and starts each run with the selected model. Direct engine runs use `REAPER_MODEL` when set, otherwise the built-in default `qwen3.6:35b`.
 
 Choose any existing absolute project directory, an installed Ollama model, and a bounded timeout in the browser. Git is an optional inspection tool, not a run precondition. The workspace supplies initial project context; tool paths may also be absolute and are subject to the started user's operating-system permissions. REAPER-AI never elevates permissions. It does not automatically commit, push, tag, publish, or release.
 
@@ -78,6 +82,13 @@ Run the focused persistence checks with:
 ```
 
 These tests cover history, durable-memory scope/source/restart behavior, checkpoint persistence/integrity, stale-run detection, explicit recovery availability, targeted large-file and conflict handling, and iterative agent behavior (read/search/range/write, external absolute paths, tool-failure correction, checkpointed decision recovery, Git, Python discovery, and shell output/error/timeout).
+
+## Known limitations
+
+- A completed run records observed tool evidence; it does not establish semantic or functional correctness unless the agent ran a suitable check.
+- Recovery is explicit. REAPER-AI never restarts an interrupted run automatically, and it rejects missing, invalid, incompatible, or legacy static-pipeline checkpoints.
+- Tool execution uses the started user's permissions. There is no automatic privilege elevation, commit, push, tag, release, or deployment.
+- The current workspace Git diff is an inspection result, not an immutable per-run diff snapshot.
 
 ## Project documents
 

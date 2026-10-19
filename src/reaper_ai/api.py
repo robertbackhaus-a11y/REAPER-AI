@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field
 
 from reaper_ai.persistence import StorageError, Store
 
-app = FastAPI(title="REAPER-AI", version="0.1.0")
+app = FastAPI(title="REAPER-AI", version="0.4.0")
 _lock = threading.Lock()
 _runs: dict[str, dict] = {}
 _active: str | None = None

@@ -1,5 +1,6 @@
 # REAPER-AI — Development Roadmap
 
+**Version target:** 0.4.0
 **Status:** M0–M4, M5/P01–P03, and M6/P01–P06 iterative-agent work implemented with documented limitations.
 **Architecture baseline:** [ARCHITECTURE.md](ARCHITECTURE.md) (approved)  
 **Target:** Windows 11, local single-user autonomous coding agent  
@@ -297,6 +298,16 @@ The initial deliverable is **one dependable agent**. Multi-agent delegation and 
 - **P05 file scanning:** ordinary project scans omit Git-ignored generated directories, while an explicitly selected ignored or hidden directory is traversed recursively. Git remains optional; explicit `.git` access is supported.
 - **P06 agent consolidation:** the active graph retains factual progress and source findings in its checkpoint, returns malformed or invalid model decisions as corrective observations, and reaches `agent_finalize` only through an explicit final decision with observed evidence. Shell execution remains autonomous under the started user's operating-system permissions.
 
+#### BUG-010–BUG-016 consolidation — 2026-10-19
+
+- **BUG-010 — completed:** malformed JSON or invalid action decisions become corrective observations; prompt input uses compact observations instead of retransmitting full results.
+- **BUG-011 — completed:** successful file reads retain source evidence for the next decision instead of relying only on disposable call history.
+- **BUG-012 — completed:** checkpointed progress records changes, checks, explicit open verification points, and errors before the next decision.
+- **BUG-013 — completed:** successful `read_file` and `read_file_range` actions neither close an explicit verification point nor create a progress error.
+- **BUG-014 — completed:** `write_file` receives its content only from structured action arguments; normalized tool-result metadata is not file content.
+- **BUG-015 — no repository evidence:** no implementation entry or source reference for this identifier exists in the current repository, so it is not claimed as completed.
+- **BUG-016 — completed:** hash- and position-bound `code_findings` survive checkpointing and are supplied before compact historical observations.
+
 #### Post-M6 technical cleanup — 2026-10-18
 
 - **Removed:** the obsolete `Inventory → Select → Analyze → Propose → Apply → Verify` graph, its snippet/range replacement and repair helpers, duplicate engine Git snapshots, and its dedicated legacy tests.
@@ -359,4 +370,4 @@ Known limitations are documented in ARCHITECTURE.md. Full functional correctness
 
 **Next milestone:** M6/D01 — real-world acceptance of the autonomous iterative agent.
 
-**Release preparation:** v0.2.0 (M3 + M4), subject to Git review and explicit commit/tag instructions.
+**Release preparation:** v0.4.0 documentation and package metadata prepared; commit, tag, push, and release remain explicit user actions.

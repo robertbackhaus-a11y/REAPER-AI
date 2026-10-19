@@ -19,7 +19,8 @@ REAPER-AI runs locally and does not commit or push changes automatically.
 
 # REAPER-AI — Architecture
 
-**Status:** M0–M4, M5/P01–P03, and M6 (iterative state, unrestricted local dispatcher, and LangGraph loop) implemented with documented acceptance limits; the optional external Basic Memory integration is deferred.
+**Version:** 0.4.0
+**Status:** M0–M4, M5/P01–P03, and M6/P01–P06 (iterative state, unrestricted local dispatcher, progress evidence, file scanning, and LangGraph loop) implemented with documented acceptance limits; the optional external Basic Memory integration is deferred.
 **Scope:** Local, single-user autonomous coding agent  
 **Language:** English for repository documentation; user interaction follows the user's language.
 
@@ -43,7 +44,7 @@ The former REAPER-AI v0.x implementation is **not** an architectural baseline. T
 
 | Area | Decision | Rationale |
 |---|---|---|
-| Workflow orchestration | **LangGraph (Python library)** | Explicit state, nodes, routing, bounded retries; no homegrown free-running tool loop |
+| Workflow orchestration | **LangGraph (Python library)** | Explicit state, nodes, routing, and checkpoint-safe iteration; no homegrown free-running tool loop |
 | Local inference | **Ollama** | Local model hosting, selectable models, tool-capable API |
 | Core application | **Python** | Direct integration of graphs, tools, Git, subprocesses |
 | User interface | **Custom lightweight browser UI (HTML/CSS/JavaScript)** | Full control, minimal dependencies; Chainlit is not used |
@@ -182,7 +183,7 @@ agent_decide → agent_finalize → END
 
 `agent_decide` obtains a constrained JSON action or final-report decision from Ollama. The engine supplies project context; `agent_execute` calls `dispatch_tool`; and `agent_observe` appends the normalized result to state. Tool errors and malformed or invalid model decisions become observations for the next decision with the available error message. A final report is accepted only after at least one successful observed tool result and no explicitly open verification point. The model's final prose remains an assessment separate from the `observed_tools` verification label.
 
-The agent has a wall-time budget, compact planner observations, and a LangGraph recursion guard derived from wall time; it has no arbitrary model-call, tool-call, file, or repair cap. Full normalized tool results stay in the run state and SQLite checkpoint, but prompt views use excerpts and redact large write content to a hash and length. The newest file-read observation receives the available prompt space so its source text remains actionable; older observations remain compact. It checkpoints after prepare, decision, execution, and observation through the existing SQLite store. Recovery recognizes `agent_*` stages and starts at their stored next safe node; already-observed tools are not rerun. The API accepts any existing absolute project directory; Git is optional, and SSE carries the existing phase/model/tool/checkpoint events.
+The agent has a wall-time budget, compact planner observations, and a LangGraph recursion guard derived from wall time; it has no arbitrary model-call, tool-call, file, or repair cap. Full normalized tool results stay in the run state and SQLite checkpoint, while the next decision receives factual progress, retained `code_findings`, and compact observations. It checkpoints after prepare, decision, execution, and observation through the existing SQLite store. Recovery recognizes `agent_*` stages and starts at their stored next safe node; already-observed tools are not rerun. The API accepts any existing absolute project directory; Git is optional, and SSE carries the existing phase/model/tool/checkpoint events.
 
 ### On-demand file access and edit scope
 
