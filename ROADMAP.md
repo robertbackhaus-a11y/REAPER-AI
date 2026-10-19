@@ -293,6 +293,10 @@ The initial deliverable is **one dependable agent**. Multi-agent delegation and 
 - **Retained source evidence:** successful whole-file and line-range reads now add hash- and position-bound `code_findings` to the existing checkpointed progress state. The next decision receives these findings before compact action history, while an exact reread updates its existing finding rather than accumulating duplicate history. This is context retention only; it does not prohibit repeated reads or impose an iteration limit.
 - **Verification evidence:** an explicit verification point closes only when a successful action identifies it through `verification_for`; a failed result leaves it open and a subsequent `final` decision is rejected as corrective model evidence.
 
+#### Sentinel decision-contract refinement — 2026-10-19
+
+- **Implemented:** the active Ollama system prompt now defines a compact, schema-aligned work method: derive subgoals and success criteria, use retained evidence before further inspection, implement once analysis is sufficient, verify proportionately, and use errors or ineffective results to change strategy. It retains JSON-only actions/finals and the existing `reason`, optional `plan`, `open_verifications`, and `verification_for` fields. Final decisions add an optional `completed`/`partial` outcome so an observed blocker is not stored as success; no graph, dispatcher, model, sampling, or checkpoint protocol changed.
+
 #### P05/P06 implementation checkpoint — 2026-10-19
 
 - **P05 file scanning:** ordinary project scans omit Git-ignored generated directories, while an explicitly selected ignored or hidden directory is traversed recursively. Git remains optional; explicit `.git` access is supported.
@@ -306,7 +310,7 @@ The initial deliverable is **one dependable agent**. Multi-agent delegation and 
 - **BUG-013 — completed:** successful `read_file` and `read_file_range` actions neither close an explicit verification point nor create a progress error.
 - **BUG-014 — completed:** `write_file` receives its content only from structured action arguments; normalized tool-result metadata is not file content.
 - **BUG-015 — no repository evidence:** no implementation entry or source reference for this identifier exists in the current repository, so it is not claimed as completed.
-- **BUG-016 — completed:** hash- and position-bound `code_findings` survive checkpointing and are supplied before compact historical observations.
+- **BUG-016 — completed:** hash- and position-bound `code_findings` survive checkpointing and are supplied before compact historical observations; the planner shares its source budget across findings so their order cannot exclude an already-read file from model context. Empty line ranges are reported as errors, and overlapping source evidence is reduced to the newest range for the same source hash.
 
 #### Post-M6 technical cleanup — 2026-10-18
 

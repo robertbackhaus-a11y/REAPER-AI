@@ -145,6 +145,14 @@ def dispatch_tool(action: ToolAction | dict[str, Any]) -> ToolResult:
         elif tool_name == "read_file_range":
             raw = tools.read_file_range(workspace, path=args["path"], start_line=args["start_line"],
                                         end_line=args["end_line"], max_chars=args.get("max_chars"))
+            content = raw.get("content") if isinstance(raw, dict) else None
+            if isinstance(content, str) and len(content) > _MAX_CAPTURE_CHARS:
+                captured = content[:_MAX_CAPTURE_CHARS]
+                raw = dict(raw)
+                raw["content"] = captured
+                raw["truncated"] = True
+                raw["captured_end_line"] = (args["start_line"] + captured.count("\n") - 1
+                                            if captured.endswith("\n") else args["start_line"] + captured.count("\n"))
         elif tool_name == "search_text":
             raw = tools.search_text(workspace, query=args["query"], path=args.get("path", "."),
                                     max_results=args.get("max_results"),

@@ -188,10 +188,14 @@ def read_file_range(workspace: str, path: str, start_line: int, end_line: int,
             raise ValueError("max_chars must be positive when supplied")
         target = _file(workspace, path)
         source_content = target.read_text(encoding="utf-8")
+        lines = source_content.splitlines(keepends=True)
+        if start_line > len(lines):
+            raise ValueError(f"start_line {start_line} is beyond end of file ({len(lines)} lines)")
         content = []
         used = 0
         truncated = False
-        for line_number, line in enumerate(source_content.splitlines(keepends=True), start=1):
+        last_line = start_line - 1
+        for line_number, line in enumerate(lines, start=1):
             if line_number < start_line:
                 continue
             if line_number > end_line:
@@ -207,8 +211,9 @@ def read_file_range(workspace: str, path: str, start_line: int, end_line: int,
                     break
             content.append(line)
             used += len(line)
+            last_line = line_number
         return {"ok": True, "path": _display_path(workspace, target), "start_line": start_line,
-                "end_line": end_line, "content": "".join(content), "truncated": truncated,
+                "end_line": end_line, "last_line": last_line, "content": "".join(content), "truncated": truncated,
                 "sha256": _sha256(source_content)}
     except (OSError, UnicodeError, ValueError) as exc:
         return {"ok": False, "error": str(exc)}
