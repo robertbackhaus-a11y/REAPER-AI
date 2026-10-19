@@ -148,6 +148,8 @@ Supported tools: list_files(path?, max_results?), search_text(query, path?, max_
 read_file(path, max_chars?), read_file_range(path, start_line, end_line, max_chars?), git_status, git_diff,
 find_python, shell(command, timeout?), write_file(path, content, expected_hash?). Paths may be workspace-relative or
 absolute. Git is optional. Shell commands and writes use the started user's normal operating-system permissions.
+On Windows, `shell` executes Windows PowerShell (`powershell -Command`), not CMD, Bash, or PowerShell 7. Use
+PowerShell syntax such as `Test-Path`; do not use Bash/CMD operators such as `||` or `2>nul`.
 Before writing an existing text file, read it and pass that result's sha256 as expected_hash. Use only the supported
 tools, respect tool errors and path rules, and never commit, push, or release automatically."""
 
@@ -165,6 +167,111 @@ def _string_list(value: Any) -> list[str] | None:
     return None
 
 
+def _captured_end(finding: dict[str, Any]) -> int | None:
+    """Return the last complete source line represented by a finding."""
+    start, end, content = finding.get("start_line"), finding.get("end_line"), finding.get("content")
+    if not isinstance(start, int) or not isinstance(end, int) or not isinstance(content, str):
+        return None
+    line_breaks = content.count("\n")
+    # A truncated final fragment is useful context, but is not evidence that its
+    # line was fully read. A complete source file may legitimately omit a final
+    # newline, so retain that line unless the content was clipped.
+    clipped = bool(finding.get("truncated") or finding.get("context_truncated"))
+    observed_end = start + line_breaks - 1 if content.endswith("\n") else start + line_breaks
+    if clipped and not content.endswith("\n"):
+        observed_end -= 1
+    return min(end, observed_end) if observed_end >= start else None
+
+
+def _merge_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(intervals):
+        if merged and start <= merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _source_coverage(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Describe completed, not merely requested, source ranges by file revision."""
+    grouped: dict[tuple[str, str], dict[str, Any]] = {}
+    for finding in findings:
+        path, digest, start = finding.get("path"), finding.get("sha256"), finding.get("start_line")
+        captured_end = _captured_end(finding)
+        if not isinstance(path, str) or not isinstance(digest, str) or not isinstance(start, int):
+            continue
+        entry = grouped.setdefault((path, digest), {"path": path, "sha256": digest, "ranges": [], "unread_from": []})
+        if captured_end is not None:
+            entry["ranges"].append((start, captured_end))
+        if bool(finding.get("truncated") or finding.get("context_truncated")):
+            entry["unread_from"].append((captured_end + 1) if captured_end is not None else start)
+    coverage: list[dict[str, Any]] = []
+    for entry in grouped.values():
+        ranges = _merge_intervals(entry["ranges"])
+        gaps = [[ranges[index][1] + 1, ranges[index + 1][0] - 1]
+                for index in range(len(ranges) - 1) if ranges[index][1] + 1 < ranges[index + 1][0]]
+        item: dict[str, Any] = {"path": entry["path"], "sha256": entry["sha256"],
+                                "covered_ranges": [[start, end] for start, end in ranges]}
+        if gaps:
+            item["unread_ranges"] = gaps
+        if entry["unread_from"]:
+            # A later range can fill the tail that an earlier truncated read
+            # did not capture. Advance each incomplete point through contiguous
+            # completed coverage before telling the model what remains unknown.
+            unread_points: list[int] = []
+            for unread_from in entry["unread_from"]:
+                for range_start, range_end in ranges:
+                    if range_start <= unread_from <= range_end:
+                        unread_from = range_end + 1
+                    elif range_start > unread_from:
+                        break
+                unread_points.append(unread_from)
+            item["unread_from"] = min(unread_points)
+        coverage.append(item)
+    return coverage
+
+
+def _uncovered_ranges(start: int, end: int, covered: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    remaining: list[tuple[int, int]] = []
+    cursor = start
+    for covered_start, covered_end in _merge_intervals(covered):
+        if covered_end < cursor:
+            continue
+        if covered_start > end:
+            break
+        if cursor < covered_start:
+            remaining.append((cursor, min(end, covered_start - 1)))
+        cursor = max(cursor, covered_end + 1)
+    if cursor <= end:
+        remaining.append((cursor, end))
+    return remaining
+
+
+def _non_overlapping_findings(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Retain each complete source line once, preferring the newest read."""
+    covered: dict[tuple[str, str], list[tuple[int, int]]] = {}
+    retained: list[dict[str, Any]] = []
+    for finding in reversed(findings):
+        path, digest, start = finding.get("path"), finding.get("sha256"), finding.get("start_line")
+        captured_end = _captured_end(finding)
+        if not isinstance(path, str) or not isinstance(digest, str) or not isinstance(start, int) or captured_end is None:
+            continue
+        key = (path, digest)
+        lines = finding["content"].splitlines(keepends=True)
+        for range_start, range_end in _uncovered_ranges(start, captured_end, covered.get(key, [])):
+            offset = range_start - start
+            length = range_end - range_start + 1
+            content = "".join(lines[offset:offset + length])
+            if not content:
+                continue
+            item = {field: finding.get(field) for field in ("path", "sha256", "truncated", "original_length", "captured_length")}
+            item.update({"start_line": range_start, "end_line": range_end, "content": content})
+            retained.append(item)
+        covered[key] = _merge_intervals([*covered.get(key, []), (start, captured_end)])
+    return list(reversed(retained))
+
+
 def _progress_snapshot(agent: dict[str, Any]) -> dict[str, Any]:
     """Compact factual progress, separate from source findings and call history."""
     progress = agent.get("progress") if isinstance(agent.get("progress"), dict) else {}
@@ -175,8 +282,7 @@ def _progress_snapshot(agent: dict[str, Any]) -> dict[str, Any]:
         "open_verifications": list(progress.get("open_verifications", [])),
         "errors": list(progress.get("errors", []))[-12:],
         "last_reason": _short_text(progress.get("last_reason", "")),
-        "finding_locations": [{key: item.get(key) for key in ("path", "start_line", "end_line", "sha256")}
-                              for item in findings if isinstance(item, dict)],
+        "source_coverage": _source_coverage([item for item in findings if isinstance(item, dict)]),
     }
 
 
@@ -240,26 +346,20 @@ def _agent_prompt(state: AgentRunState) -> str:
     """Prioritize retained source findings over disposable tool-call history."""
     agent = state["agent"]
     budget = _model_context_budget() - len(_AGENT_DECISION_SYSTEM.encode("utf-8")) - _MODEL_PROTOCOL_OVERHEAD_BYTES
+    progress = _progress_snapshot(agent)
+    source_coverage = progress.pop("source_coverage", [])
     prompt = {"task": state["task"], "workspace": state["workspace"],
               "path_rule": "Paths may be workspace-relative or absolute.",
+              "shell_environment": "Windows PowerShell (powershell -Command); use PowerShell syntax, never Bash/CMD `||` or `2>nul`.",
               "plan": agent["plan"], "current_step": agent["current_step"],
-              "progress": _progress_snapshot(agent), "verification": agent["verification"],
-              "code_findings": [], "previous_observations": []}
+              "progress": progress, "verification": agent["verification"],
+              "source_coverage": source_coverage, "visible_source_coverage": [], "code_findings": [], "previous_observations": []}
     used = len(json.dumps(prompt, ensure_ascii=False).encode("utf-8"))
     findings = [finding for finding in agent.get("progress", {}).get("findings", [])
                 if isinstance(finding, dict) and isinstance(finding.get("content"), str) and finding["content"]]
-    selected: list[dict[str, Any]] = []
-    for finding in reversed(findings):
-        path, digest = finding.get("path"), finding.get("sha256")
-        start, end = finding.get("start_line"), finding.get("end_line")
-        def overlaps(other: dict[str, Any]) -> bool:
-            if (other.get("path"), other.get("sha256")) != (path, digest):
-                return False
-            other_start, other_end = other.get("start_line"), other.get("end_line")
-            return start is None or end is None or other_start is None or other_end is None or start <= other_end and other_start <= end
-        if not any(overlaps(other) for other in selected):
-            selected.append(finding)
-    findings = list(reversed(selected))
+    prompt["source_coverage"] = _source_coverage(findings)
+    used = len(json.dumps(prompt, ensure_ascii=False).encode("utf-8"))
+    findings = _non_overlapping_findings(findings)
     retained: list[dict[str, Any]] = []
     if findings:
         headers = []
@@ -310,7 +410,20 @@ def _agent_prompt(state: AgentRunState) -> str:
                                 if content.endswith("\n") else start_line + content.count("\n"))
                 item["end_line"] = min(end_line, observed_end)
     prompt["code_findings"] = retained
+    prompt["visible_source_coverage"] = _source_coverage(retained)
+    while retained and len(json.dumps(prompt, ensure_ascii=False).encode("utf-8")) > budget:
+        overflow = len(json.dumps(prompt, ensure_ascii=False).encode("utf-8")) - budget
+        expandable = [item for item in retained if item["content"]]
+        if not expandable:
+            retained.pop()
+        else:
+            reduction = max(1, (overflow + len(expandable) - 1) // len(expandable))
+            for item in expandable:
+                content = item["content"].encode("utf-8")
+                item["content"] = content[:max(0, len(content) - reduction)].decode("utf-8", "ignore")
+        prompt["visible_source_coverage"] = _source_coverage(retained)
     used += sum(len(json.dumps(item, ensure_ascii=False).encode("utf-8")) for item in retained)
+    used = len(json.dumps(prompt, ensure_ascii=False).encode("utf-8"))
     chosen: list[dict[str, Any]] = []
     for observation in reversed(agent["observations"]):
         action = observation.get("action") if isinstance(observation.get("action"), dict) else {}
