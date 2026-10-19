@@ -8,6 +8,8 @@ from typing import Any, TypedDict
 
 from reaper_ai import system_tools
 from reaper_ai import tools
+from reaper_ai.persistence import StorageError, Store
+from reaper_ai.repository_index import RepositoryIndexError, refresh_project_index
 
 _MAX_CAPTURE_CHARS = 12_000
 
@@ -22,6 +24,13 @@ class AgentState(TypedDict):
     progress: dict[str, Any]
     verification: dict[str, Any]
     budgets: dict[str, int]
+    phase: str
+    current_task: str
+    findings: list[dict[str, Any]]
+    decisions: list[dict[str, Any]]
+    open_questions: list[dict[str, Any]]
+    completed_tasks: list[dict[str, Any]]
+    repository_map: dict[str, Any]
 
 
 class ToolAction(TypedDict):
@@ -96,6 +105,20 @@ def _context(action: dict[str, Any]) -> tuple[str, str]:
     return str(workspace_path), str(cwd_path)
 
 
+def _index_store(action: dict[str, Any], workspace: str) -> tuple[Store, dict]:
+    context = action.get("context") if isinstance(action.get("context"), dict) else {}
+    project_id = context.get("project_id")
+    if not isinstance(project_id, str) or not project_id:
+        raise ValueError("Repository index actions require a project_id")
+    store = Store()
+    project = store.get_project(project_id)
+    if project is None:
+        raise ValueError(f"Unknown project for repository index: {project_id}")
+    if Path(project["workspace"]).resolve() != Path(workspace).resolve():
+        raise ValueError("Repository index project workspace does not match tool workspace")
+    return store, project
+
+
 def new_agent_state() -> AgentState:
     """Create the minimal state used by a new iterative agent run.
 
@@ -117,6 +140,13 @@ def new_agent_state() -> AgentState:
         },
         "verification": {"status": "not_started", "checks": []},
         "budgets": {"tool_calls": 0},
+        "phase": "explore",
+        "current_task": "",
+        "findings": [],
+        "decisions": [],
+        "open_questions": [],
+        "completed_tasks": [],
+        "repository_map": {},
     }
 
 
@@ -174,6 +204,36 @@ def dispatch_tool(action: ToolAction | dict[str, Any]) -> ToolResult:
             # result metadata can never become an input to ``write_file``.
             raw = tools.write_file(workspace, path=path, content=content,
                                    expected_hash=args.get("expected_hash"))
+            if raw.get("ok") and raw.get("changed"):
+                try:
+                    store, project = _index_store(action, workspace)
+                    refresh_project_index(store, project)
+                except (RepositoryIndexError, StorageError, ValueError) as exc:
+                    raw = {**raw, "index_refresh_error": str(exc)}
+        elif tool_name == "index_files":
+            store, _ = _index_store(action, workspace)
+            raw = {"ok": True, "files": store.list_index_files(
+                action["context"]["project_id"], query=args.get("query"), language=args.get("language"),
+                limit=args.get("limit", 100))}
+        elif tool_name == "index_symbols":
+            store, _ = _index_store(action, workspace)
+            name = args.get("name")
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError("index_symbols requires a non-empty symbol name")
+            raw = {"ok": True, "symbols": store.find_index_symbols(
+                action["context"]["project_id"], name, path=args.get("path"), limit=args.get("limit", 100))}
+        elif tool_name == "index_file_symbols":
+            store, _ = _index_store(action, workspace)
+            path = args.get("path")
+            if not isinstance(path, str) or not path:
+                raise ValueError("index_file_symbols requires a file path")
+            raw = {"ok": True, "symbols": store.index_symbols_for_file(action["context"]["project_id"], path)}
+        elif tool_name == "index_imports":
+            store, _ = _index_store(action, workspace)
+            raw = {"ok": True, "imports": store.index_imports(action["context"]["project_id"], args.get("path"))}
+        elif tool_name == "index_status":
+            store, _ = _index_store(action, workspace)
+            raw = {"ok": True, "index": store.index_status(action["context"]["project_id"])}
         elif tool_name == "git_status":
             raw = tools.git_status(cwd)
         elif tool_name == "git_diff":
@@ -206,5 +266,5 @@ def dispatch_tool(action: ToolAction | dict[str, Any]) -> ToolResult:
         return _result(tool_name, ok=ok, exit_code=0 if ok else None, data=raw,
                        error="" if ok else str(raw.get("error") or raw.get("output") or "Tool failed"),
                        changes=changes, started=started)
-    except (KeyError, OSError, ValueError, TypeError) as exc:
+    except (KeyError, OSError, ValueError, TypeError, StorageError) as exc:
         return _result(tool_name, ok=False, error=str(exc), started=started)

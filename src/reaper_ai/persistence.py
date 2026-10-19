@@ -19,6 +19,10 @@ class StorageError(RuntimeError):
 
 _MAX_EVENT_BYTES = 32_000
 _CHECKPOINT_VERSION = 1
+_PROJECT_MIGRATION_KEY = "project_core_v1"
+_REPOSITORY_INDEX_MIGRATION_KEY = "repository_index_v1"
+_DEFAULT_MODEL = "qwen3.8-q5:latest"
+_DEFAULT_MODEL_OPTIONS = {"temperature": 0.0, "top_p": 0.9, "top_k": 40, "num_ctx": 16_384}
 
 
 def utc_now() -> str:
@@ -70,6 +74,24 @@ class Store:
     def _initialize(connection: sqlite3.Connection) -> None:
         connection.executescript(
             """
+            CREATE TABLE IF NOT EXISTS schema_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS projects (
+                project_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                workspace TEXT NOT NULL,
+                description TEXT,
+                system_prompt TEXT NOT NULL DEFAULT '',
+                model TEXT NOT NULL DEFAULT 'qwen3.8-q5:latest',
+                temperature REAL NOT NULL DEFAULT 0.0,
+                top_p REAL NOT NULL DEFAULT 0.9,
+                top_k INTEGER NOT NULL DEFAULT 40,
+                num_ctx INTEGER NOT NULL DEFAULT 16384,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS conversations (
                 id TEXT PRIMARY KEY,
                 created_at TEXT NOT NULL,
@@ -147,8 +169,104 @@ class Store:
                 ON durable_memory(workspace, created_at DESC);
             CREATE UNIQUE INDEX IF NOT EXISTS durable_memory_run_result
                 ON durable_memory(source_run_id) WHERE kind = 'verified_result';
+            CREATE TABLE IF NOT EXISTS project_index_state (
+                project_id TEXT PRIMARY KEY REFERENCES projects(project_id) ON DELETE CASCADE,
+                workspace TEXT NOT NULL,
+                scanned_at TEXT NOT NULL,
+                git_branch TEXT,
+                git_head TEXT
+            );
+            CREATE TABLE IF NOT EXISTS project_index_files (
+                project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+                path TEXT NOT NULL,
+                sha256 TEXT NOT NULL,
+                language TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                line_count INTEGER NOT NULL,
+                modified_at TEXT NOT NULL,
+                PRIMARY KEY (project_id, path)
+            );
+            CREATE TABLE IF NOT EXISTS project_index_symbols (
+                project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+                path TEXT NOT NULL,
+                sha256 TEXT NOT NULL,
+                name TEXT NOT NULL,
+                qualname TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                signature TEXT,
+                start_line INTEGER NOT NULL,
+                end_line INTEGER NOT NULL,
+                PRIMARY KEY (project_id, path, qualname, kind, start_line)
+            );
+            CREATE INDEX IF NOT EXISTS project_index_symbols_name
+                ON project_index_symbols(project_id, name);
+            CREATE TABLE IF NOT EXISTS project_index_imports (
+                project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+                path TEXT NOT NULL,
+                sha256 TEXT NOT NULL,
+                module TEXT NOT NULL,
+                imported_name TEXT NOT NULL DEFAULT '',
+                local_module TEXT,
+                line INTEGER NOT NULL,
+                PRIMARY KEY (project_id, path, module, imported_name, line)
+            );
+            CREATE INDEX IF NOT EXISTS project_index_imports_path
+                ON project_index_imports(project_id, path);
             """
         )
+        Store._add_column(connection, "conversations", "project_id", "TEXT")
+        Store._add_column(connection, "runs", "project_id", "TEXT")
+        Store._add_column(connection, "runs", "model_options_json", "TEXT")
+        Store._add_column(connection, "runs", "project_system_prompt", "TEXT")
+        Store._add_column(connection, "durable_memory", "project_id", "TEXT")
+        connection.execute("CREATE INDEX IF NOT EXISTS conversations_project_updated ON conversations(project_id, updated_at DESC)")
+        connection.execute("CREATE INDEX IF NOT EXISTS runs_project_started ON runs(project_id, started_at DESC)")
+        connection.execute("CREATE INDEX IF NOT EXISTS durable_memory_project_created ON durable_memory(project_id, created_at DESC)")
+        Store._migrate_project_core(connection)
+        connection.execute("INSERT OR IGNORE INTO schema_meta(key, value) VALUES(?, ?)",
+                           (_REPOSITORY_INDEX_MIGRATION_KEY, utc_now()))
+
+    @staticmethod
+    def _add_column(connection: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+        columns = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
+        if column not in columns:
+            connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+    @staticmethod
+    def _migrate_project_core(connection: sqlite3.Connection) -> None:
+        """Create one legacy project per historical workspace exactly once."""
+        if connection.execute("SELECT 1 FROM schema_meta WHERE key = ?", (_PROJECT_MIGRATION_KEY,)).fetchone():
+            return
+        workspaces: set[str] = set()
+        for table in ("conversations", "runs", "durable_memory"):
+            rows = connection.execute(f"SELECT DISTINCT workspace FROM {table} WHERE workspace IS NOT NULL AND trim(workspace) <> ''").fetchall()
+            workspaces.update(str(row["workspace"]) for row in rows)
+        projects: dict[str, str] = {}
+        now = utc_now()
+        for workspace in sorted(workspaces, key=str.casefold):
+            project_id = uuid.uuid4().hex
+            name = Path(workspace).name or workspace
+            connection.execute(
+                "INSERT INTO projects(project_id, name, workspace, description, system_prompt, model, temperature, top_p, top_k, num_ctx, created_at, updated_at) "
+                "VALUES(?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?)",
+                (project_id, name[:200], workspace, "Migrated legacy workspace", _DEFAULT_MODEL,
+                 _DEFAULT_MODEL_OPTIONS["temperature"], _DEFAULT_MODEL_OPTIONS["top_p"],
+                 _DEFAULT_MODEL_OPTIONS["top_k"], _DEFAULT_MODEL_OPTIONS["num_ctx"], now, now),
+            )
+            projects[workspace] = project_id
+        for workspace, project_id in projects.items():
+            connection.execute("UPDATE runs SET project_id = ? WHERE project_id IS NULL AND workspace = ?", (project_id, workspace))
+            connection.execute("UPDATE durable_memory SET project_id = ? WHERE project_id IS NULL AND workspace = ?", (project_id, workspace))
+        conversations = connection.execute("SELECT id, workspace FROM conversations WHERE project_id IS NULL").fetchall()
+        for conversation in conversations:
+            workspace = conversation["workspace"]
+            if not isinstance(workspace, str) or workspace not in projects:
+                continue
+            run_rows = connection.execute("SELECT DISTINCT workspace FROM runs WHERE conversation_id = ?", (conversation["id"],)).fetchall()
+            run_workspaces = {str(row["workspace"]) for row in run_rows}
+            if not run_workspaces or run_workspaces == {workspace}:
+                connection.execute("UPDATE conversations SET project_id = ? WHERE id = ?", (projects[workspace], conversation["id"]))
+        connection.execute("INSERT INTO schema_meta(key, value) VALUES(?, ?)", (_PROJECT_MIGRATION_KEY, utc_now()))
 
     @staticmethod
     def _json(value: Any, *, limit: int | None = None) -> str:
@@ -170,8 +288,260 @@ class Store:
         except json.JSONDecodeError:
             return {"unavailable": "Stored JSON could not be decoded"}
 
+    def create_project(self, *, name: str, workspace: str, description: str | None = None,
+                       system_prompt: str = "", model: str = _DEFAULT_MODEL,
+                       temperature: float = _DEFAULT_MODEL_OPTIONS["temperature"],
+                       top_p: float = _DEFAULT_MODEL_OPTIONS["top_p"],
+                       top_k: int = _DEFAULT_MODEL_OPTIONS["top_k"],
+                       num_ctx: int = _DEFAULT_MODEL_OPTIONS["num_ctx"]) -> dict:
+        now = utc_now()
+        project = {"project_id": uuid.uuid4().hex, "name": name.strip()[:200] or "Unnamed project",
+                   "workspace": workspace, "description": description, "system_prompt": system_prompt,
+                   "model": model, "temperature": temperature, "top_p": top_p, "top_k": top_k,
+                   "num_ctx": num_ctx, "created_at": now, "updated_at": now}
+        try:
+            with self._connect() as connection:
+                connection.execute(
+                    "INSERT INTO projects(project_id, name, workspace, description, system_prompt, model, temperature, top_p, top_k, num_ctx, created_at, updated_at) "
+                    "VALUES(:project_id, :name, :workspace, :description, :system_prompt, :model, :temperature, :top_p, :top_k, :num_ctx, :created_at, :updated_at)",
+                    project,
+                )
+        except sqlite3.Error as exc:
+            raise StorageError(f"Could not save project: {exc}") from exc
+        return project
+
+    def get_project(self, project_id: str) -> dict | None:
+        try:
+            with self._connect() as connection:
+                row = connection.execute("SELECT * FROM projects WHERE project_id = ?", (project_id,)).fetchone()
+        except sqlite3.Error as exc:
+            raise StorageError(f"Could not load project: {exc}") from exc
+        return dict(row) if row else None
+
+    def list_projects(self) -> list[dict]:
+        try:
+            with self._connect() as connection:
+                rows = connection.execute(
+                    "SELECT p.*, (SELECT COUNT(*) FROM conversations c WHERE c.project_id = p.project_id) AS conversation_count, "
+                    "(SELECT COUNT(*) FROM runs r WHERE r.project_id = p.project_id) AS run_count "
+                    "FROM projects p ORDER BY p.updated_at DESC"
+                ).fetchall()
+        except sqlite3.Error as exc:
+            raise StorageError(f"Could not list projects: {exc}") from exc
+        return [dict(row) for row in rows]
+
+    def update_project(self, project_id: str, **changes: Any) -> dict | None:
+        fields = {key: value for key, value in changes.items() if key in {
+            "name", "workspace", "description", "system_prompt", "model", "temperature", "top_p", "top_k", "num_ctx"
+        } and value is not None}
+        if not fields:
+            return self.get_project(project_id)
+        fields["updated_at"] = utc_now()
+        assignments = ", ".join(f"{key} = :{key}" for key in fields)
+        fields["project_id"] = project_id
+        try:
+            with self._connect() as connection:
+                cursor = connection.execute(f"UPDATE projects SET {assignments} WHERE project_id = :project_id", fields)
+                if cursor.rowcount != 1:
+                    return None
+                row = connection.execute("SELECT * FROM projects WHERE project_id = ?", (project_id,)).fetchone()
+        except sqlite3.Error as exc:
+            raise StorageError(f"Could not update project: {exc}") from exc
+        return dict(row)
+
+    def delete_project(self, project_id: str) -> bool:
+        """Delete only empty projects; historical records are never cascaded away."""
+        try:
+            with self._connect() as connection:
+                for table in ("conversations", "runs", "durable_memory"):
+                    if connection.execute(f"SELECT 1 FROM {table} WHERE project_id = ? LIMIT 1", (project_id,)).fetchone():
+                        return False
+                return connection.execute("DELETE FROM projects WHERE project_id = ?", (project_id,)).rowcount == 1
+        except sqlite3.Error as exc:
+            raise StorageError(f"Could not delete project: {exc}") from exc
+
+    def index_files(self, project_id: str) -> list[dict]:
+        try:
+            with self._connect() as connection:
+                rows = connection.execute(
+                    "SELECT * FROM project_index_files WHERE project_id = ? ORDER BY path", (project_id,)
+                ).fetchall()
+        except sqlite3.Error as exc:
+            raise StorageError(f"Could not load repository index files: {exc}") from exc
+        return [dict(row) for row in rows]
+
+    def list_index_files(self, project_id: str, *, query: str | None = None,
+                         language: str | None = None, limit: int = 500) -> list[dict]:
+        clauses = ["project_id = ?"]
+        values: list[Any] = [project_id]
+        if query:
+            clauses.append("path LIKE ?")
+            values.append(f"%{query}%")
+        if language:
+            clauses.append("language = ?")
+            values.append(language)
+        values.append(limit)
+        try:
+            with self._connect() as connection:
+                rows = connection.execute(
+                    f"SELECT * FROM project_index_files WHERE {' AND '.join(clauses)} ORDER BY path LIMIT ?", values
+                ).fetchall()
+        except sqlite3.Error as exc:
+            raise StorageError(f"Could not query repository index files: {exc}") from exc
+        return [dict(row) for row in rows]
+
+    def replace_index_file(self, project_id: str, file_record: dict,
+                           symbols: list[dict], imports: list[dict]) -> None:
+        values = {"project_id": project_id, **file_record}
+        try:
+            with self._connect() as connection:
+                connection.execute(
+                    "INSERT INTO project_index_files(project_id, path, sha256, language, size_bytes, line_count, modified_at) "
+                    "VALUES(:project_id, :path, :sha256, :language, :size_bytes, :line_count, :modified_at) "
+                    "ON CONFLICT(project_id, path) DO UPDATE SET sha256=excluded.sha256, language=excluded.language, "
+                    "size_bytes=excluded.size_bytes, line_count=excluded.line_count, modified_at=excluded.modified_at",
+                    values,
+                )
+                connection.execute("DELETE FROM project_index_symbols WHERE project_id = ? AND path = ?",
+                                   (project_id, file_record["path"]))
+                connection.execute("DELETE FROM project_index_imports WHERE project_id = ? AND path = ?",
+                                   (project_id, file_record["path"]))
+                connection.executemany(
+                    "INSERT INTO project_index_symbols(project_id, path, sha256, name, qualname, kind, signature, start_line, end_line) "
+                    "VALUES(:project_id, :path, :sha256, :name, :qualname, :kind, :signature, :start_line, :end_line)",
+                    [{"project_id": project_id, "path": file_record["path"], "sha256": file_record["sha256"], **item}
+                     for item in symbols],
+                )
+                connection.executemany(
+                    "INSERT INTO project_index_imports(project_id, path, sha256, module, imported_name, local_module, line) "
+                    "VALUES(:project_id, :path, :sha256, :module, :imported_name, :local_module, :line)",
+                    [{"project_id": project_id, "path": file_record["path"], "sha256": file_record["sha256"], **item}
+                     for item in imports],
+                )
+        except sqlite3.Error as exc:
+            raise StorageError(f"Could not update repository index file: {exc}") from exc
+
+    def update_index_file_metadata(self, project_id: str, file_record: dict) -> None:
+        try:
+            with self._connect() as connection:
+                connection.execute(
+                    "UPDATE project_index_files SET language=:language, size_bytes=:size_bytes, line_count=:line_count, "
+                    "modified_at=:modified_at WHERE project_id=:project_id AND path=:path AND sha256=:sha256",
+                    {"project_id": project_id, **file_record},
+                )
+        except sqlite3.Error as exc:
+            raise StorageError(f"Could not update repository index metadata: {exc}") from exc
+
+    def remove_index_paths(self, project_id: str, paths: list[str]) -> None:
+        if not paths:
+            return
+        placeholders = ",".join("?" for _ in paths)
+        try:
+            with self._connect() as connection:
+                for table in ("project_index_symbols", "project_index_imports", "project_index_files"):
+                    connection.execute(f"DELETE FROM {table} WHERE project_id = ? AND path IN ({placeholders})",
+                                       (project_id, *paths))
+        except sqlite3.Error as exc:
+            raise StorageError(f"Could not remove repository index paths: {exc}") from exc
+
+    def refresh_index_import_relations(self, project_id: str, modules: set[str]) -> None:
+        try:
+            with self._connect() as connection:
+                rows = connection.execute(
+                    "SELECT path, module, imported_name, line FROM project_index_imports WHERE project_id = ?", (project_id,)
+                ).fetchall()
+                for row in rows:
+                    module = row["module"]
+                    imported_name = row["imported_name"]
+                    candidates = [module]
+                    if module.startswith("."):
+                        level = len(module) - len(module.lstrip("."))
+                        parent = list(Path(row["path"]).with_suffix("").parts[:-1])
+                        base = parent[:max(0, len(parent) - level + 1)]
+                        suffix = module[level:].split(".") if module[level:] else []
+                        if suffix or imported_name:
+                            candidates = [".".join([*base, *suffix, imported_name] if not suffix else [*base, *suffix])]
+                    elif imported_name:
+                        candidates.append(f"{module}.{imported_name}")
+                    local_module = next((candidate for candidate in candidates if candidate in modules), None)
+                    connection.execute(
+                        "UPDATE project_index_imports SET local_module = ? WHERE project_id = ? AND path = ? "
+                        "AND module = ? AND imported_name = ? AND line = ?",
+                        (local_module, project_id, row["path"], module, imported_name, row["line"]),
+                    )
+        except sqlite3.Error as exc:
+            raise StorageError(f"Could not update local import relations: {exc}") from exc
+
+    def set_index_state(self, project_id: str, *, workspace: str, scanned_at: str,
+                        git_branch: str | None, git_head: str | None) -> None:
+        try:
+            with self._connect() as connection:
+                connection.execute(
+                    "INSERT INTO project_index_state(project_id, workspace, scanned_at, git_branch, git_head) "
+                    "VALUES(?, ?, ?, ?, ?) ON CONFLICT(project_id) DO UPDATE SET workspace=excluded.workspace, "
+                    "scanned_at=excluded.scanned_at, git_branch=excluded.git_branch, git_head=excluded.git_head",
+                    (project_id, workspace, scanned_at, git_branch, git_head),
+                )
+        except sqlite3.Error as exc:
+            raise StorageError(f"Could not save repository index state: {exc}") from exc
+
+    def index_status(self, project_id: str) -> dict:
+        try:
+            with self._connect() as connection:
+                state = connection.execute("SELECT * FROM project_index_state WHERE project_id = ?", (project_id,)).fetchone()
+                counts = connection.execute(
+                    "SELECT COUNT(*) AS file_count, SUM(language = 'python') AS python_file_count FROM project_index_files WHERE project_id = ?",
+                    (project_id,),
+                ).fetchone()
+                symbol_count = connection.execute("SELECT COUNT(*) FROM project_index_symbols WHERE project_id = ?", (project_id,)).fetchone()[0]
+        except sqlite3.Error as exc:
+            raise StorageError(f"Could not load repository index status: {exc}") from exc
+        return {**(dict(state) if state else {}), "project_id": project_id, "file_count": counts["file_count"],
+                "python_file_count": counts["python_file_count"] or 0, "symbol_count": symbol_count}
+
+    def find_index_symbols(self, project_id: str, name: str, *, path: str | None = None,
+                           limit: int = 100) -> list[dict]:
+        clauses = ["project_id = ?", "(name LIKE ? OR qualname LIKE ?)"]
+        values: list[Any] = [project_id, f"%{name}%", f"%{name}%"]
+        if path:
+            clauses.append("path = ?")
+            values.append(path)
+        values.append(limit)
+        try:
+            with self._connect() as connection:
+                rows = connection.execute(
+                    f"SELECT * FROM project_index_symbols WHERE {' AND '.join(clauses)} "
+                    "ORDER BY path, start_line LIMIT ?", values
+                ).fetchall()
+        except sqlite3.Error as exc:
+            raise StorageError(f"Could not query repository symbols: {exc}") from exc
+        return [dict(row) for row in rows]
+
+    def index_symbols_for_file(self, project_id: str, path: str) -> list[dict]:
+        try:
+            with self._connect() as connection:
+                rows = connection.execute(
+                    "SELECT * FROM project_index_symbols WHERE project_id = ? AND path = ? ORDER BY start_line",
+                    (project_id, path),
+                ).fetchall()
+        except sqlite3.Error as exc:
+            raise StorageError(f"Could not load file symbols: {exc}") from exc
+        return [dict(row) for row in rows]
+
+    def index_imports(self, project_id: str, path: str | None = None) -> list[dict]:
+        try:
+            with self._connect() as connection:
+                if path is None:
+                    rows = connection.execute("SELECT * FROM project_index_imports WHERE project_id = ? ORDER BY path, line", (project_id,)).fetchall()
+                else:
+                    rows = connection.execute("SELECT * FROM project_index_imports WHERE project_id = ? AND path = ? ORDER BY line", (project_id, path)).fetchall()
+        except sqlite3.Error as exc:
+            raise StorageError(f"Could not load file imports: {exc}") from exc
+        return [dict(row) for row in rows]
+
     def create_conversation(
-        self, *, workspace: str | None = None, model: str | None = None, title: str | None = None
+        self, *, workspace: str | None = None, model: str | None = None, title: str | None = None,
+        project_id: str | None = None,
     ) -> dict:
         now = utc_now()
         conversation = {
@@ -181,12 +551,13 @@ class Store:
             "title": (title or "New conversation").strip()[:200] or "New conversation",
             "workspace": workspace,
             "model": model,
+            "project_id": project_id,
         }
         try:
             with self._connect() as connection:
                 connection.execute(
-                    "INSERT INTO conversations(id, created_at, updated_at, title, workspace, model) "
-                    "VALUES(:id, :created_at, :updated_at, :title, :workspace, :model)",
+                    "INSERT INTO conversations(id, created_at, updated_at, title, workspace, model, project_id) "
+                    "VALUES(:id, :created_at, :updated_at, :title, :workspace, :model, :project_id)",
                     conversation,
                 )
         except sqlite3.Error as exc:
@@ -201,16 +572,23 @@ class Store:
             raise StorageError(f"Could not load conversation: {exc}") from exc
         return dict(row) if row else None
 
-    def list_conversations(self, limit: int = 100) -> list[dict]:
+    def list_conversations(self, limit: int = 100, project_id: str | None = None) -> list[dict]:
         try:
             with self._connect() as connection:
-                rows = connection.execute(
+                query = (
                     "SELECT c.*, "
                     "(SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) AS message_count, "
                     "(SELECT COUNT(*) FROM runs r WHERE r.conversation_id = c.id) AS run_count "
-                    "FROM conversations c ORDER BY c.updated_at DESC LIMIT ?",
-                    (limit,),
-                ).fetchall()
+                    "FROM conversations c "
+                )
+                parameters: tuple[Any, ...] = (limit,)
+                if project_id is not None:
+                    query += "WHERE c.project_id = ? "
+                    parameters = (project_id, limit)
+                    query += "ORDER BY c.updated_at DESC LIMIT ?"
+                else:
+                    query += "ORDER BY c.updated_at DESC LIMIT ?"
+                rows = connection.execute(query, parameters).fetchall()
         except sqlite3.Error as exc:
             raise StorageError(f"Could not list conversations: {exc}") from exc
         return [dict(row) for row in rows]
@@ -304,14 +682,14 @@ class Store:
             )
         return "\n".join(lines)[:6_000]
 
-    def add_memory(self, *, content: str, kind: str, workspace: str | None = None,
+    def add_memory(self, *, content: str, kind: str, workspace: str | None = None, project_id: str | None = None,
                    source_run_id: str | None = None, source_conversation_id: str | None = None,
                    verification: str) -> dict:
         if kind not in {"user_decision", "verified_result"}:
             raise StorageError(f"Unsupported durable-memory kind: {kind}")
         if verification not in {"user_confirmed", "observed"}:
             raise StorageError(f"Unsupported durable-memory verification: {verification}")
-        item = {"workspace": workspace, "kind": kind, "content": content.strip()[:2_000],
+        item = {"workspace": workspace, "project_id": project_id, "kind": kind, "content": content.strip()[:2_000],
                 "source_run_id": source_run_id, "source_conversation_id": source_conversation_id,
                 "verification": verification, "created_at": utc_now()}
         if not item["content"]:
@@ -319,8 +697,8 @@ class Store:
         try:
             with self._connect() as connection:
                 cursor = connection.execute(
-                    "INSERT INTO durable_memory(workspace, kind, content, source_run_id, source_conversation_id, "
-                    "verification, created_at) VALUES(:workspace, :kind, :content, :source_run_id, "
+                    "INSERT INTO durable_memory(workspace, project_id, kind, content, source_run_id, source_conversation_id, "
+                    "verification, created_at) VALUES(:workspace, :project_id, :kind, :content, :source_run_id, "
                     ":source_conversation_id, :verification, :created_at)", item
                 )
                 item["id"] = cursor.lastrowid
@@ -342,7 +720,7 @@ class Store:
                    f"changed_files={', '.join(str(path) for path in changed[:20]) or 'none'}; "
                    f"recorded_checks={len(checks)}.")
         try:
-            return self.add_memory(workspace=run.get("workspace"), kind="verified_result", content=summary,
+            return self.add_memory(workspace=run.get("workspace"), project_id=run.get("project_id"), kind="verified_result", content=summary,
                                    source_run_id=run["run_id"],
                                    source_conversation_id=run.get("conversation_id"), verification="observed")
         except StorageError as exc:
@@ -350,10 +728,14 @@ class Store:
                 return None
             raise
 
-    def list_memory(self, workspace: str | None = None, limit: int = 20) -> list[dict]:
+    def list_memory(self, workspace: str | None = None, limit: int = 20, project_id: str | None = None) -> list[dict]:
         try:
             with self._connect() as connection:
-                if workspace is None:
+                if project_id is not None:
+                    rows = connection.execute(
+                        "SELECT * FROM durable_memory WHERE project_id = ? ORDER BY created_at DESC LIMIT ?", (project_id, limit)
+                    ).fetchall()
+                elif workspace is None:
                     rows = connection.execute(
                         "SELECT * FROM durable_memory ORDER BY created_at DESC LIMIT ?", (limit,)
                     ).fetchall()
@@ -366,9 +748,9 @@ class Store:
             raise StorageError(f"Could not load durable memory: {exc}") from exc
         return [dict(row) for row in rows]
 
-    def relevant_memory(self, workspace: str, limit: int = 6) -> str:
+    def relevant_memory(self, workspace: str, limit: int = 6, project_id: str | None = None) -> str:
         lines = []
-        for item in reversed(self.list_memory(workspace, limit)):
+        for item in reversed(self.list_memory(workspace, limit, project_id)):
             label = "User-confirmed decision" if item["kind"] == "user_decision" else "Observed prior result"
             lines.append(f"{label}: {item['content']}")
         return "\n".join(lines)[:6_000]
@@ -376,7 +758,9 @@ class Store:
     def create_run(self, entry: dict) -> None:
         values = {
             "run_id": entry["run_id"], "conversation_id": entry.get("conversation_id"),
-            "workspace": entry["workspace"], "model": entry["model"], "task": entry["task"],
+            "project_id": entry.get("project_id"), "workspace": entry["workspace"], "model": entry["model"], "task": entry["task"],
+            "model_options_json": self._json(entry.get("model_options")) if entry.get("model_options") is not None else None,
+            "project_system_prompt": entry.get("project_system_prompt"),
             "timeout_seconds": entry.get("timeout", 660), "status": entry["status"],
             "started_at": entry["started_at"], "finished_at": entry.get("finished_at"),
             "exit_code": entry.get("exit_code"), "result_json": self._json(entry.get("result")) if entry.get("result") is not None else None,
@@ -384,9 +768,9 @@ class Store:
         try:
             with self._connect() as connection:
                 connection.execute(
-                    "INSERT INTO runs(run_id, conversation_id, workspace, model, task, timeout_seconds, status, "
-                    "started_at, finished_at, exit_code, result_json) VALUES(:run_id, :conversation_id, :workspace, "
-                    ":model, :task, :timeout_seconds, :status, :started_at, :finished_at, :exit_code, :result_json)",
+                    "INSERT INTO runs(run_id, conversation_id, project_id, workspace, model, model_options_json, project_system_prompt, task, timeout_seconds, status, "
+                    "started_at, finished_at, exit_code, result_json) VALUES(:run_id, :conversation_id, :project_id, :workspace, "
+                    ":model, :model_options_json, :project_system_prompt, :task, :timeout_seconds, :status, :started_at, :finished_at, :exit_code, :result_json)",
                     values,
                 )
         except sqlite3.Error as exc:
@@ -535,6 +919,7 @@ class Store:
         item = dict(row)
         item["timeout"] = item.pop("timeout_seconds")
         item["result"] = cls._decoded(item.pop("result_json"))
+        item["model_options"] = cls._decoded(item.pop("model_options_json", None))
         return item
 
     def get_run(self, run_id: str) -> dict | None:

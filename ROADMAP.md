@@ -376,3 +376,40 @@ Known limitations are documented in ARCHITECTURE.md. Full functional correctness
 **Next milestone:** M6/D01 — real-world acceptance of the autonomous iterative agent.
 
 **Release preparation:** v0.4.0 documentation and package metadata prepared; commit, tag, push, and release remain explicit user actions.
+
+## Variante B — Multi-project repository work
+
+### Step 1 — Project core (implemented)
+
+- A single local SQLite database now stores stable UUID projects with workspace, description, supplemental Sentinel prompt, and Ollama model settings (`temperature`, `top_p`, `top_k`, `num_ctx`).
+- Conversations, runs, and durable memory carry an optional project association. Additive, version-marked migration creates legacy projects for unambiguous historic workspaces, preserves ambiguous legacy conversations, and leaves run IDs and checkpoints unchanged.
+- New project runs use the configured project workspace and snapshot model options/prompt for stable execution and recovery. Projects sharing a workspace remain separate. Projects with historical data cannot be deleted automatically.
+- Local CRUD and project-scoped conversation/memory API endpoints are available. The browser integration follows in Step 5.
+
+### Step 2 — Repository index (implemented)
+
+- The shared SQLite store now maintains project-scoped file metadata, Python `ast` symbols and imports, plus Git branch/HEAD state without copying source text or creating another database.
+- Initial and incremental scans use content hashes: unchanged files retain their parsed data, changed/new files are reparsed, and removed paths are deleted. Typical repository metadata, dependency, virtual-environment, cache, and generated-output trees are excluded.
+- Local API index refresh, status, file, symbol, and import queries are available. Project runs refresh the selected project's index before launch and after completion. Equal workspaces remain separated by `project_id`.
+- This delivers navigation infrastructure only; the separate Step 3 working memory and Step 4 Sentinel integration build on it. Project UI follows in Step 5.
+
+### Step 3 — Hybrid run working memory (implemented)
+
+- Existing checkpointed agent state now preserves the current phase/subtask, model-proposed technical notes, decisions and questions, plus tool-observed completed steps.
+- Model notes are never promoted to file-change or verification facts. Source-linked observed notes retain file path and SHA-256 and are invalidated when that file is successfully changed.
+- The planner receives this compact memory before factual progress, observations and code findings; recovery applies defaults to checkpoints written before these fields existed.
+
+### Step 4 — Sentinel integration (implemented)
+
+- Project runs carry a compact, checkpointed repository map with task-ranked file metadata, relevant Python symbols/imports, and index status; source text is never added to this map.
+- Sentinel can query the existing project index for files, symbols, per-file symbols, imports, and status, then use `read_file_range` for source. Successful writes refresh that same index.
+- The prompt and decision contract guide dynamic `explore → plan → implement → verify` work without adding a second agent graph, database, vector store, or fixed tool/read limits. Legacy workspace-only runs retain their existing behavior without an index map.
+
+### Step 5 — Multi-project GUI (implemented)
+
+- The existing three-column vanilla-JavaScript UI now selects, creates, edits, and deletes eligible projects without adding a new UI framework.
+- The active project filters conversations and project knowledge; legacy chats remain reachable through the explicit legacy selection. New runs send the selected `project_id`, so they use the persisted project configuration.
+- The sidebar displays repository-index status (scan time, file/symbol counts, Git branch/HEAD), supports manual refresh, and offers simple combined file/symbol lookup.
+- Existing chat deletion, result/copy controls, recovery display, and the independent live-run panel remain in place. A live run remains visible while navigating chats or projects.
+
+**Next:** Commit, local installation, and a real Qwen acceptance run for the completed Variante-B steps. Do not add embeddings, a vector store, or a second project-management layer.

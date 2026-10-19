@@ -105,7 +105,8 @@ def _is_git_ignored_directory(workspace: str, directory: Path) -> bool:
         return False
 
 
-def _iter_regular_files(directory: Path, workspace: str | None = None):
+def _iter_regular_files(directory: Path, workspace: str | None = None,
+                        excluded_directories: set[str] | None = None):
     """Traverse regular files while omitting Git-ignored generated directories.
 
     Ordinary project scans skip directories that Git reports as ignored, such as
@@ -122,6 +123,8 @@ def _iter_regular_files(directory: Path, workspace: str | None = None):
             else:
                 ignored_names = set()
             directories[:] = [name for name in directories if name != ".git" and name not in ignored_names]
+        if excluded_directories:
+            directories[:] = [name for name in directories if name not in excluded_directories]
         directories.sort()
         for name in sorted(names):
             target = Path(current, name)
@@ -300,6 +303,25 @@ def git_status(workspace: str) -> dict:
         }
     except (OSError, subprocess.TimeoutExpired) as exc:
         return {"ok": False, "error": str(exc)}
+
+
+def git_info(workspace: str) -> dict:
+    """Return the current Git branch and commit when *workspace* is a repository."""
+    try:
+        branch = subprocess.run(
+            ["git", "branch", "--show-current"], cwd=workspace, capture_output=True,
+            text=True, encoding="utf-8", errors="replace", timeout=15,
+        )
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=workspace, capture_output=True,
+            text=True, encoding="utf-8", errors="replace", timeout=15,
+        )
+        if branch.returncode or head.returncode:
+            return {"ok": False, "branch": None, "head": None,
+                    "error": (head.stderr or branch.stderr).strip()}
+        return {"ok": True, "branch": branch.stdout.strip() or None, "head": head.stdout.strip() or None}
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"ok": False, "branch": None, "head": None, "error": str(exc)}
 
 
 def git_diff(workspace: str) -> dict:

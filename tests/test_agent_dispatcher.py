@@ -98,9 +98,8 @@ class AgentDispatcherTests(unittest.TestCase):
             self.assertIn("autonomous", autonomous["stdout"])
         finally:
             outside.unlink(missing_ok=True)
-            sample = root / "sample.txt"
-            if sample.exists():
-                sample.unlink()
+            for path in root.glob("*"):
+                path.unlink(missing_ok=True)
             root.rmdir()
 
         git_status = dispatch_tool({"tool": "git_status", "args": {},
@@ -127,10 +126,16 @@ class AgentDispatcherTests(unittest.TestCase):
             decisions = iter([
                 {"kind": "action", "reason": "Read the existing source before changing it.",
                  "plan": [{"step": "inspect the incorrect value"}],
+                 "phase": "explore", "current_task": "Inspect sample.py before editing",
+                 "findings": [{"summary": "The value must be read before a guarded write."}],
+                 "open_questions": ["Which value is currently stored?"],
                  "open_verifications": ["Confirm the corrected value with a command."],
                  "action": {"tool": "read_file", "args": {"path": "sample.py"}}},
                 {"kind": "action", "reason": "Apply the first correction attempt.",
                  "plan": [{"step": "write a corrected value"}],
+                 "phase": "implement", "current_task": "Write the corrected value",
+                 "decisions": ["Use the observed source hash for the guarded write."],
+                 "completed_tasks": ["Source inspection planned"],
                  "open_verifications": ["Run the value check after the write."],
                  "action": {"tool": "write_file", "args": {
                      "path": "sample.py", "content": intermediate,
@@ -150,6 +155,7 @@ class AgentDispatcherTests(unittest.TestCase):
                      "path": "sample.py", "content": fixed,
                      "expected_hash": hashlib.sha256(intermediate.encode("utf-8")).hexdigest()}}},
                 {"kind": "action", "reason": "Verify the corrected file with the same failing check.",
+                 "phase": "verify", "current_task": "Verify the corrected value",
                  "verification_for": ["Run the value check again."],
                  "action": {"tool": "shell", "args": {"command": (
                      "if ([IO.File]::ReadAllText('sample.py') -eq \"VALUE = 'fixed'`r`n\") "
@@ -187,6 +193,12 @@ class AgentDispatcherTests(unittest.TestCase):
                 self.assertLess(prompt.index('"progress"'), prompt.index('"previous_observations"'))
                 self.assertTrue(prompt_data["progress"]["checks"][-1]["ok"])
                 self.assertEqual(prompt_data["progress"]["open_verifications"], [])
+                self.assertEqual(checkpoint["state"]["agent"]["phase"], "verify")
+                self.assertEqual(checkpoint["state"]["agent"]["current_task"], "Verify the corrected value")
+                self.assertTrue(any(item["status"] == "proposed" for item in checkpoint["state"]["agent"]["decisions"]))
+                self.assertTrue(any(item["status"] == "observed" for item in checkpoint["state"]["agent"]["completed_tasks"]))
+                self.assertIsNotNone(checkpoint["state"]["agent"]["progress"]["last_change"])
+                self.assertLess(prompt.index('"working_memory"'), prompt.index('"progress"'))
                 decision_events = [payload for event, payload in events if event == "agent_decision"]
                 self.assertTrue(all("decision_kind" in payload and "progress" in payload and
                                     "verification_status" in payload for payload in decision_events))

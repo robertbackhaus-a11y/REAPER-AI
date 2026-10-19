@@ -109,3 +109,28 @@ class ApiPersistenceTests(unittest.TestCase):
         self.assertEqual(response["status"], "running")
         self.assertEqual(captured["env"]["REAPER_RESUME"], "1")
         self.assertEqual(api._store.get_run("resume-api")["status"], "running")
+
+    def test_project_run_uses_its_stored_model_snapshot(self):
+        project = api._store.create_project(
+            name="Configured", workspace="C:/project", system_prompt="Use this project's conventions.",
+            model="configured-model", temperature=0.3, top_p=0.7, top_k=12, num_ctx=24576,
+        )
+        captured = {}
+
+        class Process:
+            pid = 5678
+
+        def fake_popen(*args, **kwargs):
+            captured["env"] = kwargs["env"]
+            return Process()
+
+        with patch.object(api.os, "name", "nt"), patch.object(api, "_validate_workspace", return_value=Path("C:/project")), \
+             patch.object(api, "_installed_models", return_value=["configured-model"]), \
+             patch.object(api.subprocess, "Popen", side_effect=fake_popen), patch.object(api.threading, "Thread"):
+            response = api.start_run(api.StartRequest(project_id=project["project_id"], task="Inspect"))
+        self.assertEqual(response["project_id"], project["project_id"])
+        self.assertEqual(response["model"], "configured-model")
+        self.assertEqual(json.loads(captured["env"]["REAPER_MODEL_OPTIONS"]),
+                         {"temperature": 0.3, "top_p": 0.7, "top_k": 12, "num_ctx": 24576})
+        self.assertEqual(captured["env"]["REAPER_PROJECT_SYSTEM_PROMPT"], "Use this project's conventions.")
+        self.assertEqual(captured["env"]["REAPER_PROJECT_ID"], project["project_id"])

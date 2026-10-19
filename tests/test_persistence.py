@@ -1,9 +1,11 @@
 import unittest
 import uuid
 import sqlite3
+import shutil
 from pathlib import Path
 
 from reaper_ai.persistence import Store
+from reaper_ai.repository_index import refresh_project_index
 
 
 class StoreTests(unittest.TestCase):
@@ -115,4 +117,70 @@ class StoreTests(unittest.TestCase):
                               "timeout": 30, "status": "completed", "started_at": "now"})
         self.assertEqual(store.get_conversation_detail(first["id"])["runs"][0]["run_id"], "run-first")
         self.assertEqual(store.get_conversation_detail(second["id"])["runs"][0]["run_id"], "run-second")
+
+    def test_project_migration_is_idempotent_and_projects_with_same_workspace_stay_separate(self):
+        store = Store(self.path)
+        legacy = store.create_conversation(workspace="C:/legacy", model="old-model", title="Legacy")
+        store.create_run({"run_id": "legacy-run", "conversation_id": legacy["id"], "workspace": "C:/legacy",
+                          "model": "old-model", "task": "keep", "timeout": 30, "status": "interrupted", "started_at": "now"})
+        store.save_checkpoint("legacy-run", stage="agent_observe", next_stage="agent_decide",
+                              state={"workspace": "C:/legacy"}, stage_result={"status": "agent_observed"})
+        store.add_memory(content="Legacy decision", kind="user_decision", workspace="C:/legacy", verification="user_confirmed")
+        connection = sqlite3.connect(self.path)
+        try:
+            connection.execute("DELETE FROM schema_meta WHERE key = 'project_core_v1'")
+            connection.commit()
+        finally:
+            connection.close()
+        migrated = Store(self.path)
+        project = migrated.list_projects()[0]
+        self.assertEqual(migrated.get_run("legacy-run")["project_id"], project["project_id"])
+        self.assertEqual(migrated.get_conversation(legacy["id"])["project_id"], project["project_id"])
+        self.assertEqual(migrated.list_memory(project_id=project["project_id"])[0]["content"], "Legacy decision")
+        self.assertEqual(migrated.get_checkpoint("legacy-run")["next_stage"], "agent_decide")
+        self.assertEqual(len(Store(self.path).list_projects()), 1)
+
+        first = migrated.create_project(name="First", workspace="C:/same", model="first-model", num_ctx=8192)
+        second = migrated.create_project(name="Second", workspace="C:/same", model="second-model", num_ctx=32768)
+        migrated.add_memory(content="First only", kind="user_decision", workspace="C:/same", project_id=first["project_id"], verification="user_confirmed")
+        migrated.add_memory(content="Second only", kind="user_decision", workspace="C:/same", project_id=second["project_id"], verification="user_confirmed")
+        self.assertEqual(migrated.list_memory(project_id=first["project_id"])[0]["content"], "First only")
+        self.assertEqual(migrated.list_memory(project_id=second["project_id"])[0]["content"], "Second only")
+
+    def test_project_repository_index_is_incremental_and_project_scoped(self):
+        store = Store(self.path)
+        root = Path.cwd() / f".reaper-index-{uuid.uuid4().hex}"
+        try:
+            root.mkdir()
+            (root / "package").mkdir()
+            source = root / "package" / "worker.py"
+            source.write_text("from . import helper\n\nclass Worker:\n    async def run(self, value: int) -> str:\n        return str(value)\n", encoding="utf-8")
+            (root / "package" / "helper.py").write_text("def helper():\n    return 1\n", encoding="utf-8")
+            (root / "node_modules").mkdir()
+            (root / "node_modules" / "ignored.js").write_text("export const ignored = true;", encoding="utf-8")
+            first = store.create_project(name="First", workspace=str(root))
+            second = store.create_project(name="Second", workspace=str(root))
+
+            initial = refresh_project_index(store, first)
+            self.assertEqual(initial["parsed_files"], 2)
+            self.assertIn("Worker", [item["name"] for item in store.find_index_symbols(first["project_id"], "Worker")])
+            method = store.find_index_symbols(first["project_id"], "run")[0]
+            self.assertEqual((method["kind"], method["start_line"], method["end_line"]), ("async_method", 4, 5))
+            self.assertEqual(store.index_imports(first["project_id"], "package/worker.py")[0]["local_module"], "package.helper")
+            self.assertEqual(store.list_index_files(first["project_id"], query="ignored"), [])
+
+            unchanged = refresh_project_index(store, first)
+            self.assertEqual((unchanged["parsed_files"], unchanged["unchanged_files"]), (0, 2))
+            source.write_text("def replacement(name: str):\n    return name\n", encoding="utf-8")
+            (root / "package" / "helper.py").unlink()
+            changed = refresh_project_index(store, first)
+            self.assertEqual((changed["parsed_files"], changed["removed_files"]), (1, 1))
+            self.assertEqual([item["name"] for item in store.find_index_symbols(first["project_id"], "replacement")], ["replacement"])
+
+            refresh_project_index(store, second)
+            self.assertEqual(store.index_status(first["project_id"])["file_count"], 1)
+            self.assertEqual(store.index_status(second["project_id"])["file_count"], 1)
+            self.assertNotEqual(store.index_status(first["project_id"])["project_id"], store.index_status(second["project_id"])["project_id"])
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
 

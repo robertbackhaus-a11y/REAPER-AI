@@ -17,6 +17,7 @@ from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 from reaper_ai.persistence import StorageError, Store
+from reaper_ai.repository_index import RepositoryIndexError, refresh_project_index
 
 app = FastAPI(title="REAPER-AI", version="0.4.0")
 _lock = threading.Lock()
@@ -38,11 +39,12 @@ def _utc() -> str:
 
 
 class StartRequest(BaseModel):
-    workspace: str = Field(min_length=1)
+    workspace: str | None = Field(default=None, min_length=1)
     task: str = Field(min_length=1, max_length=20_000)
     timeout: int = Field(default=660, ge=1, le=3600)
     model: str | None = Field(default=None, min_length=1, max_length=200)
     conversation_id: str | None = Field(default=None, min_length=1, max_length=64)
+    project_id: str | None = Field(default=None, min_length=1, max_length=64)
 
 
 def _public(entry: dict) -> dict:
@@ -51,6 +53,13 @@ def _public(entry: dict) -> dict:
 
 def _storage_failure(exc: StorageError) -> HTTPException:
     return HTTPException(status_code=503, detail=f"Local persistence unavailable: {exc}")
+
+
+def _refresh_index(project: dict) -> dict:
+    try:
+        return refresh_project_index(_store, project)
+    except (RepositoryIndexError, StorageError) as exc:
+        raise HTTPException(status_code=503, detail=f"Repository index unavailable: {exc}") from exc
 
 
 def _entry(run_id: str) -> dict:
@@ -145,6 +154,14 @@ def _watch(run_id: str, proc: subprocess.Popen) -> None:
         except StorageError as exc:
             # The engine outcome remains authoritative even if its history cannot be saved.
             entry["storage_error"] = str(exc)
+    project_id = entry.get("project_id")
+    if project_id:
+        try:
+            project = _store.get_project(project_id)
+            if project is not None:
+                refresh_project_index(_store, project)
+        except (RepositoryIndexError, StorageError) as exc:
+            entry["index_error"] = str(exc)
 
 
 @app.get("/health")
@@ -180,6 +197,30 @@ class ProjectRequest(BaseModel):
     workspace: str = Field(min_length=1)
 
 
+class ProjectCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    workspace: str = Field(min_length=1, max_length=10_000)
+    description: str | None = Field(default=None, max_length=4_000)
+    system_prompt: str = Field(default="", max_length=12_000)
+    model: str = Field(default="qwen3.8-q5:latest", min_length=1, max_length=200)
+    temperature: float = Field(default=0.0, ge=0.0, le=2.0)
+    top_p: float = Field(default=0.9, gt=0.0, le=1.0)
+    top_k: int = Field(default=40, ge=1, le=500)
+    num_ctx: int = Field(default=16_384, ge=1_024, le=131_072)
+
+
+class ProjectUpdateRequest(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    workspace: str | None = Field(default=None, min_length=1, max_length=10_000)
+    description: str | None = Field(default=None, max_length=4_000)
+    system_prompt: str | None = Field(default=None, max_length=12_000)
+    model: str | None = Field(default=None, min_length=1, max_length=200)
+    temperature: float | None = Field(default=None, ge=0.0, le=2.0)
+    top_p: float | None = Field(default=None, gt=0.0, le=1.0)
+    top_k: int | None = Field(default=None, ge=1, le=500)
+    num_ctx: int | None = Field(default=None, ge=1_024, le=131_072)
+
+
 def _validate_workspace(workspace: str) -> Path:
     # Workspace must be explicitly supplied as an absolute path, not a path
     # relative to the API process or the current user directory.
@@ -198,29 +239,145 @@ def validate_project(request: ProjectRequest):
     return {"workspace": str(root), "valid": True}
 
 
+def _project_or_404(project_id: str) -> dict:
+    try:
+        project = _store.get_project(project_id)
+    except StorageError as exc:
+        raise _storage_failure(exc) from exc
+    if project is None:
+        raise HTTPException(status_code=404, detail="Unknown project")
+    return project
+
+
+@app.get("/projects")
+def list_projects():
+    try:
+        return {"projects": _store.list_projects()}
+    except StorageError as exc:
+        raise _storage_failure(exc) from exc
+
+
+@app.post("/projects", status_code=201)
+def create_project(request: ProjectCreateRequest):
+    root = _validate_workspace(request.workspace)
+    try:
+        return _store.create_project(**{**request.model_dump(), "workspace": str(root)})
+    except StorageError as exc:
+        raise _storage_failure(exc) from exc
+
+
+@app.get("/projects/{project_id}")
+def get_project(project_id: str):
+    return _project_or_404(project_id)
+
+
+@app.patch("/projects/{project_id}")
+def update_project(project_id: str, request: ProjectUpdateRequest):
+    _project_or_404(project_id)
+    changes = request.model_dump(exclude_unset=True)
+    if "workspace" in changes:
+        changes["workspace"] = str(_validate_workspace(changes["workspace"]))
+    try:
+        project = _store.update_project(project_id, **changes)
+    except StorageError as exc:
+        raise _storage_failure(exc) from exc
+    if project is None:
+        raise HTTPException(status_code=404, detail="Unknown project")
+    return project
+
+
+@app.delete("/projects/{project_id}", status_code=204)
+def delete_project(project_id: str):
+    _project_or_404(project_id)
+    try:
+        if not _store.delete_project(project_id):
+            raise HTTPException(status_code=409, detail="Project has historical chats, runs, or project knowledge and cannot be deleted")
+    except StorageError as exc:
+        raise _storage_failure(exc) from exc
+    return Response(status_code=204)
+
+
+@app.post("/projects/{project_id}/index")
+def refresh_index(project_id: str):
+    return _refresh_index(_project_or_404(project_id))
+
+
+@app.get("/projects/{project_id}/index")
+def get_index_status(project_id: str):
+    project = _project_or_404(project_id)
+    _refresh_index(project)
+    try:
+        return _store.index_status(project_id)
+    except StorageError as exc:
+        raise _storage_failure(exc) from exc
+
+
+@app.get("/projects/{project_id}/index/files")
+def get_index_files(project_id: str, query: str | None = None, language: str | None = None,
+                    limit: int = 500):
+    _refresh_index(_project_or_404(project_id))
+    try:
+        return {"files": _store.list_index_files(project_id, query=query, language=language,
+                                                   limit=max(1, min(limit, 2_000)))}
+    except StorageError as exc:
+        raise _storage_failure(exc) from exc
+
+
+@app.get("/projects/{project_id}/index/symbols")
+def get_index_symbols(project_id: str, name: str = "", path: str | None = None, limit: int = 100):
+    _refresh_index(_project_or_404(project_id))
+    try:
+        if path and not name:
+            return {"symbols": _store.index_symbols_for_file(project_id, path)}
+        return {"symbols": _store.find_index_symbols(project_id, name, path=path,
+                                                       limit=max(1, min(limit, 1_000)))}
+    except StorageError as exc:
+        raise _storage_failure(exc) from exc
+
+
+@app.get("/projects/{project_id}/index/imports")
+def get_index_imports(project_id: str, path: str | None = None):
+    _refresh_index(_project_or_404(project_id))
+    try:
+        return {"imports": _store.index_imports(project_id, path)}
+    except StorageError as exc:
+        raise _storage_failure(exc) from exc
+
+
 class ConversationRequest(BaseModel):
     workspace: str | None = Field(default=None, max_length=10_000)
     model: str | None = Field(default=None, max_length=200)
     title: str | None = Field(default=None, max_length=200)
+    project_id: str | None = Field(default=None, min_length=1, max_length=64)
 
 
 class MemoryRequest(BaseModel):
     content: str = Field(min_length=1, max_length=2_000)
     workspace: str | None = Field(default=None, max_length=10_000)
+    project_id: str | None = Field(default=None, min_length=1, max_length=64)
 
 
 @app.get("/conversations")
-def list_conversations():
+def list_conversations(project_id: str | None = None):
     try:
-        return {"conversations": _store.list_conversations()}
+        if project_id is not None:
+            _project_or_404(project_id)
+        return {"conversations": _store.list_conversations(project_id=project_id)}
     except StorageError as exc:
         raise _storage_failure(exc) from exc
 
 
 @app.post("/conversations", status_code=201)
 def create_conversation(request: ConversationRequest):
+    workspace, model = request.workspace, request.model
+    if request.project_id:
+        project = _project_or_404(request.project_id)
+        root = _validate_workspace(project["workspace"])
+        if workspace and _validate_workspace(workspace) != root:
+            raise HTTPException(status_code=422, detail="Conversation workspace must match its project workspace")
+        workspace, model = str(root), project["model"]
     try:
-        return _store.create_conversation(workspace=request.workspace, model=request.model, title=request.title)
+        return _store.create_conversation(workspace=workspace, model=model, title=request.title, project_id=request.project_id)
     except StorageError as exc:
         raise _storage_failure(exc) from exc
 
@@ -250,10 +407,21 @@ def delete_conversation(conversation_id: str):
     return Response(status_code=204)
 
 
-@app.get("/memory")
-def list_memory(workspace: str | None = None):
+@app.get("/projects/{project_id}/conversations")
+def list_project_conversations(project_id: str):
+    _project_or_404(project_id)
     try:
-        return {"memory": _store.list_memory(workspace)}
+        return {"conversations": _store.list_conversations(project_id=project_id)}
+    except StorageError as exc:
+        raise _storage_failure(exc) from exc
+
+
+@app.get("/memory")
+def list_memory(workspace: str | None = None, project_id: str | None = None):
+    try:
+        if project_id is not None:
+            _project_or_404(project_id)
+        return {"memory": _store.list_memory(workspace, project_id=project_id)}
     except StorageError as exc:
         raise _storage_failure(exc) from exc
 
@@ -261,9 +429,34 @@ def list_memory(workspace: str | None = None):
 @app.post("/memory", status_code=201)
 def add_memory(request: MemoryRequest):
     workspace = str(_validate_workspace(request.workspace)) if request.workspace else None
+    if request.project_id:
+        project = _project_or_404(request.project_id)
+        project_workspace = str(_validate_workspace(project["workspace"]))
+        if workspace and workspace != project_workspace:
+            raise HTTPException(status_code=422, detail="Project knowledge workspace must match its project workspace")
+        workspace = project_workspace
     try:
         return _store.add_memory(content=request.content, kind="user_decision", workspace=workspace,
-                                 verification="user_confirmed")
+                                 project_id=request.project_id, verification="user_confirmed")
+    except StorageError as exc:
+        raise _storage_failure(exc) from exc
+
+
+@app.get("/projects/{project_id}/memory")
+def list_project_memory(project_id: str):
+    _project_or_404(project_id)
+    try:
+        return {"memory": _store.list_memory(project_id=project_id)}
+    except StorageError as exc:
+        raise _storage_failure(exc) from exc
+
+
+@app.post("/projects/{project_id}/memory", status_code=201)
+def add_project_memory(project_id: str, request: MemoryRequest):
+    project = _project_or_404(project_id)
+    try:
+        return _store.add_memory(content=request.content, kind="user_decision", workspace=project["workspace"],
+                                 project_id=project_id, verification="user_confirmed")
     except StorageError as exc:
         raise _storage_failure(exc) from exc
 
@@ -273,14 +466,26 @@ def start_run(request: StartRequest):
     global _active
     if os.name != "nt":
         raise HTTPException(status_code=501, detail="Windows supervisor required")
-    root = _validate_workspace(request.workspace)
+    project: dict | None = None
+    if request.project_id:
+        project = _project_or_404(request.project_id)
+        root = _validate_workspace(project["workspace"])
+    elif request.workspace:
+        root = _validate_workspace(request.workspace)
+    else:
+        raise HTTPException(status_code=422, detail="Workspace is required for a legacy run without a project")
+    if project is not None and root.is_dir():
+        _refresh_index(project)
     # Resolve the model at the start of each run. Never silently use another
     # model if the requested one is missing.
     available = _installed_models()
     default = "qwen3.6:35b"
-    model = request.model or default
+    model = project["model"] if project else request.model or default
     if model not in available:
         raise HTTPException(status_code=422, detail=f"Model not installed: {model}")
+    model_options = ({key: project[key] for key in ("temperature", "top_p", "top_k", "num_ctx")}
+                     if project else {"temperature": 0.0, "top_p": 0.9, "top_k": 40, "num_ctx": 16_384})
+    project_system_prompt = project["system_prompt"] if project else ""
     run_id = uuid.uuid4().hex[:12]
     log_path = Path(tempfile.gettempdir()) / f"reaper-api-{run_id}.log"
     with _lock:
@@ -293,12 +498,15 @@ def start_run(request: StartRequest):
                     raise HTTPException(status_code=404, detail="Unknown conversation")
             else:
                 conversation = _store.create_conversation(
-                    workspace=str(root), model=model, title=request.task[:120]
+                    workspace=str(root), model=model, title=request.task[:120], project_id=request.project_id
                 )
+            if request.project_id and conversation.get("project_id") != request.project_id:
+                raise HTTPException(status_code=409, detail="Conversation belongs to a different or legacy project")
             prior_context = _store.relevant_context(conversation["id"])
-            durable_memory = _store.relevant_memory(str(root))
-            entry = {"run_id": run_id, "conversation_id": conversation["id"], "workspace": str(root),
-                     "model": model, "task": request.task, "timeout": request.timeout,
+            durable_memory = _store.relevant_memory(str(root), project_id=request.project_id)
+            entry = {"run_id": run_id, "conversation_id": conversation["id"], "project_id": request.project_id,
+                     "workspace": str(root), "model": model, "model_options": model_options,
+                     "project_system_prompt": project_system_prompt, "task": request.task, "timeout": request.timeout,
                      "status": "running",
                      "started_at": _utc(), "finished_at": None, "exit_code": None, "result": None,
                      "log_path": str(log_path)}
@@ -323,7 +531,11 @@ def start_run(request: StartRequest):
             with log_path.open("wb") as output:
                 env = os.environ.copy()
                 env["REAPER_MODEL"] = model
+                env["REAPER_MODEL_OPTIONS"] = json.dumps(model_options, separators=(",", ":"))
+                env["REAPER_PROJECT_SYSTEM_PROMPT"] = project_system_prompt
                 env["REAPER_API_RUN_ID"] = run_id
+                if request.project_id:
+                    env["REAPER_PROJECT_ID"] = request.project_id
                 env["PYTHONUNBUFFERED"] = "1"
                 env["PYTHONUTF8"] = "1"
                 env["PYTHONIOENCODING"] = "utf-8:backslashreplace"
@@ -418,7 +630,13 @@ def resume_run(run_id: str):
             with log_path.open("wb") as output:
                 env = os.environ.copy()
                 env["REAPER_MODEL"] = entry["model"]
+                env["REAPER_MODEL_OPTIONS"] = json.dumps(entry.get("model_options") or {
+                    "temperature": 0.0, "top_p": 0.9, "top_k": 40, "num_ctx": 16_384
+                }, separators=(",", ":"))
+                env["REAPER_PROJECT_SYSTEM_PROMPT"] = entry.get("project_system_prompt") or ""
                 env["REAPER_API_RUN_ID"] = run_id
+                if entry.get("project_id"):
+                    env["REAPER_PROJECT_ID"] = entry["project_id"]
                 env["REAPER_RESUME"] = "1"
                 env["PYTHONUNBUFFERED"] = "1"
                 env["PYTHONUTF8"] = "1"

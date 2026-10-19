@@ -2,7 +2,7 @@
 
 **Local, single-user AI coding agent.** REAPER-AI turns engineering requests into observable work: it iteratively inspects files, makes changes, runs checks, and reports the evidence actually produced. A model assertion is never treated as proof of success.
 
-> **Version 0.4.0:** M5/P01–P03 local history, explicit recovery, and scoped durable memory, plus the completed M6/P01–P06 iterative tool-agent work. The optional external Basic Memory integration is deferred.
+> **Version 0.4.0:** M5/P01–P03 local history, explicit recovery, scoped durable memory, the Variante-B multi-project core, repository index, hybrid per-run working memory, and index-guided Sentinel navigation are implemented, alongside the completed M6/P01–P06 iterative tool-agent work.
 
 ## Requirements and installation
 
@@ -43,18 +43,28 @@ M5/P01 uses Python's built-in SQLite support; no server, ORM, or background serv
 
 The database stores conversations, user and factual terminal-result messages, run metadata/statuses/results, and bounded structured engine events with corresponding stage-result entries. The browser's conversation selector restores saved conversations and terminal results after an API restart. `GET /conversations`, `GET /conversations/{id}`, and `GET /runs/{run_id}` expose the same records for local tools.
 
+## Projects
+
+One SQLite database can now hold multiple local projects. A project has a stable ID, name, absolute workspace, optional description and supplemental Sentinel instructions, plus an Ollama model snapshot (`temperature`, `top_p`, `top_k`, and `num_ctx`). Projects may intentionally share a workspace while keeping their conversations, runs, and durable knowledge separate. New project runs always use the project workspace and persist their model/prompt configuration with the run, including recovery.
+
+`GET/POST /projects`, `GET/PATCH/DELETE /projects/{project_id}`, `GET /projects/{project_id}/conversations`, and `GET/POST /projects/{project_id}/memory` provide the local API. Projects with historical chats, runs, or knowledge cannot be deleted; no records are silently cascaded away. Existing workspace-bound history is migrated once to generated legacy projects where unambiguous; ambiguous conversations remain accessible as legacy history. The browser sidebar selects, creates, edits, and deletes eligible projects, filters chats and project knowledge, and retains legacy chats as a separate selection.
+
+Each project also has an on-demand SQLite repository index. It stores file metadata (relative path, hash, language, size, line count, modification time), Python AST symbols, imports, and optional Git branch/HEAD—not source copies. Scans skip typical metadata, dependency, cache, and generated directories; an unchanged hash avoids a repeat Python parse, while added, changed, or removed files update the project-local index. `POST/GET /projects/{project_id}/index`, `GET /projects/{project_id}/index/files`, `.../symbols`, and `.../imports` refresh and query it. The run API refreshes a project's index before it starts and after its supervisor ends. The project sidebar shows index status, allows a manual refresh, and performs simple file/symbol searches. Sentinel receives a compact repository map once per run and can query files, symbols, per-file symbols, imports, and index status before requesting targeted source ranges.
+
+Each run also carries a compact, checkpointed working memory: current phase and subtask, model-proposed findings/decisions/questions, and tool-observed completed steps. Model notes are marked `proposed`; reads, writes, hashes, and checks remain `observed` engine facts. It is restored on recovery, stays separate from project durable memory, and does not contain another copy of source text.
+
 Raw supervisor logs remain temporary diagnostics and are not retained as a durable log archive. Stored events are capped at 32 KB each. A follow-up run in the selected conversation receives only a bounded set of prior user requests and recorded, observed run results; it never replays assistant/model prose and re-checks repository facts.
 
 ## Durable memory
 
-P03 extends the same SQLite file with small, scoped durable-memory records that survive conversations and API restarts. The implementation deliberately does **not** add Basic Memory, embeddings, or a vector database: this repository has no existing RAG stack and there is no measured need beyond workspace-scoped SQLite lookup.
+P03 extends the same SQLite file with small, scoped durable-memory records that survive conversations and API restarts. New project records are scoped by stable project ID; legacy records retain their previous workspace scope. The implementation deliberately does **not** add Basic Memory, embeddings, or a vector database.
 
 Only two kinds of knowledge are retained:
 
 - An explicit **user-confirmed decision** submitted through the browser's **Projektwissen / Merken** action or `POST /memory`.
 - One **observed result** for a completed run: a mechanical summary of its persisted verification level, changed files, and number of checks.
 
-Assistant/model prose, ordinary chat messages, checkpoint state, and unsuccessful or unconfirmed completion claims are never automatically saved as verified knowledge. Memory is fetched only as a run begins, for the selected workspace plus deliberately global user decisions, and is marked advisory: repository facts must still be checked. `GET /memory?workspace=...` lists the applicable stored records; `POST /memory` accepts an explicit `content` and optional `workspace`.
+Assistant/model prose, ordinary chat messages, checkpoint state, and unsuccessful or unconfirmed completion claims are never automatically saved as verified knowledge. Memory is fetched only as a run begins, scoped to the selected project (or workspace for legacy runs), and is marked advisory: repository facts must still be checked. `GET/POST /memory` retain legacy compatibility; project routes provide isolated project knowledge.
 
 ## Checkpoint recovery
 

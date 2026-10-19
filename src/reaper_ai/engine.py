@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from contextvars import ContextVar
@@ -66,6 +67,28 @@ def _model_context_budget() -> int:
     return max(8_000, min(configured, 96_000))
 
 
+def _ollama_options() -> dict[str, Any]:
+    """Read the per-run model snapshot while retaining legacy defaults."""
+    options: dict[str, Any] = {"temperature": 0.0, "top_p": 0.9, "top_k": 40, "num_ctx": 16_384}
+    try:
+        configured = json.loads(os.environ.get("REAPER_MODEL_OPTIONS", "{}"))
+    except json.JSONDecodeError:
+        configured = {}
+    if isinstance(configured, dict):
+        for key in options:
+            if key in configured:
+                options[key] = configured[key]
+    return options
+
+
+def _decision_system_prompt() -> str:
+    """Keep Sentinel's technical contract intact while adding project guidance."""
+    project_prompt = os.environ.get("REAPER_PROJECT_SYSTEM_PROMPT", "").strip()
+    if not project_prompt:
+        return _AGENT_DECISION_SYSTEM
+    return _AGENT_DECISION_SYSTEM + "\n\nProject-specific instructions (supplemental; the technical contract above remains binding):\n" + project_prompt
+
+
 class AgentRunState(TypedDict):
     """LangGraph state for the bounded, tool-driven agent path."""
 
@@ -93,7 +116,7 @@ def ask_json(system: str, user: str) -> dict[str, Any]:
                 {"role": "user", "content": user},
             ],
             "format": "json", "stream": False, "think": False,
-            "options": {"num_ctx": 16_384, "temperature": 0},
+            "options": _ollama_options(),
         })
         response.raise_for_status()
         payload = response.json()
@@ -117,12 +140,17 @@ _AGENT_DECISION_SYSTEM = """You are Sentinel, an autonomous local work agent. Re
 Return exactly one decision:
 {"kind":"action","reason":"short next-step rationale","action":{"tool":"supported tool","args":{}},
  "plan":[{"step":"short current or next purpose"}],"open_verifications":["required proof"],
- "verification_for":["proof established by this action"]}
+ "verification_for":["proof established by this action"],"phase":"explore|plan|implement|verify",
+ "current_task":"short concrete subgoal","findings":["proposed technical insight"],
+ "decisions":["technical choice"],"open_questions":["unresolved question"],
+ "completed_tasks":["completed planning step"]}
 or
 {"kind":"final","outcome":"completed or partial","reason":"short completion or blockage rationale","summary":"concise evidence-based result",
  "verification":"what observed tool results establish"}
 `plan`, `open_verifications`, and `verification_for` are optional. `action.tool` must be supported and `action.args`
-must be an object. Use `reason` only for a short decision rationale, not private reasoning.
+must be an object. The work-memory fields are optional and incremental: provide only additions or changes; never repeat
+the whole memory merely to restate it. `findings`, `decisions`, questions, and completed planning steps are model
+proposals, not proof of a file change or a passed check. Use `reason` only for a short decision rationale, not private reasoning.
 
 Work method for every decision:
 1. Determine the user goal, current subgoal, success criteria, constraints, and project conventions from task, plan,
@@ -133,20 +161,27 @@ Work method for every decision:
 3. Choose the action with the clearest contribution to the remaining work. For a development request, move from focused
    inspection to a concrete, minimal change, then to a proportionate verification; planning and reading are means, not
    an end. Keep the existing plan when it remains valid; update it only when evidence changes the work.
-4. Treat each tool result as the factual outcome. A technically successful call is not by itself task progress. After an
+4. Use the repository map for initial orientation. During `explore`, prefer index tools to broad scans: find files,
+   symbols, or imports, then use `read_file_range` for the exact source needed. During `plan`, identify the affected
+   functions and dependencies. During `implement`, make the concrete guarded change once sufficient evidence exists.
+   During `verify`, run proportionate checks. A return to exploration needs a concrete missing fact.
+5. Treat each tool result as the factual outcome. A technically successful call is not by itself task progress. After an
    error or an ineffective action, use its result to change strategy and correct the cause rather than repeat it without
    a new reason. Do not claim actions, tests, or facts without supporting tool results.
-5. Track explicit verification work in `open_verifications`. A write proves that a write succeeded, not that the new
+6. Track explicit verification work in `open_verifications`. A write proves that a write succeeded, not that the new
    behavior is correct: after a change, name the required independent check as an open point. When selecting the tool
    action that passes such a check, copy the exact matching open-point string into `verification_for`; that field closes
    it after the successful result. Do not overwrite a still-needed open point, and do not finalize while one remains.
-6. Return `kind: final` only with successful tool evidence. Use `outcome: "completed"` when observed results sufficiently
+7. Return `kind: final` only with successful tool evidence. Use `outcome: "completed"` when observed results sufficiently
    satisfy the user goal. Use `outcome: "partial"` when observed evidence establishes a concrete blocker or incomplete
    result; state the remaining work truthfully and do not describe it as success.
 
 Supported tools: list_files(path?, max_results?), search_text(query, path?, max_results?, case_sensitive?),
 read_file(path, max_chars?), read_file_range(path, start_line, end_line, max_chars?), git_status, git_diff,
-find_python, shell(command, timeout?), write_file(path, content, expected_hash?). Paths may be workspace-relative or
+find_python, shell(command, timeout?), write_file(path, content, expected_hash?), index_status,
+index_files(query?, language?, limit?), index_symbols(name, path?, limit?), index_file_symbols(path),
+index_imports(path?). Index tools are project-scoped metadata/navigation only; use `read_file_range` to retrieve source.
+Paths may be workspace-relative or
 absolute. Git is optional. Shell commands and writes use the started user's normal operating-system permissions.
 On Windows, `shell` executes Windows PowerShell (`powershell -Command`), not CMD, Bash, or PowerShell 7. Use
 PowerShell syntax such as `Test-Path`; do not use Bash/CMD operators such as `||` or `2>nul`.
@@ -165,6 +200,138 @@ def _string_list(value: Any) -> list[str] | None:
     if isinstance(value, list) and all(isinstance(item, str) for item in value):
         return value
     return None
+
+
+_WORK_PHASES = {"explore", "plan", "implement", "verify"}
+
+
+def _ensure_work_memory(agent: dict[str, Any]) -> None:
+    """Supply defaults for checkpoints written before the run-memory fields existed."""
+    if agent.get("phase") not in _WORK_PHASES:
+        agent["phase"] = "explore"
+    if not isinstance(agent.get("current_task"), str):
+        agent["current_task"] = ""
+    for key in ("findings", "decisions", "open_questions", "completed_tasks"):
+        if not isinstance(agent.get(key), list):
+            agent[key] = []
+    if not isinstance(agent.get("repository_map"), dict):
+        agent["repository_map"] = {}
+
+
+def _repository_map(agent: dict[str, Any], workspace: str, task: str) -> dict[str, Any]:
+    """Load one compact, persistent index overview; details remain tool-queryable."""
+    existing = agent.get("repository_map")
+    if isinstance(existing, dict) and existing.get("workspace") == workspace:
+        return existing
+    project_id = os.environ.get("REAPER_PROJECT_ID", "")
+    unavailable = {"available": False, "workspace": workspace}
+    if not project_id:
+        return unavailable
+    try:
+        store = Store()
+        project = store.get_project(project_id)
+        if project is None or Path(project["workspace"]).resolve() != Path(workspace).resolve():
+            return unavailable
+        status = store.index_status(project_id)
+        files = store.index_files(project_id)
+        terms = {term.casefold() for term in re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", task)
+                 if term.casefold() not in {"with", "from", "that", "this", "file", "files", "code", "change", "create"}}
+        ranked = sorted(files, key=lambda item: (
+            -sum(term in item["path"].casefold() for term in terms), item["path"]
+        ))
+        selected = ranked[:12]
+        symbols: list[dict[str, Any]] = []
+        for term in list(terms)[:6]:
+            symbols.extend(store.find_index_symbols(project_id, term, limit=4))
+        seen_symbols: set[tuple[str, str, int]] = set()
+        symbol_map = []
+        for symbol in symbols:
+            marker = (symbol["path"], symbol["qualname"], symbol["start_line"])
+            if marker not in seen_symbols:
+                symbol_map.append({key: symbol.get(key) for key in ("path", "name", "qualname", "kind", "start_line", "end_line")})
+                seen_symbols.add(marker)
+        imports = []
+        for item in selected[:6]:
+            imports.extend(store.index_imports(project_id, item["path"]))
+        return {
+            "available": True, "project_id": project_id, "workspace": workspace,
+            "status": {key: status.get(key) for key in ("scanned_at", "git_branch", "git_head", "file_count", "python_file_count", "symbol_count")},
+            "files": [{key: item.get(key) for key in ("path", "language", "line_count", "sha256")} for item in selected],
+            "symbols": symbol_map[:24],
+            "imports": [{key: item.get(key) for key in ("path", "module", "imported_name", "local_module", "line")} for item in imports[:24]],
+        }
+    except StorageError:
+        return unavailable
+
+
+def _memory_text_items(value: Any, *, field: str, source_hashes: set[tuple[str, str]]) -> list[dict[str, Any]]:
+    """Normalize model-supplied working notes without upgrading them to facts."""
+    raw_items = value if isinstance(value, list) else [value] if isinstance(value, str) else []
+    items: list[dict[str, Any]] = []
+    for raw in raw_items:
+        source: dict[str, Any] | None = None
+        if isinstance(raw, dict):
+            text = raw.get("summary", raw.get("text", raw.get(field, "")))
+            candidate = raw.get("source")
+            if isinstance(candidate, dict):
+                path, digest = candidate.get("path"), candidate.get("sha256")
+                if isinstance(path, str) and isinstance(digest, str) and (path, digest) in source_hashes:
+                    source = {key: candidate[key] for key in ("path", "sha256", "start_line", "end_line") if key in candidate}
+        else:
+            text = raw
+        if not isinstance(text, str) or not text.strip():
+            continue
+        item = {"status": "proposed", "summary": _short_text(text.strip(), 600)}
+        if source is not None:
+            item["source"] = source
+        items.append(item)
+    return items
+
+
+def _append_unique(items: list[dict[str, Any]], additions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep accumulated notes stable across decisions while avoiding exact repeats."""
+    seen = {(item.get("status"), item.get("summary"), str(item.get("source"))) for item in items if isinstance(item, dict)}
+    result = [item for item in items if isinstance(item, dict)]
+    for item in additions:
+        marker = (item.get("status"), item.get("summary"), str(item.get("source")))
+        if marker not in seen:
+            result.append(item)
+            seen.add(marker)
+    return result
+
+
+def _work_memory_snapshot(agent: dict[str, Any]) -> dict[str, Any]:
+    """Present compact state, with current work and decisions ahead of call history."""
+    _ensure_work_memory(agent)
+    return {
+        "current_task": _short_text(agent["current_task"], 600),
+        "phase": agent["phase"],
+        "decisions": agent["decisions"][-16:],
+        "findings": agent["findings"][-16:],
+        "open_questions": agent["open_questions"][-16:],
+        "completed_tasks": agent["completed_tasks"][-16:],
+    }
+
+
+def _update_work_memory_from_decision(agent: dict[str, Any], decision: dict[str, Any]) -> None:
+    """Apply only incremental model notes; factual state remains tool-derived."""
+    _ensure_work_memory(agent)
+    phase = decision.get("phase")
+    if phase in _WORK_PHASES:
+        agent["phase"] = phase
+    current_task = decision.get("current_task")
+    if isinstance(current_task, str) and current_task.strip():
+        agent["current_task"] = _short_text(current_task.strip(), 600)
+    source_hashes = {
+        (item.get("path"), item.get("sha256")) for item in agent.get("progress", {}).get("findings", [])
+        if isinstance(item, dict) and isinstance(item.get("path"), str) and isinstance(item.get("sha256"), str)
+    }
+    for key in ("findings", "decisions", "open_questions"):
+        agent[key] = _append_unique(agent[key], _memory_text_items(decision.get(key), field=key, source_hashes=source_hashes))
+    # Model-reported planning completion is retained as a proposal; only tool results create observed completion.
+    agent["completed_tasks"] = _append_unique(
+        agent["completed_tasks"], _memory_text_items(decision.get("completed_tasks"), field="completed_tasks", source_hashes=source_hashes)
+    )
 
 
 def _captured_end(finding: dict[str, Any]) -> int | None:
@@ -288,6 +455,7 @@ def _progress_snapshot(agent: dict[str, Any]) -> dict[str, Any]:
 
 def _record_progress(agent: dict[str, Any], observation: dict[str, Any]) -> None:
     """Persist checks plus read-source evidence without suppressing any action."""
+    _ensure_work_memory(agent)
     progress = dict(agent.get("progress") or {})
     action = observation.get("action") if isinstance(observation.get("action"), dict) else {}
     result = observation.get("result") if isinstance(observation.get("result"), dict) else {}
@@ -313,11 +481,36 @@ def _record_progress(agent: dict[str, Any], observation: dict[str, Any]) -> None
             else:
                 findings.append(finding)
             progress["findings"] = findings
+            agent["findings"] = _append_unique(agent["findings"], [{
+                "status": "observed",
+                "summary": f"Read {finding['path']} lines {finding.get('start_line')}–{finding.get('end_line')}",
+                "source": {key: finding.get(key) for key in ("path", "sha256", "start_line", "end_line")},
+            }])
     changes = result.get("changes")
     if isinstance(changes, list):
         paths = [item.get("path") for item in changes if isinstance(item, dict) and isinstance(item.get("path"), str)]
         if paths:
             progress["last_change"] = {"step": observation.get("step"), "tool": action.get("tool"), "paths": paths}
+            # A write refreshes the persistent index in the dispatcher. Rebuild the compact map only for the next
+            # decision so it cannot advertise the old file hash.
+            agent["repository_map"] = {}
+            for change in changes:
+                if not isinstance(change, dict) or not isinstance(change.get("path"), str):
+                    continue
+                path, after_hash = change["path"], change.get("after_hash")
+                # Old source-linked notes are not facts about a changed file.
+                progress["findings"] = [item for item in progress.get("findings", []) if not (
+                    isinstance(item, dict) and item.get("path") == path and item.get("sha256") != after_hash
+                )]
+                agent["findings"] = [item for item in agent["findings"] if not (
+                    isinstance(item, dict) and item.get("status") == "observed" and
+                    isinstance(item.get("source"), dict) and item["source"].get("path") == path and
+                    item["source"].get("sha256") != after_hash
+                )]
+                agent["findings"] = _append_unique(agent["findings"], [{
+                    "status": "observed", "summary": f"Wrote {path}",
+                    "source": {"path": path, "sha256": after_hash} if isinstance(after_hash, str) else {},
+                }])
     if not ok:
         progress["errors"] = [*progress.get("errors", []), {"step": observation.get("step"),
                               "tool": action.get("tool"), "error": _short_text(result.get("error", "Tool failed"))}][-12:]
@@ -325,6 +518,14 @@ def _record_progress(agent: dict[str, Any], observation: dict[str, Any]) -> None
         resolved = _string_list(action.get("verification_for"))
         if resolved:
             progress["open_verifications"] = [item for item in progress.get("open_verifications", []) if item not in resolved]
+    if ok:
+        summary = f"{action.get('tool')} succeeded"
+        if agent.get("current_task"):
+            summary = agent["current_task"]
+        agent["completed_tasks"] = _append_unique(agent["completed_tasks"], [{
+            "status": "observed", "summary": _short_text(summary, 600), "step": observation.get("step"),
+            "tool": action.get("tool"),
+        }])
     agent["progress"] = progress
 
 
@@ -343,14 +544,16 @@ def _decision_error(agent: dict[str, Any], error: str) -> dict[str, Any]:
 
 
 def _agent_prompt(state: AgentRunState) -> str:
-    """Prioritize retained source findings over disposable tool-call history."""
+    """Prioritize durable run work notes, then factual progress and source excerpts."""
     agent = state["agent"]
-    budget = _model_context_budget() - len(_AGENT_DECISION_SYSTEM.encode("utf-8")) - _MODEL_PROTOCOL_OVERHEAD_BYTES
+    budget = _model_context_budget() - len(_decision_system_prompt().encode("utf-8")) - _MODEL_PROTOCOL_OVERHEAD_BYTES
     progress = _progress_snapshot(agent)
     source_coverage = progress.pop("source_coverage", [])
-    prompt = {"task": state["task"], "workspace": state["workspace"],
+    prompt = {"task": state["task"], "current_task": agent.get("current_task", ""), "phase": agent.get("phase", "explore"),
+              "workspace": state["workspace"],
               "path_rule": "Paths may be workspace-relative or absolute.",
               "shell_environment": "Windows PowerShell (powershell -Command); use PowerShell syntax, never Bash/CMD `||` or `2>nul`.",
+              "working_memory": _work_memory_snapshot(agent), "repository_map": agent.get("repository_map", {}),
               "plan": agent["plan"], "current_step": agent["current_step"],
               "progress": progress, "verification": agent["verification"],
               "source_coverage": source_coverage, "visible_source_coverage": [], "code_findings": [], "previous_observations": []}
@@ -448,7 +651,7 @@ def _agent_prompt(state: AgentRunState) -> str:
     return json.dumps(prompt, ensure_ascii=False)
 
 
-def _agent_action(decision: dict[str, Any], workspace: str) -> dict[str, Any] | None:
+def _agent_action(decision: dict[str, Any], workspace: str, project_id: str | None = None) -> dict[str, Any] | None:
     action = decision.get("action")
     if not isinstance(action, dict) or not isinstance(action.get("tool"), str):
         return None
@@ -467,6 +670,8 @@ def _agent_action(decision: dict[str, Any], workspace: str) -> dict[str, Any] | 
                 start_line < 1 or end_line < start_line):
             raise ValueError("read_file_range requires positive integer start_line/end_line with end_line >= start_line")
     context: dict[str, str] = {"workspace": workspace}
+    if project_id:
+        context["project_id"] = project_id
     requested_context = action.get("context")
     if isinstance(requested_context, dict) and isinstance(requested_context.get("cwd"), str):
         context["cwd"] = requested_context["cwd"]
@@ -479,7 +684,10 @@ def _agent_action(decision: dict[str, Any], workspace: str) -> dict[str, Any] | 
 
 def agent_prepare(state: AgentRunState) -> dict[str, Any]:
     _emit_event("phase_changed", phase="agent_prepare")
-    return {"status": "agent_prepared", "error": "", "last_result": None}
+    agent = dict(state["agent"])
+    _ensure_work_memory(agent)
+    agent["repository_map"] = _repository_map(agent, state["workspace"], state["task"])
+    return {"agent": agent, "status": "agent_prepared", "error": "", "last_result": None}
 
 
 def agent_decide(state: AgentRunState) -> dict[str, Any]:
@@ -487,15 +695,20 @@ def agent_decide(state: AgentRunState) -> dict[str, Any]:
     agent = dict(state["agent"])
     agent["progress"] = dict(agent.get("progress") or {})
     agent["verification"] = dict(agent.get("verification") or {})
+    _ensure_work_memory(agent)
+    if not agent["repository_map"]:
+        agent["repository_map"] = _repository_map(agent, state["workspace"], state["task"])
     try:
-        decision = ask_json(_AGENT_DECISION_SYSTEM, _agent_prompt(state))
+        decision = ask_json(_decision_system_prompt(), _agent_prompt(state))
     except (RunBudgetExceeded, httpx.TimeoutException):
         raise
     except Exception as exc:
         return _decision_error(agent, f"Agent decision failed: {exc}")
     plan = decision.get("plan")
     if isinstance(plan, list) and plan and all(isinstance(item, dict) for item in plan):
-        agent["plan"] = plan
+        existing_steps = {str(item.get("step")) for item in agent["plan"] if isinstance(item, dict)}
+        agent["plan"] = [*agent["plan"], *[item for item in plan if str(item.get("step")) not in existing_steps]]
+    _update_work_memory_from_decision(agent, decision)
     reason = _short_text(decision.get("reason", ""))
     agent["progress"]["last_reason"] = reason
     kind = decision.get("kind")
@@ -523,7 +736,8 @@ def agent_decide(state: AgentRunState) -> dict[str, Any]:
     if open_points is not None:
         agent["progress"]["open_verifications"] = open_points
     try:
-        action = _agent_action(decision, state["workspace"])
+        repository_map = agent.get("repository_map") if isinstance(agent.get("repository_map"), dict) else {}
+        action = _agent_action(decision, state["workspace"], repository_map.get("project_id"))
     except ValueError as exc:
         return _decision_error(agent, str(exc))
     if action is None:
