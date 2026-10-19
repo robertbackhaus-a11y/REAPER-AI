@@ -19,8 +19,8 @@ REAPER-AI runs locally and does not commit or push changes automatically.
 
 # REAPER-AI — Architecture
 
-**Version:** 0.5.0
-**Status:** M0–M4, M5/P01–P03, M6/P01–P06, P0 targeted edits, and P1 working-memory consolidation are implemented. One checkpoint-recovered end-to-end Sentinel coding acceptance is recorded; broader task reliability remains an explicit limitation. v0.6.0 is planned as a UI-only modernization on this unchanged stack.
+**Version:** 0.6.0
+**Status:** M0–M4, M5/P01–P03, M6/P01–P06, P0 targeted edits, and P1 working-memory consolidation are implemented. One checkpoint-recovered end-to-end Sentinel coding acceptance is recorded; broader task reliability remains an explicit limitation. v0.6.0 delivers the UI-only modernization on this unchanged stack.
 **Scope:** Local, single-user autonomous coding agent  
 **Language:** English for repository documentation; user interaction follows the user's language.
 
@@ -278,7 +278,9 @@ Schema changes are additive and tracked by a small SQLite schema marker. On the 
 
 The same database also keeps a project-local repository index. `project_index_files` stores only path, SHA-256, language, size, line count, and modification time; `project_index_symbols` and `project_index_imports` record Python `ast` output and simple local-module links. Source text remains in the workspace and `read_file_range` remains the only source-retrieval path. Typical metadata, virtual environments, dependency trees, caches, and generated-output directories are excluded from ordinary indexing. The index uses content hashes to avoid reparsing unchanged files, removes vanished paths, records Git branch/HEAD when available, and is refreshed on project-run start/end and API index queries. Two projects sharing one workspace retain separate index rows keyed by `project_id`.
 
-The index adds neither a second state store nor new LangGraph nodes. The existing vanilla-JavaScript browser sidebar selects or creates a project, edits its stored configuration, filters its chats and project memory, and exposes index status, refresh, and simple file/symbol search. Legacy/unassigned chats remain accessible through a separate selector state. Project-specific prompt text supplements the fixed Sentinel technical contract; it cannot replace tool definitions or execution rules.
+The index adds neither a second state store nor new LangGraph nodes. The existing vanilla-JavaScript browser UI lists and selects projects in its left sidebar, presents project conversations as non-destructive top tabs, and groups project creation/editing, project memory, and index status/refresh/search in a top-right settings control. Legacy/unassigned chats remain accessible through their own project selection. Project-specific prompt text supplements the fixed Sentinel technical contract; it cannot replace tool definitions or execution rules.
+
+The same browser surface uses a local transparent Wolf/Kanji brand asset and a compact dark blue/cyan presentation layer. It is purely a static UI asset plus CSS: it does not change FastAPI routing, SQLite records, SSE event contents, or LangGraph state. The right activity panel continues to render only persisted/live event timeline entries, decision traces, and the available Ollama-thinking or runtime-log data.
 
 ### Variante B / hybrid run working memory (step 3)
 
