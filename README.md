@@ -4,6 +4,8 @@
 
 > **Version 0.5.0:** M5/P01–P03 local history, explicit recovery, scoped durable memory, the Variante-B multi-project core, repository index, hybrid per-run working memory, and index-guided Sentinel navigation are implemented, alongside the completed M6/P01–P06 iterative tool-agent work. P0 adds hash-bound targeted edits; P1 consolidates run working memory.
 
+The next planned release, v0.6.0, is limited to a GUI modernization on the existing local stack. The current interface remains the functional v0.5.0 implementation.
+
 ## Requirements and installation
 
 Windows 11, Python 3.12+, and Ollama with at least one installed model are required. Git is optional.
@@ -21,7 +23,7 @@ Open <http://127.0.0.1:8000/>. For development, install with `pip install -e .` 
 
 ## Ollama configuration
 
-REAPER-AI uses the local Ollama API at `http://127.0.0.1:11434`. Start Ollama before opening the application and install a model with `ollama pull <model>`. The browser lists installed models and starts each run with the selected model. Direct engine runs use `REAPER_MODEL` when set, otherwise the built-in default `qwen3.6:35b`. Sentinel requests JSON decisions with Ollama thinking disabled (`think: false`), because the tested Qwen setup returned more reliable structured decisions that way.
+REAPER-AI uses the local Ollama API at `http://127.0.0.1:11434`. Start Ollama before opening the application and install a model with `ollama pull <model>`. The browser lists installed models and starts each run with the selected model. Direct engine runs use `REAPER_MODEL` when set, otherwise the built-in default `qwen3.6:35b`. Sentinel requests JSON decisions with `think: false`, `format: "json"`, `stream: false`, `temperature: 0.0`, `top_p: 0.9`, `top_k: 40`, and `num_ctx: 16384`; the tested Qwen setup returned more reliable structured decisions that way.
 
 Choose any existing absolute project directory, an installed Ollama model, and a bounded timeout in the browser. Git is an optional inspection tool, not a run precondition. The workspace supplies initial project context; tool paths may also be absolute and are subject to the started user's operating-system permissions. REAPER-AI never elevates permissions. It does not automatically commit, push, tag, publish, or release.
 

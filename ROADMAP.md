@@ -1,436 +1,189 @@
 # REAPER-AI — Development Roadmap
 
-**Version target:** 0.5.0
-**Status:** M0–M4, M5/P01–P03, M6/P01–P06, P0 targeted edits, and P1 working-memory consolidation implemented with documented limitations.
-**Architecture baseline:** [ARCHITECTURE.md](ARCHITECTURE.md) (approved)  
-**Target:** Windows 11, local single-user autonomous coding agent  
-**Technology decisions:** Python, embedded LangGraph, Ollama, FastAPI, SSE, custom HTML/CSS/vanilla JavaScript UI  
-**Language:** English for repository artifacts; user interaction in the user's preferred language.
+**Current release:** v0.5.0
+**Next planned release:** v0.6.0 — GUI Modernization
+**Scope:** local, single-user autonomous coding agent
 
-## 1. Goal and delivery policy
+## 1. Project goal and architecture principles
 
-Build an agent that reliably **inspects, implements, verifies, corrects, and reports** software-engineering work. Observable repository state and executed checks take precedence over model claims. A chat interface exposes a bounded execution engine; it does not itself orchestrate coding work.
+REAPER-AI turns an engineering request into observable local work: Sentinel inspects relevant repository facts, makes focused changes, runs checks, and reports the evidence actually produced. A model assertion is never proof by itself.
 
-This is a new implementation. The former REAPER-AI runner, Main/Worker architecture, JSONL session design, prompts, and earlier A01–A06 backlog are **not** migration requirements. Reuse old code only if independently justified.
+- Keep one local stack: FastAPI, LangGraph, Ollama, SQLite, HTML/CSS/vanilla JavaScript, and SSE.
+- Prefer existing components over a second agent, state store, service, frontend, or persistence layer.
+- Keep Git optional and never commit, push, tag, release, or elevate permissions automatically.
+- Preserve explicit checkpoint recovery, file-hash conflict detection, process timeouts, and observable tool results.
+- Document only implemented behaviour and observed acceptance evidence.
 
-### Non-negotiable rules
+## 2. Current state — v0.5.0
 
-- Local, **single-user** system. No enterprise services, accounts, multi-tenancy, containers, hosted dependencies, or second orchestration framework.
-- LangGraph is a normal Python dependency; **do not replicate its orchestration infrastructure**.
-- Ollama provides local model inference. The user chooses installed models.
-- Keep application source, local application data, and target project repositories separate.
-- **Never** automatically commit, push, tag, publish, deploy, or perform destructive repository actions.
-- Protect existing dirty files and untracked files. A model-generated statement is never an execution result.
-- Prefer small modules and focused changes. No test-count targets, unnecessary abstractions, or full regression after every package.
-- Every work package closes with working code, a focused verification, and relevant documentation updated. No automatic Git operations.
-- Implement in the sequence below. Avoid building later-phase infrastructure in advance.
+| Area | State |
+| --- | --- |
+| M0 — Foundation | Implemented |
+| M1 — Engine | Implemented |
+| M2 — Reliability | Implemented with documented limitations |
+| M3 — FastAPI | Accepted |
+| M4 — Web UI | Functional; redesign planned for v0.6.0 |
+| M5 — Persistence | Implemented |
+| M6 — Autonomous Agent | First autonomous end-to-end coding acceptance passed |
+| Variante B — Multi-project | Steps 1–5 implemented |
 
-## 2. Milestones at a glance
+v0.5.0 includes the project-scoped repository index, hybrid checkpointed working memory, durable project memory, explicit checkpoint recovery, index-guided Sentinel navigation, P0 hash-bound `apply_patch`, and P1 working-memory consolidation.
 
-| Milestone | Outcome | Main deliverable |
-|---|---|---|
-| M0 — Foundation | Implemented working baseline; original individual acceptance items not all audited | Installable minimal project skeleton |
-| M1 — Engine proof | Implemented; coding E2E evidence recorded | CLI-only inspect → edit → verify flow |
-| M2 — Reliability | Qualified acceptance; verified coding function and synthetic process-tree timeout; limitations below | Evidence, repair, safety, process containment |
-| M3 — Local application | **Accepted (A01–A03); qualifications below** | FastAPI, projects, models, structured events |
-| M4 — User interface | Usable lightweight local application | Vanilla JS chat and run-progress UI |
-| M5 — Persistence | Usable conversations and run history | Local store, result retrieval, safe recovery |
-| M6 — Agent transition and release candidate | Iterative tool agent, then verified end-to-end REAPER-AI | Autonomous local dispatcher, documentation, installation, real-world acceptance |
+## 3. Completed milestones M0–M6
 
-The initial deliverable is **one dependable agent**. Multi-agent delegation and long-term memory are **not prerequisites**.
+| Milestone | Completed scope |
+| --- | --- |
+| M0 — Foundation | Python package, local workspace conventions, development baseline |
+| M1 — Engine | LangGraph-based execution and Ollama-backed structured decisions |
+| M2 — Reliability | File/Git/process adapters, explicit errors, bounded execution, source and write conflict evidence |
+| M3 — FastAPI | Local API, run control, SSE events, supervisor integration, persisted run access |
+| M4 — Web UI | Functional browser UI with projects, conversations, run status, events, recovery, and diagnostics |
+| M5 — Persistence | SQLite conversations, messages, runs, events, stage results, checkpoints/recovery, and scoped durable memory |
+| M6 — Autonomous Agent | Iterative `Prepare → Decide → Execute → Observe → Finalize` graph, dispatcher, decision traces, evidence-based completion, and recovery |
 
-## 3. Work packages
+### Variante B — multi-project implementation
 
-### M0 — Foundation
+| Step | Completed scope |
+| --- | --- |
+| 1 — Project core | Stable project IDs, project workspaces, per-project model settings, project-scoped chats/runs/memory |
+| 2 — Repository index | Incremental project-scoped file metadata, Python AST symbols/imports, Git branch/HEAD metadata, index queries |
+| 3 — Hybrid run working memory | Checkpointed current task/phase, confirmed facts, proposed decisions, information gaps, source and verification evidence |
+| 4 — Sentinel integration | Repository map and index tools guide targeted source access without loading the whole repository |
+| 5 — Multi-project UI | Project management, project-scoped conversations/memory, index status/search, and existing live-run UI integration |
 
-**F01 — Project skeleton and development environment**
+Historic BUG-003 through BUG-019 work is consolidated in these completed capabilities: unrestricted project inspection, source-capture metadata, context-visible coverage, structured decision traces, robust UTF-8 event handling, source-aware working memory, targeted edits, and evidence-based final status. Detailed incident logs remain in Git history and persisted run records rather than being repeated here.
 
-- Create Python package layout, `pyproject.toml`, dependency locking, basic CLI entry point and configuration loader.
-- Add LangGraph and the chosen Ollama client as explicit dependencies; never vendor LangGraph.
-- Keep configuration for model, Ollama URL, project root, limits and data directory minimal.
-- Keep `ARCHITECTURE.md` as design authority. No speculative endpoints or frontend framework.
+## 4. Demonstrated Sentinel capabilities and remaining acceptance
 
-**Done when:** clean environment installs, package imports, CLI starts, and a local Ollama health/model-list check works or fails clearly.
+### Successful autonomous coding acceptance
 
-**F02 — Resolve engine-critical design choices**
+Run `f852b6ce174e` is the current end-to-end acceptance record:
 
-- Validate **direct Ollama API vs. adapter** with actual model tool-call responses; choose one.
-- Select graph execution isolation: local child process or in-process **with proven full-tree cancellation**. Prefer the simplest mechanism that satisfies Windows behavior.
-- Define exact file-edit preconditions, workspace constraints, and evidence formats.
-- Define minimal task-aware verification gates (`coding`, `analysis`, `investigation`, `other`).
-- Record the decisions in `ARCHITECTURE.md` before locking implementation details.
+- resumed the same valid checkpoint and reached `completed` with exit code `0`;
+- used hash-protected `apply_patch` to change `src/reaper_ai/persistence.py` and `src/reaper_ai/api.py`;
+- detected and corrected its own failed verification script;
+- used the REAPER Venv FastAPI `TestClient` for functional verification;
+- received HTTP 200 with real project repository-index data from `GET /projects/{project_id}/index/top-python-files`.
 
-**Done when:** a short decision record documents each choice and the failure modes it addresses; none are left to ad hoc model prompts.
+This demonstrates one complete autonomous coding workflow. It is not a claim that every coding task, repository, model response, or external command is reliably handled.
 
-### M1 — LangGraph execution prototype (CLI only)
+### D01 — autonomous-agent acceptance (partially complete)
 
-**E01 — Typed execution state and graph**
+Existing focused tests already cover tool dispatch, failed-check correction, checkpoint recovery, persistence, project isolation, UTF-8 events, process timeout reporting, and explicit recovery availability. The following are targeted remaining acceptance cases, not unproven defects:
 
-- Implement a compact state: immutable objective/project root, task kind, findings, plan, phase, budgets, attempts, tool evidence, result.
-- Nodes: prepare, inspect/plan, execute, verify, conditional repair, finalize.
-- Route read-only tasks around editing; permit justified no-op and evidence-based early failure.
-- The graph—not the model—owns progress counters, transitions and terminal status.
+- read-only analysis that completes without modifying code;
+- behaviour with a repository already modified before a run starts;
+- rejection of unsupported or insufficient success claims;
+- unproductive-loop detection and controlled terminal behaviour;
+- cancellation of a process tree including child processes;
+- browser representation of actual engine events, cancellation, recovery, and terminal status.
 
-**Done when:** CLI demonstrations show deterministic routing for a simple coding request and a read-only analysis request, without a free-running generic tool loop.
+### D02 — published baseline
 
-**E02 — Focused repository and Git tools**
+v0.5.0 is the published baseline: package metadata, documentation, GitHub release, and the successful `f852b6ce174e` acceptance record are aligned. Follow-up work must preserve this evidence and add only targeted acceptance for an observed gap.
 
-- Implement bounded `list_files`, `search_code`, `read_file`, `git_status`, `git_diff`.
-- Bind every invocation to an explicit absolute project root; return structured data with source location and truncation flags.
-- Capture a baseline including existing tracked changes and untracked paths.
+## 5. Technical decisions
 
-**Done when:** the engine can inspect a repository without broad recursive dumps and can distinguish pre-existing changes from work performed during a run.
+### Agent, state, and source evidence
 
-**E03 — Safe editing and command tools**
+LangGraph remains the embedded iterative graph. The dispatcher deterministically executes model-selected tools; SQLite persists conversations, runs, events, checkpoints, index data, and durable memory. The run state keeps confirmed facts, model-proposed decisions, information gaps, sources, changes, and verification as distinct evidence kinds.
 
-- Provide a focused `apply_edit` with file/version preconditions and an explicit error on conflicts.
-- Provide bounded `run_command` (PowerShell/child process), working directory, timeout, exit code, capped output, cancellation support.
-- Prevent implicit edits outside the authorized workspace; disallow automatic Git publication and destructive actions.
+Historical source coverage records what was captured from a file. Visible source coverage records only excerpts that were actually sent in the current model prompt. The distinction prevents a context-truncated excerpt from being represented as a complete read. Source-linked facts are invalidated after a changed hash.
 
-**Done when:** a CLI-run coding task creates a real, attributable change without overwriting pre-existing user work; failures are returned as data, not hidden in logs.
+### Editing and verification
 
-**E04 — First real coding task**
+`write_file` remains available for new files or full replacement. `apply_patch(path, expected_text, replacement, expected_hash)` is the focused existing-file edit path: it requires a matching hash and exactly one original-text occurrence, and returns before/after hashes. Tool results, not model prose, provide change and verification evidence.
 
-- Wire the selected Ollama model into graph planning and execution.
-- Produce a small, scoped implementation followed by actual verification and a structured result.
-- Use a disposable sample repository, not REAPER-AI itself, for initial destructive/edge-case trials.
+### Ollama structured-decision configuration
 
-**Gate M1:** a real local model completes a representative change; another request performs analysis with no edit. The output contains observable evidence, not merely a success summary. **Do not proceed to API/UI until this gate passes.**
+The active Sentinel decision request uses:
 
-### M2 — Execution reliability
+```python
+"think": False,
+"format": "json",
+"stream": False,
+"temperature": 0.0,
+"top_p": 0.9,
+"top_k": 40,
+"num_ctx": 16384,
+```
 
-**R01 — Progress control and context efficiency**
+The Qwen A/B measurement for the same reconstructed decision situation observed 54.14 seconds with thinking enabled and 4.99 seconds with thinking disabled. With `think: true`, several production decisions produced long separate reasoning while `message.content` was empty; `think: false` returned valid JSON and allowed the acceptance run to finish. This setting applies to Sentinel's structured decision path only, not to reasoning use in unrelated LLM applications.
 
-- Bound model calls, tool calls, wall time, inspection without progress, output volume and repair attempts.
-- Keep concise source-linked findings in graph state, separate from disposable LLM history.
-- Report token usage per call and per run; avoid repeatedly retransmitting long tool output.
-- On insufficient progress, request a concrete next step or terminate with a truthful reason.
+## 6. Release history
 
-**Done when:** a deliberately nonproductive inspection task terminates within budget and preserves diagnostic evidence; no 40-step blind loop is required.
+| Release | Status | Notes |
+| --- | --- | --- |
+| v0.4.0 | Historical pre-release | Earlier M5/M6 and Variante-B baseline; tag retained |
+| v0.5.0 | Current published milestone | P0/P1, `think: false`, repository-index endpoint, copyright notices, and checkpoint-recovered autonomous coding acceptance |
 
-**R02 — Verification and result contract**
+Historical tags remain immutable from this roadmap forward. Repository publication status and an installed local application are separate states.
 
-- Implement `RunResult`: `completed | partial | failed | cancelled | timed_out`, changed files, diff summary, executed checks, evidence references, unresolved issues and usage.
-- Verification decisions use observed file/Git state and actual check exit codes; model assessment is explicitly distinct.
-- Support justified no-change outcomes and failures without pretending that syntax checks prove functional correctness.
+## 7. v0.6.0 — GUI Modernization
 
-**Done when:** a model's false `success` claim cannot mark a no-op coding request completed; a genuine successful read-only task can complete.
+**Goal:** provide a compact, technically oriented Sentinel development interface without changing the backend stack.
 
-**R03 — Bounded repair flow**
+The existing FastAPI, HTML, CSS, vanilla JavaScript, SSE, and SQLite stack remains in place. No React/Vue migration, npm frontend, second web server, or separate state layer is planned.
 
-- Feed concrete check failures into a limited execute → verify retry.
-- Preserve the original objective and avoid unrelated refactoring.
-- Return `partial`/`failed` when budget expires or remaining risks are unresolved.
+### G01 — project navigation and chat tabs
 
-**Done when:** one test failure can trigger a focused correction, and repeated failure terminates predictably.
+- The left sidebar lists only existing projects and clearly marks the active project.
+- Chats of the selected project appear as tabs in a top tab bar; `+` creates a new chat.
+- Tabs can switch and close without deleting persisted conversations.
+- Project changes show project-scoped tabs. Existing SQLite conversations remain the source of truth.
+- Runs continue through tab or project changes.
 
-**R04 — Process control and interruption**
+### G02 — live agent activity
 
-- Make cancellation terminate the execution process and its spawned commands on Windows.
-- Handle hung tools, unavailable Ollama, invalid tool calls, context exhaustion and unexpected child exits.
-- Preserve evidence from interrupted runs; never replay potentially non-idempotent commands automatically.
+- The right panel becomes a compact dark developer dashboard.
+- Show real Sentinel phase, explore/plan/implement/verify state, active/completed tools, durations, file changes, errors, correction attempts, verification evidence, and terminal status.
+- Reuse existing SSE and persisted engine events; do not invent activity or progress percentages.
+- With `think: false`, do not reserve permanent empty thinking output.
 
-**Gate M2:** real and synthetic targeted trials cover successful edit, false success, failure/repair, read-only run, pre-existing dirty changes, timeout and cancellation.
+### G03 — settings entry point
 
-<!-- M2 IMPLEMENTATION STATUS (2026-10-18) -->
-#### Implementation checkpoint — 2026-10-18
+- A top-right settings control consolidates existing project creation/editing/removal, workspace, description, project prompt, model selection, existing model parameters, index status/refresh/search, and actual general settings.
+- Reuse current API routes and SQLite records. Offer only settings that work.
 
-- **M0 working baseline:** Python virtual environment/package, embedded LangGraph import and local Ollama connection established. Do not imply every original F01/F02 completion criterion was separately checked.
-- **M1 working baseline:** CLI engine can inspect/select, propose/apply changes in a disposable Git repository and report syntax/Git evidence. The first two-file exercise updated `calculator.py` and created `service.py`.
-- **M2 implemented:** R01 call/time budgets and usage, R02 structured outcomes/check evidence, R03 bounded repair logic, R04 Windows Job Object supervisor with timeout backstop. This is an implementation inventory, not proof that every branch works.
-- **Verified:** `multiply(6, 7) == 42` and `multiply_numbers(6, 7) == 42` with live Python imports (`FUNCTIONAL: OK`). R04 synthetic three-second timeout terminated parent and child (`R04: PASS`, exit 2). Dirty working-tree protection yielded an explicit failure instead of overwriting modified files.
-- **Historical cleanup:** the retired static pipeline and its Git before/after provenance wrapper were removed in favor of persisted API run identity, events, and per-write hash evidence from the iterative agent.
-- **Not fully covered:** False-success rejection, all repair/failure variants, real user cancellation, interruption diagnostics, resumed runs and complete original M2 gate scenario matrix. They remain acceptance concerns for M3/M6 where relevant. **Do not rerun the successful coding exercise just to increase test counts.**
-- **Next:** M3 A01 — a minimal local FastAPI layer around the already implemented engine/supervisor. Add project and model discovery/events in A02/A03; no frontend framework, auto-commit or new orchestration stack.
+### G04 — chat and results
 
-### M3 — Local API and project binding
+- Improve reading space and distinguish user messages, Sentinel answers, tool results, changes, diffs, errors, and observed verification.
+- Retain copy controls, cancellation, and recovery.
+- Keep diffs and technical details collapsible instead of permanently crowding the chat.
 
-**A01 — FastAPI application and run management**
+### G05 — visual usability
 
-- Serve one local API and the future static UI; start, inspect, cancel and retrieve runs.
-- Keep graph execution isolated from HTTP request lifetime and provide reliable cancellation.
-- Use bounded concurrency suitable for one local user, initially one modifying run at a time.
+- Keep dark mode, compact developer-dashboard styling, consistent spacing/type/status symbols, and useful responsive layout.
+- Avoid design-system dependencies and decorative animation.
+- Retain a sensible collapsible activity panel where the existing layout supports it.
 
-**Done when:** an API request starts a real engine run and receives a stable run identifier and structured terminal result.
+### G06 — targeted GUI acceptance
 
-**A02 — Ollama models and projects**
+1. Select and switch projects.
+2. Create and edit a project from settings.
+3. Open, switch, and close multiple chat tabs without deleting conversations.
+4. Keep an active run alive while changing tabs/projects.
+5. Show actual SSE tool events, changes, verification, errors, cancel, and recovery state.
+6. Reload the browser and restore persisted conversations.
 
-- List **installed Ollama models dynamically**; no hardcoded model names.
-- Select and validate a project/repository root before running; expose the active workspace clearly.
-- Keep user choices and run settings explicit, with safe defaults and local configuration.
+### Definition of done
 
-**Done when:** a newly downloaded Ollama model appears without changing REAPER-AI code, and the selected project root controls every tool.
+- The new GUI structure works with the existing backend.
+- Project-scoped chat tabs and settings-based project management work.
+- Live activity presents actual events, changes, and verification evidence.
+- Cancellation and recovery remain usable.
+- README, architecture, and roadmap describe the implemented state.
+- The local installation is checked after implementation.
 
-**A03 — Structured run events and SSE**
+## 8. Open work after v0.6.0
 
-- Emit `run_started`, `phase_changed`, `model_activity`, `tool_started`, `tool_completed`, `files_changed`, `verification_completed`, `run_completed`.
-- Include run identifiers and bounded evidence references; do not require parsing stderr to determine status.
-- Preserve terminal delivery even if verbose logs are dropped or the browser reconnects.
+Do not invent feature milestones in advance. Continue with the remaining D01 acceptance cases and concrete limitations observed during v0.6.0 use. Prioritize evidence-backed fixes over new platform layers.
 
-**Gate M3:** the API can start/cancel work and report actual progress, results and errors independently of a browser.
+## 9. Deliberately deferred functionality
 
-<!-- M3 ACCEPTANCE CHECKPOINT (2026-10-18) -->
-#### M3 implementation and acceptance checkpoint — 2026-10-18
-
-- **A01 — Accepted for current scope:** FastAPI exposes health, run start/status/log and cancellation. A real local Ollama coding request completed through the API (`exit_code: 0`) and generated a genuine Git diff. The API cancellation endpoint returned `cancelling` followed by `cancelled`; Git status was unchanged.
-- **A02 — Accepted for current scope:** Installed models discovered dynamically (`qwen3.6:35b`, `qwen3.8-q5:latest`, `qwen3:8b`); workspace validation passed against a temporary Git repository; run-specific model choice reached the engine.
-- **A03 — Accepted for current scope:** SSE returned 13 structured events ending in `run_completed`, with phase/model/file/verification information. Final evidence was syntax/Git **structural** verification, not a functional runtime test.
-- **Resolve before M4:** Public API `run_id` and engine provenance `run_id` are different values. Normalize the externally exposed identifier/event payload without losing internal correlation.
-- **Deferred/limitations:** Run registry and logs are in memory (M5 persistence pending); exceptional process/cancel paths not comprehensively covered; API cancellation verified status transition but not descendant termination in that same trial (full process-tree timeout proven separately at M2). Do not upgrade structural evidence into a functional-correctness claim.
-- **Next:** M4/U01 — serve a small HTML/CSS/vanilla JS interface with project/model choice, task submission and current run status. U02 adds event/diff/error visibility. No framework, second service, or automatic Git publication.
-
-### M4 — Lightweight interface
-
-**U01 — Custom chat and project/model controls**
-
-- Plain HTML, CSS, vanilla JavaScript served by FastAPI; no Chainlit, React, npm or separate frontend server.
-- Show sessions, user requests, active project/workspace, installed model selection, and current run status.
-
-**Done when:** a local user can submit a coding task without the CLI and can see which repository will be modified.
-
-**U02 — Execution transparency**
-
-- Render current phase, useful model/tool activity, verification results, changed files, readable diffs, errors and final status.
-- Support cancellation and clear failed/partial outcomes; never label a model's unverified claim as success.
-- Keep interface responsive when output is large and when SSE reconnects.
-
-**Gate M4:** the browser can drive the M2 acceptance scenarios and display consistent engine-produced outcomes.
-
-### M5 — Local persistence and context
-
-**P01 — Conversation and run records**
-
-- Choose the smallest suitable local storage mechanism only after real API/UI requirements are known.
-- Save conversations separately from structured run results and bounded diagnostic events.
-- Feed subsequent turns only relevant user decisions and verified prior results—not raw model success claims.
-
-**Done when:** restarting the app preserves completed conversations/results without misleading follow-up context.
-
-#### P01 implementation and acceptance checkpoint — 2026-10-18
-
-- **Storage:** implemented a single local SQLite file using Python's standard library; no ORM, server, or background service. The default location is `%LOCALAPPDATA%\REAPER-AI\reaper-ai.sqlite3`, with `REAPER_DATA_DIR` as an explicit parent-directory override. Database files are ignored by Git.
-- **Records:** conversations, user/terminal-result messages, runs, bounded structured engine events, and corresponding stage-result records are stored separately and linked by IDs. Run records retain workspace, model, task, timeout, status, timestamps, exit code, and structured result.
-- **Retrieval:** the API exposes conversation history and reloads completed runs from SQLite when the in-memory registry is empty. The browser offers a conversation selector and renders stored messages after restart. A follow-up receives only bounded user-request and observed-result context; raw model success claims are not used as context.
-- **Errors/boundaries:** pre-run database failures are explicit API errors; a post-run history failure does not overwrite the engine's actual terminal status. Raw logs remain temporary, individual persisted event payloads are capped, and P01 does not resume or replay interrupted runs.
-- **Focused verification:** persistence/API tests cover storage, reload with a new store instance, conversation/run association, stage results, and retrieval after clearing the API's memory registry.
-
-**P02 — Optional checkpoints and safe recovery**
-
-- Decide whether real pause/resume is necessary; if yes, use LangGraph-compatible checkpointing rather than a second custom system.
-- Interrupted runs must remain visibly interrupted and cannot silently re-execute modifying commands.
-
-**Done when:** restart/recovery semantics are documented and tested. If resume is not needed, explicitly omit it from the first release.
-
-#### P02 implementation and acceptance checkpoint — 2026-10-18
-
-- **Checkpoint boundary:** the existing SQLite store now saves one versioned, digest-protected full engine-state snapshot after every completed nonterminal stage, including the stage result and the next LangGraph stage. The next stage, rather than the completed stage, is used for recovery.
-- **Interruption and safety:** API startup marks stale `running`/`cancelling` records as `interrupted`; it never starts them. Recovery is available only through an explicit API/UI action for interrupted, cancelled, or timed-out runs with a valid checkpoint. Missing, damaged, unsupported, or workspace-inconsistent state is rejected clearly.
-- **Control surface:** `GET /runs/{run_id}/recovery` explains recovery availability; `POST /runs/{run_id}/resume` starts a supervised continuation. The browser surfaces the checkpoint status and continuation control in conversation history, including runs interrupted before a terminal message was stored.
-- **Scope:** this is a single-user, stage-boundary continuation mechanism built on the P01 database, not automatic process restoration, event sourcing, or P03 durable memory.
-- **Focused verification:** tests cover SQLite checkpoint reload and digest invalidation, stale-run detection after a simulated restart, recovery API availability, and an interrupted agent continuation from its saved next decision without rerunning observed tools.
-
-**P03 — Optional durable memory (decision gate)**
-
-- Evaluate whether Basic Memory gives a measurable benefit beyond conversation/run records.
-- If adopted, retrieve only on demand and write only verified durable decisions or lessons.
-- Do not put ephemeral graph state or unverified completion claims in long-term memory.
-
-**Done when:** there is a documented keep/defer decision. Basic Memory integration is not required to ship the initial agent.
-
-#### P03 implementation and decision checkpoint — 2026-10-18
-
-- **Decision:** Do not add the optional Basic Memory integration for the initial agent. The repository has no existing RAG/vector stack, and no measured retrieval need justifies a new dependency or duplicate store. Re-evaluate that decision only when a concrete retrieval requirement exceeds scoped SQLite lookup.
-- **Implemented minimum:** the existing SQLite store now keeps scoped durable-memory records for explicit user-confirmed decisions and mechanically summarized, observed results from completed runs. Records retain workspace, source conversation/run IDs, verification type, and creation time.
-- **Write boundary:** ordinary messages, assistant/model prose, ephemeral graph state, checkpoints, and failed/partial completion claims are not promoted to durable knowledge. A completed run contributes only its recorded verification level, changed-file evidence, and check count.
-- **Read boundary:** memory is loaded on demand when a run starts, for its workspace plus explicitly global user decisions. It is advisory context; the engine is instructed to re-check repository facts. The browser offers an explicit project-knowledge action; `GET/POST /memory` provide the equivalent local API.
-- **Focused verification:** one persistence/restart test proves source attribution, workspace isolation, retrieval after reopening SQLite, and exclusion of assistant prose; the existing API persistence test covers the explicit user-decision endpoint.
-
-#### Context handling history — 2026-10-18 (BUG-007)
-
-- The former static pipeline briefly used selected source sections and snippet/range proposals to manage context. That implementation was removed with the pipeline.
-- The active agent retains compact observations in its prompt, reads files or ranges on demand through `tools.py`, and keeps `REAPER_MODEL_CONTEXT_CHARS` as its prompt budget. Existing-file writes use the read hash rather than a static proposal range.
-
-### M6 — Iterative agent transition, final acceptance and first release
-
-**P01 — Agent state and tool dispatcher**
-
-- Add one serializable agent-state seed to the existing LangGraph/checkpoint state: objective and project context, plan/current step, next action, compact observations, Git/file baselines, change evidence, verification status, and budgets.
-- Define one action/result contract and dispatch existing file, Git, shell, and Python-discovery adapters through it. Results must record success/failure, exit code where applicable, output or structured data, duration, changes, and a precise error.
-- Run tools with the started user's normal permissions; no automatic elevation. Preserve timeouts, explicit errors, and file conflict detection.
-- Keep the current stage pipeline and its API/UI working while the iterative decision loop is not yet present.
-
-**Done when:** the state is checkpointed with an existing run; direct dispatcher calls can list/search/read project files and ranges, inspect Git, discover Python, run `Get-Location`, and return command failure/timeout evidence.
-
-#### P01 implementation checkpoint — 2026-10-18
-
-- **Implemented:** `reaper_ai.agent` supplies the checkpoint-friendly minimal `AgentState` (plan, step, next action, observations, factual progress, verification, and tool-call accounting) and central `dispatch_tool`. Immutable task/workspace state is held by the graph; `tools.py` provides file listing, line-range reads, and line-oriented text search; `system_tools.py` remains the shell/Python implementation.
-- **Safety:** no shell allow-list, blacklist, risk class, or approval workflow remains. The dispatcher has text writes protected by an observed SHA-256 precondition; conflicts never overwrite an intervening change.
-- **Integration:** state, tool results, and checkpoints use the existing SQLite store. Git is optional and a workspace is project context rather than a filesystem boundary.
-- **Focused verification:** one dispatcher test performs list/read/range/search/write, an absolute-path write, Python discovery, Git status, PowerShell `Get-Location`, a nonzero command, and a timeout.
-
-**P02 — Iterative decision and observation loop**
-
-- Use the P01 state and dispatcher inside LangGraph: decide one next action, execute it, persist a compact observation, and route to a new decision or verification step under the existing budgets/checkpoints.
-- Keep tool execution deterministic and return failures as observations for the next decision.
-- Use the iterative graph as the active API/CLI execution path and add task-specific observed verification before completion.
-
-#### P02 implementation checkpoint — 2026-10-18
-
-- **Implemented graph:** `agent_prepare → agent_decide → agent_execute → agent_observe → agent_decide … → agent_finalize` is the active LangGraph graph. SSE receives the existing phase, model, tool, checkpoint, and verification events.
-- **Decisions and evidence:** Ollama must return JSON for one action or a final report. The engine adds the real workspace context, calls `dispatch_tool`, and persists the normalized result as an observation. Failed tool calls remain visible to the next decision, allowing a correction. A final report without a successful tool result is rejected.
-- **Budgets and recovery:** agent runs retain the wall-time limit, compact result capture, and a LangGraph recursion guard derived from the wall-time budget, but no artificial model, tool, file, or repair-operation cap. SQLite checkpoints are written after every safe agent node. An interrupted agent resumes at the saved `agent_*` next node with its observed tools intact; it does not replay completed actions.
-- **Execution:** shell commands and file operations use the launched user's OS permissions without elevation. Existing text writes require a matching read hash; tool errors remain observations so Sentinel can correct itself.
-- **Focused verification:** a deterministic end-to-end agent test performs a source read, guarded write, failed PowerShell content check, corrective reread/write, successful repeated check, completion, and restart at the saved next decision without rerunning the six tools. A live `qwen3:8b` read-only run searched `def dispatch_tool`, read `src/reaper_ai/agent.py` lines 152–180, used three model decisions/two successful tool calls, and left Git status unchanged.
-
-#### BUG-012 implementation checkpoint — 2026-10-19
-
-- **Evidence-based progress:** each observed tool result updates a compact, checkpointed snapshot of the last attributable change, recent checks and their outcomes, open verification points, and recent errors. The snapshot is supplied before the compact observation history, so a newly requested decision retains prior successful checks even when older tool output is abbreviated. A verifying action can name exact open points; only a successful result clears those points.
-- **Decision contract and diagnostics:** action decisions can state a short reason and open verification points; final decisions explicitly state why work and verification are complete. Existing action/final JSON remains accepted for compatibility. Malformed or otherwise invalid decisions become a corrective `model_decision` observation. Persisted `decision_trace` events record the actual prompt hash/size, presented facts/decisions/gaps/source ranges, choice, and the subsequent tool outcome/information gain; separate `model_thinking` events retain only an Ollama-provided `message.thinking` field and explicitly mark its absence.
-- **Focused verification:** one deterministic temporary coding run performed an actual read, an initial guarded write, a failing PowerShell content check, a reread and corrected guarded write, then a successful repeated PowerShell check and `agent_finalize`. It also verified that the successful check and the failed-check error survive in checkpointed progress and that explicit recovery resumes at the final decision without replaying the six completed tool actions.
-
-#### BUG-016 implementation checkpoint — 2026-10-19
-
-- **Retained source evidence:** successful whole-file and line-range reads now add hash- and position-bound `code_findings` to the existing checkpointed progress state. The next decision receives these findings before compact action history, while an exact reread updates its existing finding rather than accumulating duplicate history. This is context retention only; it does not prohibit repeated reads or impose an iteration limit.
-- **Verification evidence:** an explicit verification point closes only when a successful action identifies it through `verification_for`; a failed result leaves it open and a subsequent `final` decision is rejected as corrective model evidence.
-
-#### BUG-019 phase 2 implementation checkpoint — 2026-10-19
-
-- **File-scoped search:** `search_text` now accepts either one UTF-8 text file or a directory tree, matching the agent tool contract and returning the same path/line result format for both.
-- **Observed source facts:** successful reads derive compact, checkpointed facts about Python declarations, signatures, and imports with their source path, hash, and line span. They remain distinct from model-proposed findings and are prioritized before proposed notes and historical observations in the next decision prompt. Existing coverage still describes read ranges without banning a justified reread; writes invalidate stale old-hash source facts.
-- **Independent acceptance:** the requested `top-python-files` endpoint was intentionally kept outside this fix and later passed the separate end-to-end acceptance run recorded below.
-
-#### P0 targeted file edits — 2026-10-19
-
-- **Implemented:** `apply_patch(path, expected_text, replacement, expected_hash)` performs one exact, hash-bound replacement in an existing UTF-8 text file. It reads the file locally, writes only when the expected source hash matches and the original text occurs exactly once, and returns before/after hashes plus normal change evidence. `write_file` remains available for new files and whole-file replacements.
-
-#### P1 working-memory consolidation — 2026-10-19
-
-- **Implemented:** active run state now separates confirmed facts, hash-bound sources, changes, and verification instead of retaining source text in both read observations and source findings. Prompt-visible coverage is derived only from the selected excerpts. Older checkpoint fields are compactly normalized on use; SQLite schema and recovery routing remain unchanged.
-
-#### Sentinel acceptance test 2 — passed — 2026-10-19
-
-- **Result:** Run `f852b6ce174e` resumed from its valid checkpoint and completed with exit code 0. Sentinel used hash-bound `apply_patch` to add the project-scoped `top-python-files` Store query and FastAPI route, corrected its own failed verification script, then used the REAPER Venv FastAPI `TestClient` to obtain HTTP 200 with real repository-index data.
-- **Scope:** This is one complete, observed end-to-end coding workflow. It does not establish general reliability for all coding tasks.
-- **Model decision setting:** Ollama decision requests use `think: false`; the tested Qwen configuration otherwise sometimes returned thinking without JSON content.
-
-#### Sentinel decision-contract refinement — 2026-10-19
-
-- **Implemented:** the active Ollama system prompt now defines a compact, schema-aligned work method: derive subgoals and success criteria, use retained evidence before further inspection, implement once analysis is sufficient, verify proportionately, and use errors or ineffective results to change strategy. It retains JSON-only actions/finals and the existing `reason`, optional `plan`, `open_verifications`, and `verification_for` fields. Final decisions add an optional `completed`/`partial` outcome so an observed blocker is not stored as success; no graph, dispatcher, model, sampling, or checkpoint protocol changed.
-
-#### P05/P06 implementation checkpoint — 2026-10-19
-
-- **P05 file scanning:** ordinary project scans omit Git-ignored generated directories, while an explicitly selected ignored or hidden directory is traversed recursively. Git remains optional; explicit `.git` access is supported.
-- **P06 agent consolidation:** the active graph retains factual progress and source findings in its checkpoint, returns malformed or invalid model decisions as corrective observations, and reaches `agent_finalize` only through an explicit final decision with observed evidence. Shell execution remains autonomous under the started user's operating-system permissions.
-
-#### BUG-010–BUG-016 consolidation — 2026-10-19
-
-- **BUG-010 — completed:** malformed JSON or invalid action decisions become corrective observations; prompt input uses compact observations instead of retransmitting full results.
-- **BUG-011 — completed:** successful file reads retain source evidence for the next decision instead of relying only on disposable call history.
-- **BUG-012 — completed:** checkpointed progress records changes, checks, explicit open verification points, and errors before the next decision.
-- **BUG-013 — completed:** successful `read_file` and `read_file_range` actions neither close an explicit verification point nor create a progress error.
-- **BUG-014 — completed:** `write_file` receives its content only from structured action arguments; normalized tool-result metadata is not file content.
-- **BUG-015 — no repository evidence:** no implementation entry or source reference for this identifier exists in the current repository, so it is not claimed as completed.
-- **BUG-016 — completed:** hash- and position-bound `code_findings` survive checkpointing and are supplied before compact historical observations; the planner shares its source budget across findings so their order cannot exclude an already-read file from model context. Empty line ranges are reported as errors, and overlapping source evidence is reduced to the newest range for the same source hash.
-- **BUG-017 — completed:** dispatcher capture limits now mark truncated whole-file reads explicitly, retain original/captured lengths and the captured line span, and carry that evidence through findings and prompt excerpts. A planner can therefore request the next uncovered range rather than mistaking a 12,000-character capture for a complete file.
-
-#### Post-M6 technical cleanup — 2026-10-18
-
-- **Removed:** the obsolete `Inventory → Select → Analyze → Propose → Apply → Verify` graph, its snippet/range replacement and repair helpers, duplicate engine Git snapshots, and its dedicated legacy tests.
-- **Retained:** the iterative graph, direct Ollama client, dispatcher, `tools.py` file/Git adapters, `system_tools.py` shell/Python discovery, FastAPI/UI, SQLite history/checkpoints/memory, and Windows supervisor.
-- **Compatibility:** current agent checkpoints retain all fields needed for recovery. Older agent snapshots with surplus state fields are accepted; checkpoints for the removed static graph are preserved as records but cannot be resumed.
-
-**D01 — Representative end-to-end acceptance**
-
-Exercise real local tasks and record evidence for:
-
-1. Focused coding task with actual attributable diff and relevant checks.
-2. Read-only repository analysis without edits.
-3. Failed check followed by bounded correction or honest failure.
-4. Model invents success without changing files: rejected.
-5. Pre-existing tracked/untracked user modifications preserved.
-6. Nonproductive inspection: bounded termination and token diagnostics.
-7. Cancellation ends the entire command tree and allows clean next run.
-8. Browser status/changed files/check results reflect real engine events.
-
-Use focused automated checks and a small manual acceptance set; add permanent tests only where a genuine regression risk warrants them. Do not impose a giant test suite.
-
-**D02 — Packaging, operations and documentation**
-
-- Verify installation on a clean Windows Python environment and local Ollama connectivity.
-- Document setup, configuration, project selection, safety policy, troubleshooting and actual supported features.
-- Finalize architecture documentation to match shipped behavior, then create/update the project README.
-- Release, tag, push and publication happen only on explicit user instruction.
-
-**Gate M6:** REAPER-AI is usable from a clean installation and passes the evidence-based scenarios above. Outstanding limitations are documented; no unsupported feature claims.
-
-## 4. Deferred scope — not part of the initial release
-
-- Delegated/specialist workers and concurrent editing.
-- Multi-model routing as an optimization.
-- Advanced durable memory or automated knowledge extraction.
-- Autonomous scheduling, deployment/release automation, cloud services, remote agents.
-- Interactive graph/workflow editor and heavy frontend framework.
-
-Promote an item only after a real use case justifies it, with an explicit new work package. Do not create placeholder infrastructure now.
-
-## 5. Working agreement
-
-- Complete **one work package at a time**; inspect the current implementation before making targeted changes.
-- Verify with the smallest meaningful check and report **what actually ran**, what changed and what remains uncertain.
-- Do not alter unrelated modules. Update `ARCHITECTURE.md` if an architectural decision changes.
-- Keep documentation consistent, but **write the README after this roadmap is approved**, as agreed.
-- Never perform Git commit/push/release automatically.
-
-**Next step:** D01 — perform representative end-to-end acceptance of the autonomous iterative agent; do not create a commit, push, or release without explicit instruction.
-
-## M4 acceptance record
-
-**M4/U01 — Lightweight interface:** Completed for the tested coding workflow.
-
-**M4/U02 — Execution transparency:** Completed for the tested coding workflow.
-
-Browser acceptance demonstrated workspace validation, model selection, coding execution, SSE timeline, structural verification, terminal status and Git diff rendering.
-
-Known limitations are documented in ARCHITECTURE.md. Full functional correctness and browser reconnection have not been established; checkpoint recovery is covered separately by M5/P02 tests.
-
-**Next milestone:** M6/D01 — real-world acceptance of the autonomous iterative agent.
-
-**Release preparation:** v0.5.0 documentation and package metadata prepared; commit, tag, push, and release remain explicit user actions.
-
-## Variante B — Multi-project repository work
-
-### Step 1 — Project core (implemented)
-
-- A single local SQLite database now stores stable UUID projects with workspace, description, supplemental Sentinel prompt, and Ollama model settings (`temperature`, `top_p`, `top_k`, `num_ctx`).
-- Conversations, runs, and durable memory carry an optional project association. Additive, version-marked migration creates legacy projects for unambiguous historic workspaces, preserves ambiguous legacy conversations, and leaves run IDs and checkpoints unchanged.
-- New project runs use the configured project workspace and snapshot model options/prompt for stable execution and recovery. Projects sharing a workspace remain separate. Projects with historical data cannot be deleted automatically.
-- Local CRUD and project-scoped conversation/memory API endpoints are available. The browser integration follows in Step 5.
-
-### Step 2 — Repository index (implemented)
-
-- The shared SQLite store now maintains project-scoped file metadata, Python `ast` symbols and imports, plus Git branch/HEAD state without copying source text or creating another database.
-- Initial and incremental scans use content hashes: unchanged files retain their parsed data, changed/new files are reparsed, and removed paths are deleted. Typical repository metadata, dependency, virtual-environment, cache, and generated-output trees are excluded.
-- Local API index refresh, status, file, symbol, and import queries are available. Project runs refresh the selected project's index before launch and after completion. Equal workspaces remain separated by `project_id`.
-- This delivers navigation infrastructure only; the separate Step 3 working memory and Step 4 Sentinel integration build on it. Project UI follows in Step 5.
-
-### Step 3 — Hybrid run working memory (implemented)
-
-- Existing checkpointed agent state preserves current phase/subtask, confirmed tool facts, model-proposed decisions, and explicit information gaps. Sources, changes, and verification have dedicated existing progress fields.
-- Model notes are never promoted to file-change or verification facts. Source-linked facts retain file path and SHA-256 and are invalidated when that file is successfully changed.
-- The planner receives selected source excerpts, facts, decisions, gaps, and verification before compact historical tool metadata; recovery normalizes checkpoints written with the older overlapping fields.
-
-### Step 4 — Sentinel integration (implemented)
-
-- Project runs carry a compact, checkpointed repository map with task-ranked file metadata, relevant Python symbols/imports, and index status; source text is never added to this map.
-- Sentinel can query the existing project index for files, symbols, per-file symbols, imports, and status, then use `read_file_range` for source. Successful writes refresh that same index.
-- A common checkpointed observation path records typed facts from reads, searches, index navigation, changes, and checks, plus concrete information gaps. Prompt context prioritizes this evidence before generic tool history; source coverage remains separate from search hints.
-- The prompt and decision contract guide dynamic `explore → plan → implement → verify` work without adding a second agent graph, database, vector store, or fixed tool/read limits. Reached phases are advanced from successful tool evidence rather than model declaration alone. Context selection compacts historical evidence, preserves coherent task-relevant source ranges, retires superseded no-match searches, and does not demote a concrete implementation task solely because it performs a focused read. Legacy workspace-only runs retain their existing behavior without an index map.
-
-### Step 5 — Multi-project GUI (implemented)
-
-- The existing three-column vanilla-JavaScript UI now selects, creates, edits, and deletes eligible projects without adding a new UI framework.
-- The active project filters conversations and project knowledge; legacy chats remain reachable through the explicit legacy selection. New runs send the selected `project_id`, so they use the persisted project configuration.
-- The sidebar displays repository-index status (scan time, file/symbol counts, Git branch/HEAD), supports manual refresh, and offers simple combined file/symbol lookup.
-- Existing chat deletion, result/copy controls, recovery display, and the independent live-run panel remain in place. A live run remains visible while navigating chats or projects.
-
-**Next:** Commit, local installation, and a real Qwen acceptance run for the completed Variante-B steps. Do not add embeddings, a vector store, or a second project-management layer.
+- Multi-agent delegation
+- Automatic multi-model routing
+- Embeddings, vector databases, or RAG without a measured need
+- Cloud services
+- Automated releases or deployments
+- Enterprise roles, tenants, and permission systems
