@@ -1,6 +1,8 @@
 """REAPER-AI iterative LangGraph tool agent with persisted recovery points."""
 
 import argparse
+import ast
+import hashlib
 import json
 import os
 import re
@@ -21,7 +23,9 @@ MODEL = os.environ.get("REAPER_MODEL", "qwen3.6:35b")
 MAX_WALL_SECONDS = 600
 _MAX_REPLY_CHARS = 80_000
 _MODEL_PROTOCOL_OVERHEAD_BYTES = 512
+_MAX_THINKING_CHARS = 12_000
 _RUN = ContextVar("reaper_run_metrics", default=None)
+_LAST_MODEL_RESPONSE = ContextVar("reaper_last_model_response", default=None)
 
 
 def _configure_utf8_stdio() -> None:
@@ -126,7 +130,16 @@ def ask_json(system: str, user: str) -> dict[str, Any]:
     _emit_event("model_activity", status="completed", model=MODEL,
                 input_tokens=payload.get("prompt_eval_count") or 0,
                 output_tokens=payload.get("eval_count") or 0)
-    raw = payload["message"]["content"]
+    message = payload["message"]
+    raw = message["content"]
+    thinking = message.get("thinking")
+    if not isinstance(thinking, str):
+        thinking = ""
+    _LAST_MODEL_RESPONSE.set({
+        "thinking_available": bool(thinking),
+        "thinking": thinking[:_MAX_THINKING_CHARS],
+        "thinking_truncated": len(thinking) > _MAX_THINKING_CHARS,
+    })
     if len(raw) > _MAX_REPLY_CHARS:
         raise ValueError("Model output exceeds 80,000 characters")
     result = json.loads(raw)
@@ -141,21 +154,22 @@ Return exactly one decision:
 {"kind":"action","reason":"short next-step rationale","action":{"tool":"supported tool","args":{}},
  "plan":[{"step":"short current or next purpose"}],"open_verifications":["required proof"],
  "verification_for":["proof established by this action"],"phase":"explore|plan|implement|verify",
- "current_task":"short concrete subgoal","findings":["proposed technical insight"],
- "decisions":["technical choice"],"open_questions":["unresolved question"],
- "completed_tasks":["completed planning step"]}
+ "current_task":"short concrete subgoal","decisions":["technical choice"],
+ "information_gaps":["unresolved question"]}
 or
 {"kind":"final","outcome":"completed or partial","reason":"short completion or blockage rationale","summary":"concise evidence-based result",
  "verification":"what observed tool results establish"}
 `plan`, `open_verifications`, and `verification_for` are optional. `action.tool` must be supported and `action.args`
 must be an object. The work-memory fields are optional and incremental: provide only additions or changes; never repeat
-the whole memory merely to restate it. `findings`, `decisions`, questions, and completed planning steps are model
-proposals, not proof of a file change or a passed check. Use `reason` only for a short decision rationale, not private reasoning.
+the whole memory merely to restate it. `decisions` and `information_gaps` are model proposals, not proof of a file
+change or a passed check. Use `reason` only for a short decision rationale, not private reasoning.
 
 Work method for every decision:
 1. Determine the user goal, current subgoal, success criteria, constraints, and project conventions from task, plan,
-   progress, verification, findings, and observations.
-2. Prefer already known facts. `code_findings` contain source previously read; do not reread an unchanged range unless
+   progress, verification, confirmed facts, and observations.
+2. Prefer already known facts. `working_memory.confirmed_facts` are tool-confirmed facts from reads, searches,
+   index queries, changes, and checks; use them before repeating equivalent discovery. `information_gaps` states what
+   tool evidence still does not establish. `code_findings` contain the corresponding source; do not reread an unchanged range unless
    new evidence makes it necessary. Inspect only information needed for the next useful action. Stop analysis once it
    is sufficient to implement or verify the current subgoal.
 3. Choose the action with the clearest contribution to the remaining work. For a development request, move from focused
@@ -164,7 +178,8 @@ Work method for every decision:
 4. Use the repository map for initial orientation. During `explore`, prefer index tools to broad scans: find files,
    symbols, or imports, then use `read_file_range` for the exact source needed. During `plan`, identify the affected
    functions and dependencies. During `implement`, make the concrete guarded change once sufficient evidence exists.
-   During `verify`, run proportionate checks. A return to exploration needs a concrete missing fact.
+   During `verify`, run proportionate checks. A return to exploration needs a concrete missing fact. The engine records
+   the reached phase from successful tool evidence; do not claim a later phase before the corresponding work is done.
 5. Treat each tool result as the factual outcome. A technically successful call is not by itself task progress. After an
    error or an ineffective action, use its result to change strategy and correct the cause rather than repeat it without
    a new reason. Do not claim actions, tests, or facts without supporting tool results.
@@ -176,17 +191,19 @@ Work method for every decision:
    satisfy the user goal. Use `outcome: "partial"` when observed evidence establishes a concrete blocker or incomplete
    result; state the remaining work truthfully and do not describe it as success.
 
-Supported tools: list_files(path?, max_results?), search_text(query, path?, max_results?, case_sensitive?),
+Supported tools: list_files(path?, max_results?), search_text(query, path? file-or-directory, max_results?, case_sensitive?),
 read_file(path, max_chars?), read_file_range(path, start_line, end_line, max_chars?), git_status, git_diff,
-find_python, shell(command, timeout?), write_file(path, content, expected_hash?), index_status,
+find_python, shell(command, timeout?), write_file(path, content, expected_hash?),
+apply_patch(path, expected_text, replacement, expected_hash), index_status,
 index_files(query?, language?, limit?), index_symbols(name, path?, limit?), index_file_symbols(path),
 index_imports(path?). Index tools are project-scoped metadata/navigation only; use `read_file_range` to retrieve source.
 Paths may be workspace-relative or
 absolute. Git is optional. Shell commands and writes use the started user's normal operating-system permissions.
 On Windows, `shell` executes Windows PowerShell (`powershell -Command`), not CMD, Bash, or PowerShell 7. Use
 PowerShell syntax such as `Test-Path`; do not use Bash/CMD operators such as `||` or `2>nul`.
-Before writing an existing text file, read it and pass that result's sha256 as expected_hash. Use only the supported
-tools, respect tool errors and path rules, and never commit, push, or release automatically."""
+Before modifying an existing text file, read it and pass that result's sha256 as expected_hash. Use `apply_patch` for
+one exact, uniquely occurring source text replacement; use `write_file` for new files or whole-file replacement. Use
+only the supported tools, respect tool errors and path rules, and never commit, push, or release automatically."""
 
 
 def _short_text(value: Any, limit: int = 500) -> str:
@@ -211,11 +228,35 @@ def _ensure_work_memory(agent: dict[str, Any]) -> None:
         agent["phase"] = "explore"
     if not isinstance(agent.get("current_task"), str):
         agent["current_task"] = ""
-    for key in ("findings", "decisions", "open_questions", "completed_tasks"):
+    for key in ("facts", "decisions", "information_gaps"):
         if not isinstance(agent.get(key), list):
             agent[key] = []
+    progress = agent.get("progress") if isinstance(agent.get("progress"), dict) else {}
+    agent["progress"] = progress
+    if not isinstance(progress.get("sources"), list):
+        progress["sources"] = progress.pop("findings", []) if isinstance(progress.get("findings"), list) else []
+    else:
+        progress.pop("findings", None)
+    # Checkpoints written before P1 stored observed and proposed notes together.
+    # Keep their useful content once, then save the compact shape at the next node.
+    legacy_findings = agent.pop("findings", [])
+    if isinstance(legacy_findings, list):
+        observed = [item for item in legacy_findings if isinstance(item, dict) and item.get("status") == "observed"]
+        proposed = [item for item in legacy_findings if isinstance(item, dict) and item.get("status") != "observed"]
+        agent["facts"] = _append_unique(agent["facts"], observed)
+        agent["decisions"] = _append_unique(agent["decisions"], proposed)
+    legacy_questions = agent.pop("open_questions", [])
+    if isinstance(legacy_questions, list):
+        questions = []
+        for item in legacy_questions:
+            if isinstance(item, dict):
+                questions.append({**item, "kind": item.get("kind", "question"), "status": item.get("status", "proposed")})
+        agent["information_gaps"] = _append_unique(agent["information_gaps"], questions)
+    agent.pop("completed_tasks", None)
     if not isinstance(agent.get("repository_map"), dict):
         agent["repository_map"] = {}
+    if not isinstance(agent.get("pending_decision_trace"), dict):
+        agent["pending_decision_trace"] = None
 
 
 def _repository_map(agent: dict[str, Any], workspace: str, task: str) -> dict[str, Any]:
@@ -264,6 +305,21 @@ def _repository_map(agent: dict[str, Any], workspace: str, task: str) -> dict[st
         return unavailable
 
 
+def _repository_map_snapshot(repository_map: Any) -> dict[str, Any]:
+    """Keep orientation data useful without crowding out the current edit."""
+    if not isinstance(repository_map, dict):
+        return {}
+    result = {key: repository_map.get(key) for key in ("available", "project_id", "workspace", "status") if key in repository_map}
+    for key, fields in (("files", ("path", "language", "line_count")),
+                        ("symbols", ("path", "qualname", "kind", "start_line", "end_line")),
+                        ("imports", ("path", "module", "imported_name", "local_module", "line"))):
+        values = repository_map.get(key)
+        if isinstance(values, list):
+            result[key] = [{field: item.get(field) for field in fields if field in item}
+                           for item in values[:8] if isinstance(item, dict)]
+    return result
+
+
 def _memory_text_items(value: Any, *, field: str, source_hashes: set[tuple[str, str]]) -> list[dict[str, Any]]:
     """Normalize model-supplied working notes without upgrading them to facts."""
     raw_items = value if isinstance(value, list) else [value] if isinstance(value, str) else []
@@ -281,7 +337,7 @@ def _memory_text_items(value: Any, *, field: str, source_hashes: set[tuple[str, 
             text = raw
         if not isinstance(text, str) or not text.strip():
             continue
-        item = {"status": "proposed", "summary": _short_text(text.strip(), 600)}
+        item = {"status": "proposed", "kind": field, "summary": _short_text(text.strip(), 600)}
         if source is not None:
             item["source"] = source
         items.append(item)
@@ -300,38 +356,61 @@ def _append_unique(items: list[dict[str, Any]], additions: list[dict[str, Any]])
     return result
 
 
+def _compact_memory_item(item: dict[str, Any]) -> dict[str, Any]:
+    """Serialize evidence for a decision without replaying a tool's full payload."""
+    compact = {key: item.get(key) for key in ("status", "kind", "tool", "query", "path", "source")
+               if key in item}
+    compact["summary"] = _short_text(item.get("summary", ""), 500)
+    locations = item.get("locations")
+    if isinstance(locations, list):
+        compact["locations"] = [
+            {key: _short_text(location.get(key), 240) for key in ("path", "line", "text") if key in location}
+            for location in locations[:4] if isinstance(location, dict)
+        ]
+    evidence = item.get("evidence")
+    if isinstance(evidence, list):
+        compact["evidence"] = [
+            {key: value for key, value in entry.items()
+             if key in {"path", "name", "qualname", "kind", "start_line", "end_line", "module", "local_module"}}
+            for entry in evidence[:4] if isinstance(entry, dict)
+        ]
+    elif isinstance(evidence, dict):
+        compact["evidence"] = {key: evidence.get(key) for key in
+                               ("file_count", "symbol_count", "git_branch", "git_head", "scanned_at") if key in evidence}
+    return compact
+
+
 def _work_memory_snapshot(agent: dict[str, Any]) -> dict[str, Any]:
-    """Present compact state, with current work and decisions ahead of call history."""
+    """Present current, compact evidence before historical notes and observations."""
     _ensure_work_memory(agent)
+    facts = [item for item in agent["facts"] if isinstance(item, dict)]
     return {
         "current_task": _short_text(agent["current_task"], 600),
         "phase": agent["phase"],
-        "decisions": agent["decisions"][-16:],
-        "findings": agent["findings"][-16:],
-        "open_questions": agent["open_questions"][-16:],
-        "completed_tasks": agent["completed_tasks"][-16:],
+        "confirmed_facts": [_compact_memory_item(item) for item in facts[-10:]],
+        "decisions": [_compact_memory_item(item) for item in agent["decisions"][-8:]],
+        "information_gaps": [_compact_memory_item(item) for item in agent["information_gaps"][-8:]],
     }
 
 
 def _update_work_memory_from_decision(agent: dict[str, Any], decision: dict[str, Any]) -> None:
     """Apply only incremental model notes; factual state remains tool-derived."""
     _ensure_work_memory(agent)
-    phase = decision.get("phase")
-    if phase in _WORK_PHASES:
-        agent["phase"] = phase
     current_task = decision.get("current_task")
     if isinstance(current_task, str) and current_task.strip():
         agent["current_task"] = _short_text(current_task.strip(), 600)
     source_hashes = {
-        (item.get("path"), item.get("sha256")) for item in agent.get("progress", {}).get("findings", [])
+        (item.get("path"), item.get("sha256")) for item in agent.get("progress", {}).get("sources", [])
         if isinstance(item, dict) and isinstance(item.get("path"), str) and isinstance(item.get("sha256"), str)
     }
-    for key in ("findings", "decisions", "open_questions"):
-        agent[key] = _append_unique(agent[key], _memory_text_items(decision.get(key), field=key, source_hashes=source_hashes))
-    # Model-reported planning completion is retained as a proposal; only tool results create observed completion.
-    agent["completed_tasks"] = _append_unique(
-        agent["completed_tasks"], _memory_text_items(decision.get("completed_tasks"), field="completed_tasks", source_hashes=source_hashes)
-    )
+    for key in ("decisions", "findings", "completed_tasks"):
+        agent["decisions"] = _append_unique(
+            agent["decisions"], _memory_text_items(decision.get(key), field=key, source_hashes=source_hashes)
+        )
+    for key in ("information_gaps", "open_questions"):
+        agent["information_gaps"] = _append_unique(
+            agent["information_gaps"], _memory_text_items(decision.get(key), field=key, source_hashes=source_hashes)
+        )
 
 
 def _captured_end(finding: dict[str, Any]) -> int | None:
@@ -439,18 +518,362 @@ def _non_overlapping_findings(findings: list[dict[str, Any]]) -> list[dict[str, 
     return list(reversed(retained))
 
 
+def _coherent_findings(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Join adjacent retained ranges so a function reaches the model intact."""
+    joined: list[dict[str, Any]] = []
+    ordered = sorted(findings, key=lambda item: (str(item.get("path", "")), str(item.get("sha256", "")),
+                                                 item.get("start_line", 0)))
+    for finding in ordered:
+        if (joined and finding.get("path") == joined[-1].get("path") and
+                finding.get("sha256") == joined[-1].get("sha256") and
+                isinstance(finding.get("start_line"), int) and
+                finding["start_line"] == joined[-1].get("end_line", 0) + 1):
+            joined[-1]["content"] += finding["content"]
+            joined[-1]["end_line"] = finding["end_line"]
+            joined[-1]["truncated"] = bool(joined[-1].get("truncated") or finding.get("truncated"))
+            continue
+        joined.append(dict(finding))
+    return joined
+
+
+def _implementation_intent(agent: dict[str, Any]) -> bool:
+    """Recognize a concrete proposed change without treating it as completed work."""
+    notes = [agent.get("current_task", "")]
+    notes.extend(item.get("summary", "") for item in agent.get("decisions", []) if isinstance(item, dict))
+    text = " ".join(note for note in notes if isinstance(note, str)).casefold()
+    return bool(re.search(r"\b(add|implement|change|update|write|create|replace|fix|remove)\b", text))
+
+
+def _reconcile_work_phase(agent: dict[str, Any]) -> None:
+    """Promote a concrete, evidence-backed plan without claiming it is complete."""
+    if agent.get("phase") == "plan" and _implementation_intent(agent):
+        agent["phase"] = "implement"
+
+
+def _reconcile_information_gaps(agent: dict[str, Any]) -> None:
+    """Drop no-match searches once later source evidence has superseded them."""
+    source_paths = {
+        item.get("path") for item in agent.get("progress", {}).get("sources", [])
+        if isinstance(item, dict) and isinstance(item.get("path"), str) and item.get("content")
+    }
+    agent["information_gaps"] = [gap for gap in agent.get("information_gaps", []) if not (
+        isinstance(gap, dict) and gap.get("kind") == "search_gap" and
+        (not isinstance(gap.get("path"), str) or gap.get("path") in source_paths)
+    )]
+
+
+def _context_range_scores(agent: dict[str, Any], findings: list[dict[str, Any]]) -> list[int]:
+    """Rank individual source ranges for the next action, not their whole file."""
+    notes = [agent.get("current_task", "")]
+    notes.extend(item.get("summary", "") for item in agent.get("decisions", []) if isinstance(item, dict))
+    terms = {term.casefold() for note in notes if isinstance(note, str)
+             for term in re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", note)}
+    recent_reads = [
+        {key: item.get(key) for key in ("path", "sha256", "start_line", "end_line")}
+        for item in agent.get("progress", {}).get("sources", []) if isinstance(item, dict)
+    ]
+    search_locations = [location for item in agent.get("facts", [])
+                        if isinstance(item, dict) and item.get("kind") == "search_result"
+                        for location in item.get("locations", []) if isinstance(location, dict)]
+    scores: list[int] = []
+    for index, finding in enumerate(findings):
+        path, start, end = finding.get("path"), finding.get("start_line"), finding.get("end_line")
+        if not isinstance(path, str) or not isinstance(start, int) or not isinstance(end, int):
+            scores.append(-1)
+            continue
+        path_terms = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", path.casefold()))
+        content = finding.get("content", "").casefold()
+        matches = sum(term in path_terms or re.search(rf"\b{re.escape(term)}\b", content) is not None
+                      for term in terms)
+        score = matches * 100
+        # A dispatcher-truncated full read is weaker edit context than a later,
+        # complete targeted range from the same file.
+        if finding.get("truncated"):
+            score -= 5_000
+        # A latest, focused read is direct evidence about the active edit.  It
+        # wins ties over an older range from the same file without hiding a
+        # separately relevant Store/API convention.
+        for recency, source in enumerate(reversed(recent_reads), start=1):
+            if source.get("path") != path:
+                continue
+            read_start, read_end = source.get("start_line"), source.get("end_line")
+            if isinstance(read_start, int) and isinstance(read_end, int) and not (end < read_start or start > read_end):
+                score += 1_000 + max(0, 100 - recency)
+                break
+        for location in search_locations:
+            line = location.get("line")
+            if location.get("path") == path and isinstance(line, int) and start <= line <= end:
+                score += 500
+        scores.append(score + index)
+    return scores
+
+
+def _select_context_findings(agent: dict[str, Any], findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Prefer a few task-relevant, coherent ranges over every historical fragment."""
+    scores = _context_range_scores(agent, findings)
+    selected_indexes: set[int] = set()
+    for index, candidate in sorted(enumerate(findings), key=lambda entry: scores[entry[0]], reverse=True):
+        if len(selected_indexes) == 3:
+            break
+        path, digest = candidate.get("path"), candidate.get("sha256")
+        start, end = candidate.get("start_line"), candidate.get("end_line")
+        if not all((isinstance(path, str), isinstance(digest, str), isinstance(start, int), isinstance(end, int))):
+            continue
+        duplicate = False
+        for selected_index in selected_indexes:
+            selected = findings[selected_index]
+            selected_start, selected_end = selected.get("start_line"), selected.get("end_line")
+            if (selected.get("path") != path or selected.get("sha256") != digest or
+                    not isinstance(selected_start, int) or not isinstance(selected_end, int)):
+                continue
+            overlap = max(0, min(end, selected_end) - max(start, selected_start) + 1)
+            if not overlap:
+                continue
+            # A clipped broad capture adds no usable context beside the focused
+            # range it overlaps. Near-identical reads are likewise redundant.
+            if candidate.get("truncated") or overlap * 2 >= end - start + 1:
+                duplicate = True
+                break
+        if not duplicate:
+            selected_indexes.add(index)
+    # Deduplicate only the ranges that will be shown. Doing so before ranking
+    # can fuse a full-file capture with a later targeted range, after which
+    # truncation keeps only the unrelated beginning of the combined excerpt.
+    selected = [finding for index, finding in enumerate(findings) if index in selected_indexes]
+    coherent = _coherent_findings(_non_overlapping_findings(selected))
+    coherent_scores = _context_range_scores(agent, coherent)
+    return [entry[1] for entry in sorted(enumerate(coherent), key=lambda entry: coherent_scores[entry[0]], reverse=True)]
+
+
 def _progress_snapshot(agent: dict[str, Any]) -> dict[str, Any]:
-    """Compact factual progress, separate from source findings and call history."""
+    """Compact changes and verification state, separate from sources and history."""
     progress = agent.get("progress") if isinstance(agent.get("progress"), dict) else {}
-    findings = progress.get("findings") if isinstance(progress.get("findings"), list) else []
     return {
         "last_change": progress.get("last_change"),
         "checks": list(progress.get("checks", []))[-12:],
         "open_verifications": list(progress.get("open_verifications", [])),
         "errors": list(progress.get("errors", []))[-12:],
         "last_reason": _short_text(progress.get("last_reason", "")),
-        "source_coverage": _source_coverage([item for item in findings if isinstance(item, dict)]),
     }
+
+
+def _source_fact_finding(finding: dict[str, Any]) -> dict[str, Any] | None:
+    """Summarize source facts confirmed by a successful read, never model prose."""
+    path, digest, content = finding.get("path"), finding.get("sha256"), finding.get("content")
+    start_line, end_line = finding.get("start_line"), finding.get("end_line")
+    if not all((isinstance(path, str), isinstance(digest, str), isinstance(content, str),
+                isinstance(start_line, int), isinstance(end_line, int))):
+        return None
+    facts: list[str] = []
+    try:
+        tree = ast.parse(content)
+        for node in ast.walk(tree):
+            line = start_line + node.lineno - 1 if hasattr(node, "lineno") else None
+            if isinstance(node, ast.ClassDef):
+                facts.append(f"class {node.name} at line {line}")
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                prefix = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
+                try:
+                    signature = ast.unparse(node.args)
+                except (TypeError, ValueError):
+                    signature = "..."
+                facts.append(f"{prefix} {node.name}({signature}) at line {line}")
+            elif isinstance(node, ast.Import):
+                facts.append("imports " + ", ".join(alias.name for alias in node.names))
+            elif isinstance(node, ast.ImportFrom):
+                module = "." * node.level + (node.module or "")
+                facts.append(f"imports from {module}: " + ", ".join(alias.name for alias in node.names))
+    except SyntaxError:
+        # Ranges inside an indented scope or a clipped final definition are not
+        # independently parseable. Preserve only declaration/import lines that
+        # occur verbatim in the observed text; this is not a substitute AST.
+        for offset, line in enumerate(content.splitlines(), start=0):
+            match = re.match(r"^\s*((?:async\s+def|def|class)\s+[A-Za-z_]\w*[^:]*:|"
+                             r"from\s+[^\s]+\s+import\s+.+|import\s+.+)$", line)
+            if match:
+                facts.append(f"{match.group(1).strip()} at line {start_line + offset}")
+    if not facts:
+        return None
+    unique = list(dict.fromkeys(facts))[:8]
+    return {
+        "status": "observed",
+        "kind": "source_fact",
+        "summary": _short_text(f"Observed in {path}: " + "; ".join(unique), 1_200),
+        "source": {"path": path, "sha256": digest, "start_line": start_line, "end_line": end_line},
+    }
+
+
+def _observed_tool_knowledge(action: dict[str, Any], result: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Turn every information-bearing tool result into compact, sourced run knowledge.
+
+    This is deliberately one update point for file, search, index, change, and
+    verification evidence.  It records what a tool established, never a model
+    interpretation, and leaves full result payloads in the checkpointed
+    observation history.
+    """
+    tool = action.get("tool") if isinstance(action.get("tool"), str) else "tool"
+    args = action.get("args") if isinstance(action.get("args"), dict) else {}
+    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    if not result.get("ok"):
+        error = _short_text(result.get("error", "Tool failed"), 600)
+        return ([{"status": "observed", "kind": "tool_error",
+                  "summary": f"{tool} failed: {error}", "tool": tool, "args": args}],
+                [{"status": "observed", "kind": "tool_error",
+                  "summary": f"Resolve the {tool} failure before relying on its result: {error}", "tool": tool}])
+
+    source = {key: data.get(key) for key in ("path", "sha256", "start_line", "end_line")
+              if isinstance(data.get(key), (str, int))}
+    facts: list[dict[str, Any]] = []
+    gaps: list[dict[str, Any]] = []
+    if tool in {"read_file", "read_file_range"} and isinstance(data.get("content"), str):
+        finding = {key: data.get(key) for key in ("path", "start_line", "end_line", "sha256", "content",
+                                                    "truncated", "original_length", "captured_length")}
+        if tool == "read_file_range":
+            finding["end_line"] = data.get("captured_end_line", data.get("last_line", finding["end_line"]))
+        source_fact = _source_fact_finding(finding)
+        if source_fact is not None:
+            facts.append(source_fact)
+        if data.get("truncated"):
+            gaps.append({"status": "observed", "kind": "source_gap",
+                         "summary": f"Only part of {source.get('path', args.get('path', 'file'))} is captured; read a targeted missing range if needed.",
+                         "source": source})
+    elif tool == "search_text":
+        matches = data.get("matches") if isinstance(data.get("matches"), list) else []
+        locations = [{key: item.get(key) for key in ("path", "line", "text")}
+                     for item in matches[:12] if isinstance(item, dict) and isinstance(item.get("path"), str)
+                     and isinstance(item.get("line"), int)]
+        query = args.get("query", "")
+        facts.append({"status": "observed", "kind": "search_result",
+                      "summary": _short_text(f"Search {query!r} in {args.get('path', '.')}: {len(matches)} match(es)", 600),
+                      "tool": tool, "query": query, "path": args.get("path", "."), "locations": locations})
+        if locations:
+            gaps.append({"status": "observed", "kind": "source_gap",
+                         "summary": f"Search found source locations for {query!r}; read a matching range for implementation details if they are still needed.",
+                         "tool": tool, "query": query, "locations": locations})
+        else:
+            gaps.append({"status": "observed", "kind": "search_gap",
+                         "summary": f"Search {query!r} found no matches; refine the query or use indexed structure.",
+                         "tool": tool, "query": query, "path": args.get("path", ".")})
+    elif tool.startswith("index_"):
+        payload_key = {"index_files": "files", "index_symbols": "symbols", "index_file_symbols": "symbols",
+                       "index_imports": "imports", "index_status": "index"}.get(tool, "")
+        payload = data.get(payload_key)
+        if isinstance(payload, list):
+            entries = [{key: item.get(key) for key in ("path", "name", "qualname", "kind", "start_line", "end_line", "module", "local_module")}
+                       for item in payload[:12] if isinstance(item, dict)]
+            summary = f"{tool} returned {len(payload)} indexed entr{'y' if len(payload) == 1 else 'ies'}"
+        elif isinstance(payload, dict):
+            entries = {key: payload.get(key) for key in ("file_count", "symbol_count", "git_branch", "git_head", "scanned_at")}
+            summary = f"{tool} returned current repository-index status"
+        else:
+            entries, summary = [], f"{tool} completed"
+        facts.append({"status": "observed", "kind": "repository_index", "summary": _short_text(summary, 600),
+                      "tool": tool, "args": args, "evidence": entries})
+    elif tool == "list_files":
+        files = data.get("files") if isinstance(data.get("files"), list) else []
+        facts.append({"status": "observed", "kind": "file_listing",
+                      "summary": f"Listed {len(files)} file(s) below {args.get('path', '.')}", "tool": tool,
+                      "paths": [item.get("path") for item in files[:20] if isinstance(item, dict)]})
+    elif tool in {"write_file", "apply_patch"}:
+        # Actual changes already have their own hash-bound progress evidence.
+        # Do not duplicate that record as a generic fact.
+        pass
+    else:
+        output = result.get("stdout") if isinstance(result.get("stdout"), str) else ""
+        evidence = {key: _short_text(value, 1_200) for key, value in data.items()
+                    if key in {"output", "diff", "error"} and isinstance(value, str) and value.strip()}
+        facts.append({"status": "observed", "kind": "tool_result",
+                      "summary": _short_text(f"{tool} succeeded" + (f": {output.strip()}" if output.strip() else ""), 900),
+                      "tool": tool, "args": args, "evidence": evidence})
+    return facts, gaps
+
+
+def _record_observed_knowledge(agent: dict[str, Any], facts: list[dict[str, Any]], gaps: list[dict[str, Any]]) -> None:
+    """Merge common tool knowledge and explicitly retain an ineffective repeat."""
+    before = len([item for item in agent["facts"] if isinstance(item, dict)])
+    agent["facts"] = _append_unique(agent["facts"], facts)
+    if facts and len(agent["facts"]) == before:
+        tool = facts[0].get("tool", "tool")
+        agent["facts"] = _append_unique(agent["facts"], [{
+            "status": "observed", "kind": "repeat",
+            "summary": f"The latest successful {tool} action added no new confirmed knowledge; use the retained facts or address an explicit information gap.",
+            "tool": tool,
+        }])
+    agent["information_gaps"] = _append_unique(agent["information_gaps"], gaps)[-32:]
+
+
+def _advance_phase_from_evidence(agent: dict[str, Any], action: dict[str, Any], result: dict[str, Any]) -> None:
+    """Make working phases evidence-based while retaining dynamic backwards research."""
+    if not result.get("ok"):
+        return
+    tool = action.get("tool")
+    if tool in {"list_files", "index_status", "index_files", "index_symbols", "index_file_symbols", "index_imports", "find_python"}:
+        agent["phase"] = "explore"
+    elif tool in {"search_text", "read_file", "read_file_range"}:
+        # A focused read can fill a concrete implementation detail.  Do not
+        # discard a pending implementation decision merely because its source
+        # was reread; a later decision can still return to research explicitly.
+        if agent.get("phase") not in {"implement", "verify"}:
+            agent["phase"] = "implement" if _implementation_intent(agent) else "plan"
+    elif tool in {"write_file", "apply_patch"}:
+        agent["phase"] = "implement"
+    elif tool in {"shell", "git_status", "git_diff"} and (
+        action.get("verification_for") or agent.get("phase") in {"implement", "verify"}
+    ):
+        agent["phase"] = "verify"
+
+
+def _knowledge_mentions_path(item: dict[str, Any], path: str) -> bool:
+    """Identify a path in any compact evidence shape before invalidating changed facts."""
+    if item.get("path") == path:
+        return True
+    source = item.get("source")
+    if isinstance(source, dict) and source.get("path") == path:
+        return True
+    for key in ("locations", "paths"):
+        values = item.get(key)
+        if isinstance(values, list):
+            for value in values:
+                if value == path or (isinstance(value, dict) and value.get("path") == path):
+                    return True
+    return False
+
+
+def _resolve_source_gaps(agent: dict[str, Any], action: dict[str, Any], result: dict[str, Any]) -> None:
+    """Clear source gaps once their cited range is read; expire superseded searches."""
+    if not result.get("ok"):
+        return
+    if action.get("tool") == "search_text":
+        args = action.get("args") if isinstance(action.get("args"), dict) else {}
+        path = args.get("path", ".")
+        # A later focused search supersedes an earlier no-match attempt in the
+        # same location. The zero-match result remains an observed fact, but it
+        # is no longer an actionable information gap.
+        agent["information_gaps"] = [gap for gap in agent.get("information_gaps", []) if not (
+            isinstance(gap, dict) and gap.get("kind") == "search_gap" and gap.get("path", ".") == path
+        )]
+        return
+    if action.get("tool") not in {"read_file", "read_file_range"}:
+        return
+    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    path, start, end = data.get("path"), data.get("start_line"), data.get("captured_end_line", data.get("end_line"))
+    if not isinstance(path, str) or not isinstance(start, int) or not isinstance(end, int):
+        return
+    retained = []
+    for gap in agent.get("information_gaps", []):
+        if not isinstance(gap, dict) or gap.get("kind") != "source_gap":
+            retained.append(gap)
+            continue
+        locations = gap.get("locations")
+        source = gap.get("source") if isinstance(gap.get("source"), dict) else {}
+        location_matches = isinstance(locations, list) and any(
+            isinstance(location, dict) and location.get("path") == path and start <= location.get("line", -1) <= end
+            for location in locations
+        )
+        cited = (source.get("path") == path) or location_matches
+        if not cited:
+            retained.append(gap)
+    agent["information_gaps"] = retained
 
 
 def _record_progress(agent: dict[str, Any], observation: dict[str, Any]) -> None:
@@ -472,7 +895,7 @@ def _record_progress(agent: dict[str, Any], observation: dict[str, Any]) -> None
             finding["end_line"] = data.get("captured_end_line", data.get("last_line", finding["end_line"]))
         if isinstance(finding["path"], str):
             key = (finding["path"], finding["start_line"], finding["end_line"])
-            findings = list(progress.get("findings", []))
+            findings = list(progress.get("sources", []))
             for index, previous in enumerate(findings):
                 if isinstance(previous, dict) and (previous.get("path"), previous.get("start_line"),
                                                    previous.get("end_line")) == key:
@@ -480,12 +903,7 @@ def _record_progress(agent: dict[str, Any], observation: dict[str, Any]) -> None
                     break
             else:
                 findings.append(finding)
-            progress["findings"] = findings
-            agent["findings"] = _append_unique(agent["findings"], [{
-                "status": "observed",
-                "summary": f"Read {finding['path']} lines {finding.get('start_line')}–{finding.get('end_line')}",
-                "source": {key: finding.get(key) for key in ("path", "sha256", "start_line", "end_line")},
-            }])
+            progress["sources"] = findings
     changes = result.get("changes")
     if isinstance(changes, list):
         paths = [item.get("path") for item in changes if isinstance(item, dict) and isinstance(item.get("path"), str)]
@@ -499,18 +917,21 @@ def _record_progress(agent: dict[str, Any], observation: dict[str, Any]) -> None
                     continue
                 path, after_hash = change["path"], change.get("after_hash")
                 # Old source-linked notes are not facts about a changed file.
-                progress["findings"] = [item for item in progress.get("findings", []) if not (
+                progress["sources"] = [item for item in progress.get("sources", []) if not (
                     isinstance(item, dict) and item.get("path") == path and item.get("sha256") != after_hash
                 )]
-                agent["findings"] = [item for item in agent["findings"] if not (
-                    isinstance(item, dict) and item.get("status") == "observed" and
-                    isinstance(item.get("source"), dict) and item["source"].get("path") == path and
-                    item["source"].get("sha256") != after_hash
+                agent["facts"] = [item for item in agent["facts"] if not (
+                    isinstance(item, dict) and _knowledge_mentions_path(item, path) and
+                    (not isinstance(item.get("source"), dict) or item["source"].get("sha256") != after_hash)
                 )]
-                agent["findings"] = _append_unique(agent["findings"], [{
-                    "status": "observed", "summary": f"Wrote {path}",
-                    "source": {"path": path, "sha256": after_hash} if isinstance(after_hash, str) else {},
-                }])
+                agent["information_gaps"] = [item for item in agent.get("information_gaps", []) if not (
+                    isinstance(item, dict) and _knowledge_mentions_path(item, path)
+                )]
+    _resolve_source_gaps(agent, action, result)
+    facts, gaps = _observed_tool_knowledge(action, result)
+    _record_observed_knowledge(agent, facts, gaps)
+    _reconcile_information_gaps(agent)
+    _advance_phase_from_evidence(agent, action, result)
     if not ok:
         progress["errors"] = [*progress.get("errors", []), {"step": observation.get("step"),
                               "tool": action.get("tool"), "error": _short_text(result.get("error", "Tool failed"))}][-12:]
@@ -518,14 +939,6 @@ def _record_progress(agent: dict[str, Any], observation: dict[str, Any]) -> None
         resolved = _string_list(action.get("verification_for"))
         if resolved:
             progress["open_verifications"] = [item for item in progress.get("open_verifications", []) if item not in resolved]
-    if ok:
-        summary = f"{action.get('tool')} succeeded"
-        if agent.get("current_task"):
-            summary = agent["current_task"]
-        agent["completed_tasks"] = _append_unique(agent["completed_tasks"], [{
-            "status": "observed", "summary": _short_text(summary, 600), "step": observation.get("step"),
-            "tool": action.get("tool"),
-        }])
     agent["progress"] = progress
 
 
@@ -548,22 +961,23 @@ def _agent_prompt(state: AgentRunState) -> str:
     agent = state["agent"]
     budget = _model_context_budget() - len(_decision_system_prompt().encode("utf-8")) - _MODEL_PROTOCOL_OVERHEAD_BYTES
     progress = _progress_snapshot(agent)
-    source_coverage = progress.pop("source_coverage", [])
+    plan = [item for item in agent.get("plan", []) if isinstance(item, dict)][-8:]
     prompt = {"task": state["task"], "current_task": agent.get("current_task", ""), "phase": agent.get("phase", "explore"),
               "workspace": state["workspace"],
               "path_rule": "Paths may be workspace-relative or absolute.",
               "shell_environment": "Windows PowerShell (powershell -Command); use PowerShell syntax, never Bash/CMD `||` or `2>nul`.",
-              "working_memory": _work_memory_snapshot(agent), "repository_map": agent.get("repository_map", {}),
-              "plan": agent["plan"], "current_step": agent["current_step"],
-              "progress": progress, "verification": agent["verification"],
-              "source_coverage": source_coverage, "visible_source_coverage": [], "code_findings": [], "previous_observations": []}
+              "code_findings": [], "visible_source_coverage": [],
+              "working_memory": _work_memory_snapshot(agent), "progress": progress, "verification": agent["verification"],
+              "source_coverage": [], "repository_map": _repository_map_snapshot(agent.get("repository_map")),
+              "plan": plan, "current_step": agent["current_step"], "previous_observations": []}
     used = len(json.dumps(prompt, ensure_ascii=False).encode("utf-8"))
-    findings = [finding for finding in agent.get("progress", {}).get("findings", [])
+    findings = [finding for finding in agent.get("progress", {}).get("sources", [])
                 if isinstance(finding, dict) and isinstance(finding.get("content"), str) and finding["content"]]
     prompt["source_coverage"] = _source_coverage(findings)
     used = len(json.dumps(prompt, ensure_ascii=False).encode("utf-8"))
-    findings = _non_overlapping_findings(findings)
+    findings = _select_context_findings(agent, findings)
     retained: list[dict[str, Any]] = []
+    source_sizes: list[int] = []
     if findings:
         headers = []
         for finding in findings:
@@ -579,30 +993,25 @@ def _agent_prompt(state: AgentRunState) -> str:
                            for header in headers)
         available = max(0, budget - used - header_bytes)
         source_sizes = [len(finding["content"].encode("utf-8")) for finding in findings]
-        shares = [min(size, available // len(findings)) for size in source_sizes]
-        available -= sum(shares)
-        while available:
-            expandable = [index for index, size in enumerate(source_sizes) if shares[index] < size]
-            if not expandable:
-                break
-            share = max(1, available // len(expandable))
-            for index in expandable:
-                added = min(source_sizes[index] - shares[index], share, available)
-                shares[index] += added
-                available -= added
+        # Findings are ordered by relevance. Preserve a coherent, current edit
+        # range before spending remaining context on older supporting source.
+        shares = []
+        for size in source_sizes:
+            share = min(size, available)
+            shares.append(share)
+            available -= share
         for finding, header, share in zip(findings, headers, shares):
             item = {**header, "content": finding["content"].encode("utf-8")[:share].decode("utf-8", "ignore")}
             retained.append(item)
         while retained and used + sum(len(json.dumps(item, ensure_ascii=False).encode("utf-8")) for item in retained) > budget:
             overflow = used + sum(len(json.dumps(value, ensure_ascii=False).encode("utf-8")) for value in retained) - budget
-            expandable = [item for item in retained if item["content"]]
+            expandable = [item for item in reversed(retained) if item["content"]]
             if not expandable:
                 retained.pop()
                 continue
-            reduction = max(1, (overflow + len(expandable) - 1) // len(expandable))
-            for item in expandable:
-                content = item["content"].encode("utf-8")
-                item["content"] = content[:max(0, len(content) - reduction)].decode("utf-8", "ignore")
+            item = expandable[0]
+            content = item["content"].encode("utf-8")
+            item["content"] = content[:max(0, len(content) - max(1, overflow))].decode("utf-8", "ignore")
         for item, source_size in zip(retained, source_sizes):
             context_size = len(item["content"].encode("utf-8"))
             item["context_truncated"] = context_size < source_size
@@ -616,15 +1025,25 @@ def _agent_prompt(state: AgentRunState) -> str:
     prompt["visible_source_coverage"] = _source_coverage(retained)
     while retained and len(json.dumps(prompt, ensure_ascii=False).encode("utf-8")) > budget:
         overflow = len(json.dumps(prompt, ensure_ascii=False).encode("utf-8")) - budget
-        expandable = [item for item in retained if item["content"]]
+        expandable = [item for item in reversed(retained) if item["content"]]
         if not expandable:
             retained.pop()
         else:
-            reduction = max(1, (overflow + len(expandable) - 1) // len(expandable))
-            for item in expandable:
-                content = item["content"].encode("utf-8")
-                item["content"] = content[:max(0, len(content) - reduction)].decode("utf-8", "ignore")
-        prompt["visible_source_coverage"] = _source_coverage(retained)
+            item = expandable[0]
+            content = item["content"].encode("utf-8")
+            item["content"] = content[:max(0, len(content) - max(1, overflow))].decode("utf-8", "ignore")
+    # The final JSON-size trim can remove complete lines. Recompute metadata
+    # afterwards so the trace and visible coverage describe the exact content
+    # sent to Ollama, rather than the pre-trim excerpt.
+    for item, source_size in zip(retained, source_sizes):
+        content = item["content"]
+        item["context_truncated"] = len(content.encode("utf-8")) < source_size
+        start_line, end_line = item.get("start_line"), item.get("end_line")
+        if isinstance(start_line, int) and isinstance(end_line, int):
+            observed_end = (start_line + content.count("\n") - 1
+                            if content.endswith("\n") else start_line + content.count("\n"))
+            item["end_line"] = min(end_line, observed_end)
+    prompt["visible_source_coverage"] = _source_coverage(retained)
     used += sum(len(json.dumps(item, ensure_ascii=False).encode("utf-8")) for item in retained)
     used = len(json.dumps(prompt, ensure_ascii=False).encode("utf-8"))
     chosen: list[dict[str, Any]] = []
@@ -636,7 +1055,7 @@ def _agent_prompt(state: AgentRunState) -> str:
         item = {"step": observation.get("step"), "tool": action.get("tool"), "ok": bool(result.get("ok"))}
         if not result.get("ok"):
             item["error"] = _short_text(result.get("error", "Tool failed"))
-        elif action.get("tool") == "write_file":
+        elif action.get("tool") in {"write_file", "apply_patch"}:
             item["changes"] = result.get("changes", [])
         else:
             item["data"] = result.get("data", {})
@@ -649,6 +1068,80 @@ def _agent_prompt(state: AgentRunState) -> str:
         used += len(encoded)
     prompt["previous_observations"] = list(reversed(chosen))
     return json.dumps(prompt, ensure_ascii=False)
+
+
+def _fact_markers(agent: dict[str, Any]) -> set[str]:
+    """Identify the confirmed facts available before or after one tool action."""
+    return {
+        json.dumps(_compact_memory_item(item), ensure_ascii=False, sort_keys=True)
+        for item in agent.get("facts", [])
+        if isinstance(item, dict) and item.get("status") == "observed" and item.get("kind") != "repeat"
+    }
+
+
+def _action_signature(action: dict[str, Any] | None) -> str | None:
+    if not isinstance(action, dict):
+        return None
+    tool = action.get("tool")
+    args = action.get("args")
+    if not isinstance(tool, str) or not isinstance(args, dict):
+        return None
+    return json.dumps({"tool": tool, "args": args}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _trace_context(prompt: str, system: str) -> dict[str, Any]:
+    """Record the decision-relevant portions of the exact serialized prompt."""
+    payload = json.loads(prompt)
+    memory = payload.get("working_memory") if isinstance(payload.get("working_memory"), dict) else {}
+    excerpts = []
+    for item in payload.get("code_findings", []):
+        if not isinstance(item, dict):
+            continue
+        content = item.get("content") if isinstance(item.get("content"), str) else ""
+        excerpts.append({
+            **{key: item.get(key) for key in ("path", "start_line", "end_line", "sha256", "context_truncated") if key in item},
+            "content_chars": len(content),
+            "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        })
+    return {
+        "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        "prompt_bytes": len(prompt.encode("utf-8")),
+        "system_sha256": hashlib.sha256(system.encode("utf-8")).hexdigest(),
+        "system_bytes": len(system.encode("utf-8")),
+        "task": payload.get("task"),
+        "current_task": payload.get("current_task"),
+        "phase": payload.get("phase"),
+        "confirmed_facts": memory.get("confirmed_facts", []),
+        "model_decisions": memory.get("decisions", []),
+        "information_gaps": memory.get("information_gaps", []),
+        "visible_source_coverage": payload.get("visible_source_coverage", []),
+        "source_excerpts": excerpts,
+        "open_verifications": payload.get("progress", {}).get("open_verifications", []),
+    }
+
+
+def _trace_result(result: dict[str, Any]) -> dict[str, Any]:
+    """Keep the tool outcome diagnostic without duplicating full captured output."""
+    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    return {
+        "ok": bool(result.get("ok")),
+        "exit_code": result.get("exit_code"),
+        "duration_ms": result.get("duration_ms"),
+        "error": _short_text(result.get("error", ""), 800),
+        "changes": result.get("changes", []),
+        "data_keys": sorted(data)[:24],
+    }
+
+
+def _emit_model_thinking(*, trace_id: str, step: int) -> None:
+    """Expose only the separate Ollama thinking field when the server supplied it."""
+    response = _LAST_MODEL_RESPONSE.get()
+    if not isinstance(response, dict) or not response.get("thinking_available"):
+        _emit_event("model_thinking", trace_id=trace_id, step=step, model=MODEL,
+                    available=False, reason="Ollama response did not contain message.thinking")
+        return
+    _emit_event("model_thinking", trace_id=trace_id, step=step, model=MODEL, available=True,
+                thinking=response.get("thinking", ""), truncated=bool(response.get("thinking_truncated")))
 
 
 def _agent_action(decision: dict[str, Any], workspace: str, project_id: str | None = None) -> dict[str, Any] | None:
@@ -696,13 +1189,36 @@ def agent_decide(state: AgentRunState) -> dict[str, Any]:
     agent["progress"] = dict(agent.get("progress") or {})
     agent["verification"] = dict(agent.get("verification") or {})
     _ensure_work_memory(agent)
+    _reconcile_information_gaps(agent)
+    _reconcile_work_phase(agent)
     if not agent["repository_map"]:
         agent["repository_map"] = _repository_map(agent, state["workspace"], state["task"])
+    system = _decision_system_prompt()
+    prompt = _agent_prompt(state)
+    step = agent["current_step"] + 1
+    run_id = os.environ.get("REAPER_API_RUN_ID")
+    trace_id = f"{run_id or 'local'}:{step}"
+    previous = agent["observations"][-1] if agent["observations"] else {}
+    previous_action = previous.get("action") if isinstance(previous, dict) else None
+    trace = {
+        "trace_id": trace_id, "run_id": run_id, "step": step, "model": MODEL,
+        "context": _trace_context(prompt, system), "phase_before": agent.get("phase"),
+        "previous_action": {"step": previous.get("step"), "action": previous_action}
+        if isinstance(previous_action, dict) else None,
+        "_fact_markers": sorted(_fact_markers(agent)),
+        "_previous_action_signature": _action_signature(previous_action),
+    }
+    _LAST_MODEL_RESPONSE.set(None)
     try:
-        decision = ask_json(_decision_system_prompt(), _agent_prompt(state))
+        decision = ask_json(system, prompt)
     except (RunBudgetExceeded, httpx.TimeoutException):
         raise
     except Exception as exc:
+        error = f"Agent decision failed: {exc}"
+        _emit_model_thinking(trace_id=trace_id, step=step)
+        _emit_event("decision_trace", trace_state="decision", trace_id=trace_id, run_id=run_id, step=step,
+                    model=MODEL, context=trace["context"], phase_before=trace["phase_before"],
+                    decision_kind="invalid", reason=error, action=None)
         return _decision_error(agent, f"Agent decision failed: {exc}")
     plan = decision.get("plan")
     if isinstance(plan, list) and plan and all(isinstance(item, dict) for item in plan):
@@ -712,7 +1228,11 @@ def agent_decide(state: AgentRunState) -> dict[str, Any]:
     reason = _short_text(decision.get("reason", ""))
     agent["progress"]["last_reason"] = reason
     kind = decision.get("kind")
+    _emit_model_thinking(trace_id=trace_id, step=step)
     if kind == "final":
+        _emit_event("decision_trace", trace_state="decision", trace_id=trace_id, run_id=run_id, step=step,
+                    model=MODEL, context=trace["context"], phase_before=trace["phase_before"],
+                    decision_kind="final", reason=reason, action=None)
         successful = any(observation.get("result", {}).get("ok") for observation in agent["observations"])
         if not successful:
             return _decision_error(agent, "Agent attempted final report without successful tool evidence")
@@ -731,6 +1251,9 @@ def agent_decide(state: AgentRunState) -> dict[str, Any]:
                     progress=_progress_snapshot(agent), verification_status=verification["status"])
         return {"agent": agent, "status": "agent_finalizing", "error": ""}
     if kind != "action":
+        _emit_event("decision_trace", trace_state="decision", trace_id=trace_id, run_id=run_id, step=step,
+                    model=MODEL, context=trace["context"], phase_before=trace["phase_before"],
+                    decision_kind="invalid", reason=reason or "Agent decision must be an action or final report", action=None)
         return _decision_error(agent, "Agent decision must be an action or final report")
     open_points = _string_list(decision.get("open_verifications"))
     if open_points is not None:
@@ -739,9 +1262,21 @@ def agent_decide(state: AgentRunState) -> dict[str, Any]:
         repository_map = agent.get("repository_map") if isinstance(agent.get("repository_map"), dict) else {}
         action = _agent_action(decision, state["workspace"], repository_map.get("project_id"))
     except ValueError as exc:
+        _emit_event("decision_trace", trace_state="decision", trace_id=trace_id, run_id=run_id, step=step,
+                    model=MODEL, context=trace["context"], phase_before=trace["phase_before"],
+                    decision_kind="invalid", reason=str(exc), action=None)
         return _decision_error(agent, str(exc))
     if action is None:
+        _emit_event("decision_trace", trace_state="decision", trace_id=trace_id, run_id=run_id, step=step,
+                    model=MODEL, context=trace["context"], phase_before=trace["phase_before"],
+                    decision_kind="invalid", reason="Agent action requires a tool name and object arguments", action=None)
         return _decision_error(agent, "Agent action requires a tool name and object arguments")
+    trace["action"] = {"tool": action["tool"], "args": action["args"]}
+    trace["reason"] = reason
+    agent["pending_decision_trace"] = trace
+    _emit_event("decision_trace", trace_state="decision", trace_id=trace_id, run_id=run_id, step=step,
+                model=MODEL, context=trace["context"], phase_before=trace["phase_before"],
+                decision_kind="action", reason=reason, action=trace["action"])
     agent["next_action"] = action
     _emit_event("agent_decision", decision_kind="action", tool=action["tool"], step=agent["current_step"] + 1,
                 reason=reason, progress=_progress_snapshot(agent),
@@ -774,11 +1309,38 @@ def agent_observe(state: AgentRunState) -> dict[str, Any]:
     if not isinstance(action, dict) or not isinstance(result, dict):
         return {"status": "agent_failed", "error": "Agent observation lacks action or result"}
     observation = {"step": agent["current_step"] + 1, "action": action, "result": result}
+    _record_progress(agent, observation)
+    # A successful source read is retained once in progress.sources.  Historical
+    # observations keep its metadata for recovery and diagnostics, not a second
+    # complete copy of the same text.
+    if action.get("tool") in {"read_file", "read_file_range"}:
+        historical_result = dict(result)
+        historical_data = dict(result.get("data") or {})
+        historical_data.pop("content", None)
+        historical_result["data"] = historical_data
+        observation = {**observation, "result": historical_result}
     observations = [*agent["observations"], observation]
     agent["observations"] = observations
     agent["current_step"] += 1
     agent["next_action"] = None
-    _record_progress(agent, observation)
+    trace = agent.get("pending_decision_trace")
+    if isinstance(trace, dict):
+        before = set(trace.get("_fact_markers", [])) if isinstance(trace.get("_fact_markers"), list) else set()
+        after = _fact_markers(agent)
+        new_facts = [json.loads(marker) for marker in sorted(after - before)]
+        signature = _action_signature(action)
+        previous_signature = trace.get("_previous_action_signature")
+        _emit_event(
+            "decision_trace", trace_state="result", trace_id=trace.get("trace_id"),
+            run_id=trace.get("run_id"), step=observation["step"], model=trace.get("model", MODEL),
+            tool_result=_trace_result(result), information_gain={
+                "new_confirmed_facts": new_facts,
+                "new_fact_count": len(new_facts),
+                "repeated_action": bool(signature and signature == previous_signature),
+            }, phase_before=trace.get("phase_before"), phase_after=agent.get("phase"),
+            strategy_changed=bool(signature and previous_signature and signature != previous_signature),
+        )
+        agent["pending_decision_trace"] = None
     _emit_event("agent_observation", step=agent["current_step"], tool=action.get("tool"), ok=result.get("ok"))
     return {"agent": agent, "status": "agent_observed", "error": "", "details": observations,
             "last_result": None}

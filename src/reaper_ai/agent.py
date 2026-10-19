@@ -26,11 +26,11 @@ class AgentState(TypedDict):
     budgets: dict[str, int]
     phase: str
     current_task: str
-    findings: list[dict[str, Any]]
+    facts: list[dict[str, Any]]
     decisions: list[dict[str, Any]]
-    open_questions: list[dict[str, Any]]
-    completed_tasks: list[dict[str, Any]]
+    information_gaps: list[dict[str, Any]]
     repository_map: dict[str, Any]
+    pending_decision_trace: dict[str, Any] | None
 
 
 class ToolAction(TypedDict):
@@ -136,17 +136,17 @@ def new_agent_state() -> AgentState:
             "open_verifications": [],
             "errors": [],
             "last_reason": "",
-            "findings": [],
+            "sources": [],
         },
         "verification": {"status": "not_started", "checks": []},
         "budgets": {"tool_calls": 0},
         "phase": "explore",
         "current_task": "",
-        "findings": [],
+        "facts": [],
         "decisions": [],
-        "open_questions": [],
-        "completed_tasks": [],
+        "information_gaps": [],
         "repository_map": {},
+        "pending_decision_trace": None,
     }
 
 
@@ -210,6 +210,24 @@ def dispatch_tool(action: ToolAction | dict[str, Any]) -> ToolResult:
                     refresh_project_index(store, project)
                 except (RepositoryIndexError, StorageError, ValueError) as exc:
                     raw = {**raw, "index_refresh_error": str(exc)}
+        elif tool_name == "apply_patch":
+            path = args.get("path")
+            expected_text = args.get("expected_text")
+            replacement = args.get("replacement")
+            if not isinstance(path, str) or not path:
+                raise ValueError("apply_patch requires a file path")
+            if not isinstance(expected_text, str) or not expected_text:
+                raise ValueError("apply_patch requires non-empty expected_text")
+            if not isinstance(replacement, str):
+                raise ValueError("apply_patch requires text replacement")
+            raw = tools.apply_patch(workspace, path=path, expected_text=expected_text,
+                                    replacement=replacement, expected_hash=args.get("expected_hash"))
+            if raw.get("ok") and raw.get("changed"):
+                try:
+                    store, project = _index_store(action, workspace)
+                    refresh_project_index(store, project)
+                except (RepositoryIndexError, StorageError, ValueError) as exc:
+                    raw = {**raw, "index_refresh_error": str(exc)}
         elif tool_name == "index_files":
             store, _ = _index_store(action, workspace)
             raw = {"ok": True, "files": store.list_index_files(
@@ -257,7 +275,7 @@ def dispatch_tool(action: ToolAction | dict[str, Any]) -> ToolResult:
 
         ok = bool(raw.get("ok"))
         changes = []
-        if tool_name == "write_file" and ok and raw.get("changed"):
+        if tool_name in {"write_file", "apply_patch"} and ok and raw.get("changed"):
             changes = [{
                 "path": raw.get("path"),
                 "before_hash": raw.get("before_hash"),

@@ -221,21 +221,25 @@ def read_file_range(workspace: str, path: str, start_line: int, end_line: int,
 
 def search_text(workspace: str, query: str, path: str = ".", max_results: int | None = None,
                 case_sensitive: bool = False) -> dict:
-    """Search UTF-8 project text line-by-line and return source locations, not whole files."""
+    """Search one UTF-8 text file or every regular file below a directory."""
     try:
         if not isinstance(query, str) or not query:
             raise ValueError("Search query must not be empty")
         if max_results is not None and (not isinstance(max_results, int) or max_results < 1):
             raise ValueError("max_results must be positive when supplied")
-        directory = _workspace_target(workspace, path, allow_root=True)
-        if not directory.is_dir():
-            raise ValueError("Search path is not a directory")
+        target = _workspace_target(workspace, path, allow_root=True)
+        if target.is_file():
+            targets = [target]
+        elif target.is_dir():
+            targets = _iter_regular_files(target, workspace)
+        else:
+            raise ValueError("Search path is neither a file nor a directory")
         needle = query if case_sensitive else query.casefold()
         matches = []
         truncated = False
-        for target in _iter_regular_files(directory, workspace):
+        for file_target in targets:
             try:
-                with target.open("r", encoding="utf-8") as source:
+                with file_target.open("r", encoding="utf-8") as source:
                     for line_number, line in enumerate(source, start=1):
                         haystack = line if case_sensitive else line.casefold()
                         if needle not in haystack:
@@ -243,7 +247,7 @@ def search_text(workspace: str, query: str, path: str = ".", max_results: int | 
                         if max_results is not None and len(matches) >= max_results:
                             truncated = True
                             break
-                        matches.append({"path": _display_path(workspace, target), "line": line_number,
+                        matches.append({"path": _display_path(workspace, file_target), "line": line_number,
                                         "text": line.rstrip("\r\n")[:500]})
             except (OSError, UnicodeError):
                 continue
@@ -283,6 +287,41 @@ def write_file(workspace: str, path: str, content: str,
                 "before_hash": before_hash, "after_hash": _sha256(content),
                 "changed": before_hash != _sha256(content)}
     except (OSError, ValueError) as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def apply_patch(workspace: str, path: str, expected_text: str, replacement: str,
+                expected_hash: str | None = None) -> dict:
+    """Replace one exact text occurrence in an existing UTF-8 file.
+
+    The original file hash and the unique expected text make the write
+    conflict-safe without transferring the complete file to the model.
+    """
+    try:
+        if not isinstance(expected_text, str) or not expected_text:
+            raise ValueError("apply_patch requires non-empty expected_text")
+        if not isinstance(replacement, str):
+            raise ValueError("apply_patch requires text replacement")
+        target = _file(workspace, path)
+        if not target.exists() or not target.is_file():
+            return {"ok": False, "error": "apply_patch requires an existing regular file"}
+        content = target.read_text(encoding="utf-8")
+        before_hash = _sha256(content)
+        if not isinstance(expected_hash, str) or not expected_hash:
+            return {"ok": False, "error": "Existing file requires expected_hash from a prior read"}
+        if expected_hash != before_hash:
+            return {"ok": False, "error": "Source hash conflict: file changed since it was read"}
+        first = content.find(expected_text)
+        if first < 0:
+            return {"ok": False, "error": "Expected text was not found"}
+        if content.find(expected_text, first + 1) >= 0:
+            return {"ok": False, "error": "Expected text must occur exactly once"}
+        updated = content[:first] + replacement + content[first + len(expected_text):]
+        target.write_text(updated, encoding="utf-8")
+        after_hash = _sha256(updated)
+        return {"ok": True, "path": _display_path(workspace, target), "bytes": target.stat().st_size,
+                "before_hash": before_hash, "after_hash": after_hash, "changed": before_hash != after_hash}
+    except (OSError, UnicodeError, ValueError) as exc:
         return {"ok": False, "error": str(exc)}
 
 

@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field
 from reaper_ai.persistence import StorageError, Store
 from reaper_ai.repository_index import RepositoryIndexError, refresh_project_index
 
-app = FastAPI(title="REAPER-AI", version="0.4.0")
+app = FastAPI(title="REAPER-AI", version="0.5.0")
 _lock = threading.Lock()
 _runs: dict[str, dict] = {}
 _active: str | None = None
@@ -340,6 +340,15 @@ def get_index_imports(project_id: str, path: str | None = None):
     _refresh_index(_project_or_404(project_id))
     try:
         return {"imports": _store.index_imports(project_id, path)}
+    except StorageError as exc:
+        raise _storage_failure(exc) from exc
+
+
+@app.get("/projects/{project_id}/index/top-python-files")
+def get_top_python_files(project_id: str):
+    _refresh_index(_project_or_404(project_id))
+    try:
+        return {"files": _store.top_python_files_by_symbols(project_id, limit=5)}
     except StorageError as exc:
         raise _storage_failure(exc) from exc
 

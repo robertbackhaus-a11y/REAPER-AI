@@ -539,6 +539,22 @@ class Store:
             raise StorageError(f"Could not load file imports: {exc}") from exc
         return [dict(row) for row in rows]
 
+    def top_python_files_by_symbols(self, project_id: str, limit: int = 5) -> list[dict]:
+        try:
+            with self._connect() as connection:
+                rows = connection.execute(
+                    "SELECT f.path AS path, COUNT(*) AS symbol_count "
+                    "FROM project_index_files AS f "
+                    "JOIN project_index_symbols AS s ON s.project_id = f.project_id AND s.path = f.path "
+                    "WHERE f.project_id = ? AND f.language = 'python' "
+                    "GROUP BY f.path "
+                    "ORDER BY symbol_count DESC, f.path ASC LIMIT ?",
+                    (project_id, limit),
+                ).fetchall()
+        except sqlite3.Error as exc:
+            raise StorageError(f"Could not query top Python files by symbols: {exc}") from exc
+        return [dict(row) for row in rows]
+
     def create_conversation(
         self, *, workspace: str | None = None, model: str | None = None, title: str | None = None,
         project_id: str | None = None,

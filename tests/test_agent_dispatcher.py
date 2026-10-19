@@ -196,7 +196,8 @@ class AgentDispatcherTests(unittest.TestCase):
                 self.assertEqual(checkpoint["state"]["agent"]["phase"], "verify")
                 self.assertEqual(checkpoint["state"]["agent"]["current_task"], "Verify the corrected value")
                 self.assertTrue(any(item["status"] == "proposed" for item in checkpoint["state"]["agent"]["decisions"]))
-                self.assertTrue(any(item["status"] == "observed" for item in checkpoint["state"]["agent"]["completed_tasks"]))
+                self.assertTrue(any(item["status"] == "observed" for item in checkpoint["state"]["agent"]["facts"]))
+                self.assertIn("sources", checkpoint["state"]["agent"]["progress"])
                 self.assertIsNotNone(checkpoint["state"]["agent"]["progress"]["last_change"])
                 self.assertLess(prompt.index('"working_memory"'), prompt.index('"progress"'))
                 decision_events = [payload for event, payload in events if event == "agent_decision"]

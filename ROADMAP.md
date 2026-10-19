@@ -1,7 +1,7 @@
 # REAPER-AI — Development Roadmap
 
-**Version target:** 0.4.0
-**Status:** M0–M4, M5/P01–P03, and M6/P01–P06 iterative-agent work implemented with documented limitations.
+**Version target:** 0.5.0
+**Status:** M0–M4, M5/P01–P03, M6/P01–P06, P0 targeted edits, and P1 working-memory consolidation implemented with documented limitations.
 **Architecture baseline:** [ARCHITECTURE.md](ARCHITECTURE.md) (approved)  
 **Target:** Windows 11, local single-user autonomous coding agent  
 **Technology decisions:** Python, embedded LangGraph, Ollama, FastAPI, SSE, custom HTML/CSS/vanilla JavaScript UI  
@@ -285,13 +285,33 @@ The initial deliverable is **one dependable agent**. Multi-agent delegation and 
 #### BUG-012 implementation checkpoint — 2026-10-19
 
 - **Evidence-based progress:** each observed tool result updates a compact, checkpointed snapshot of the last attributable change, recent checks and their outcomes, open verification points, and recent errors. The snapshot is supplied before the compact observation history, so a newly requested decision retains prior successful checks even when older tool output is abbreviated. A verifying action can name exact open points; only a successful result clears those points.
-- **Decision contract and diagnostics:** action decisions can state a short reason and open verification points; final decisions explicitly state why work and verification are complete. Existing action/final JSON remains accepted for compatibility. Malformed or otherwise invalid decisions become a corrective `model_decision` observation. Persisted decision events record the decision type, tool/final choice, short reason, and progress/verification status without retaining complete model prose.
+- **Decision contract and diagnostics:** action decisions can state a short reason and open verification points; final decisions explicitly state why work and verification are complete. Existing action/final JSON remains accepted for compatibility. Malformed or otherwise invalid decisions become a corrective `model_decision` observation. Persisted `decision_trace` events record the actual prompt hash/size, presented facts/decisions/gaps/source ranges, choice, and the subsequent tool outcome/information gain; separate `model_thinking` events retain only an Ollama-provided `message.thinking` field and explicitly mark its absence.
 - **Focused verification:** one deterministic temporary coding run performed an actual read, an initial guarded write, a failing PowerShell content check, a reread and corrected guarded write, then a successful repeated PowerShell check and `agent_finalize`. It also verified that the successful check and the failed-check error survive in checkpointed progress and that explicit recovery resumes at the final decision without replaying the six completed tool actions.
 
 #### BUG-016 implementation checkpoint — 2026-10-19
 
 - **Retained source evidence:** successful whole-file and line-range reads now add hash- and position-bound `code_findings` to the existing checkpointed progress state. The next decision receives these findings before compact action history, while an exact reread updates its existing finding rather than accumulating duplicate history. This is context retention only; it does not prohibit repeated reads or impose an iteration limit.
 - **Verification evidence:** an explicit verification point closes only when a successful action identifies it through `verification_for`; a failed result leaves it open and a subsequent `final` decision is rejected as corrective model evidence.
+
+#### BUG-019 phase 2 implementation checkpoint — 2026-10-19
+
+- **File-scoped search:** `search_text` now accepts either one UTF-8 text file or a directory tree, matching the agent tool contract and returning the same path/line result format for both.
+- **Observed source facts:** successful reads derive compact, checkpointed facts about Python declarations, signatures, and imports with their source path, hash, and line span. They remain distinct from model-proposed findings and are prioritized before proposed notes and historical observations in the next decision prompt. Existing coverage still describes read ranges without banning a justified reread; writes invalidate stale old-hash source facts.
+- **Independent acceptance:** the requested `top-python-files` endpoint was intentionally kept outside this fix and later passed the separate end-to-end acceptance run recorded below.
+
+#### P0 targeted file edits — 2026-10-19
+
+- **Implemented:** `apply_patch(path, expected_text, replacement, expected_hash)` performs one exact, hash-bound replacement in an existing UTF-8 text file. It reads the file locally, writes only when the expected source hash matches and the original text occurs exactly once, and returns before/after hashes plus normal change evidence. `write_file` remains available for new files and whole-file replacements.
+
+#### P1 working-memory consolidation — 2026-10-19
+
+- **Implemented:** active run state now separates confirmed facts, hash-bound sources, changes, and verification instead of retaining source text in both read observations and source findings. Prompt-visible coverage is derived only from the selected excerpts. Older checkpoint fields are compactly normalized on use; SQLite schema and recovery routing remain unchanged.
+
+#### Sentinel acceptance test 2 — passed — 2026-10-19
+
+- **Result:** Run `f852b6ce174e` resumed from its valid checkpoint and completed with exit code 0. Sentinel used hash-bound `apply_patch` to add the project-scoped `top-python-files` Store query and FastAPI route, corrected its own failed verification script, then used the REAPER Venv FastAPI `TestClient` to obtain HTTP 200 with real repository-index data.
+- **Scope:** This is one complete, observed end-to-end coding workflow. It does not establish general reliability for all coding tasks.
+- **Model decision setting:** Ollama decision requests use `think: false`; the tested Qwen configuration otherwise sometimes returned thinking without JSON content.
 
 #### Sentinel decision-contract refinement — 2026-10-19
 
@@ -375,7 +395,7 @@ Known limitations are documented in ARCHITECTURE.md. Full functional correctness
 
 **Next milestone:** M6/D01 — real-world acceptance of the autonomous iterative agent.
 
-**Release preparation:** v0.4.0 documentation and package metadata prepared; commit, tag, push, and release remain explicit user actions.
+**Release preparation:** v0.5.0 documentation and package metadata prepared; commit, tag, push, and release remain explicit user actions.
 
 ## Variante B — Multi-project repository work
 
@@ -395,15 +415,16 @@ Known limitations are documented in ARCHITECTURE.md. Full functional correctness
 
 ### Step 3 — Hybrid run working memory (implemented)
 
-- Existing checkpointed agent state now preserves the current phase/subtask, model-proposed technical notes, decisions and questions, plus tool-observed completed steps.
-- Model notes are never promoted to file-change or verification facts. Source-linked observed notes retain file path and SHA-256 and are invalidated when that file is successfully changed.
-- The planner receives this compact memory before factual progress, observations and code findings; recovery applies defaults to checkpoints written before these fields existed.
+- Existing checkpointed agent state preserves current phase/subtask, confirmed tool facts, model-proposed decisions, and explicit information gaps. Sources, changes, and verification have dedicated existing progress fields.
+- Model notes are never promoted to file-change or verification facts. Source-linked facts retain file path and SHA-256 and are invalidated when that file is successfully changed.
+- The planner receives selected source excerpts, facts, decisions, gaps, and verification before compact historical tool metadata; recovery normalizes checkpoints written with the older overlapping fields.
 
 ### Step 4 — Sentinel integration (implemented)
 
 - Project runs carry a compact, checkpointed repository map with task-ranked file metadata, relevant Python symbols/imports, and index status; source text is never added to this map.
 - Sentinel can query the existing project index for files, symbols, per-file symbols, imports, and status, then use `read_file_range` for source. Successful writes refresh that same index.
-- The prompt and decision contract guide dynamic `explore → plan → implement → verify` work without adding a second agent graph, database, vector store, or fixed tool/read limits. Legacy workspace-only runs retain their existing behavior without an index map.
+- A common checkpointed observation path records typed facts from reads, searches, index navigation, changes, and checks, plus concrete information gaps. Prompt context prioritizes this evidence before generic tool history; source coverage remains separate from search hints.
+- The prompt and decision contract guide dynamic `explore → plan → implement → verify` work without adding a second agent graph, database, vector store, or fixed tool/read limits. Reached phases are advanced from successful tool evidence rather than model declaration alone. Context selection compacts historical evidence, preserves coherent task-relevant source ranges, retires superseded no-match searches, and does not demote a concrete implementation task solely because it performs a focused read. Legacy workspace-only runs retain their existing behavior without an index map.
 
 ### Step 5 — Multi-project GUI (implemented)
 
