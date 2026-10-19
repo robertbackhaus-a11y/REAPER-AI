@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Robert Backhaus
+
 """Windows process-tree supervisor for REAPER-AI.
 
 Runs the LangGraph engine in a Windows Job Object. Closing the job kills any

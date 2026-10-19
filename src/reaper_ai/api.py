@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Robert Backhaus
+
 """Local, single-user run API with SQLite conversation and run history."""
 
 import json

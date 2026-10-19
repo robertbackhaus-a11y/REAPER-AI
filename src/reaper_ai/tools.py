@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Robert Backhaus
+
 """Local file and Git tools for REAPER-AI."""
 
 from pathlib import Path

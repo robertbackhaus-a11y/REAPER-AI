@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Robert Backhaus
+
 """Small SQLite store for local conversation, run history, and recovery checkpoints."""
 
 from __future__ import annotations

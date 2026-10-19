@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Robert Backhaus
+
 """Shared state and deterministic dispatch for the iterative Sentinel agent."""
 
 from __future__ import annotations

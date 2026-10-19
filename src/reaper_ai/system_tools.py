@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Robert Backhaus
+
 """System-level tools for REAPER-AI: shell execution and Python discovery."""
 
 import subprocess

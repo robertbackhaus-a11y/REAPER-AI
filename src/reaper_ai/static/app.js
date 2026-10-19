@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Robert Backhaus
+
 'use strict';
 
 const $=id=>document.getElementById(id);

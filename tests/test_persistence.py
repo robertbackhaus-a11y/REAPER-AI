@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Robert Backhaus
+
 import unittest
 import uuid
 import sqlite3

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Robert Backhaus
+
 """REAPER-AI iterative LangGraph tool agent with persisted recovery points."""
 
 import argparse

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 Robert Backhaus
+
 """Incremental, project-scoped repository metadata and Python symbol index."""
 
 from __future__ import annotations
