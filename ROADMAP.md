@@ -311,6 +311,7 @@ The initial deliverable is **one dependable agent**. Multi-agent delegation and 
 - **BUG-014 — completed:** `write_file` receives its content only from structured action arguments; normalized tool-result metadata is not file content.
 - **BUG-015 — no repository evidence:** no implementation entry or source reference for this identifier exists in the current repository, so it is not claimed as completed.
 - **BUG-016 — completed:** hash- and position-bound `code_findings` survive checkpointing and are supplied before compact historical observations; the planner shares its source budget across findings so their order cannot exclude an already-read file from model context. Empty line ranges are reported as errors, and overlapping source evidence is reduced to the newest range for the same source hash.
+- **BUG-017 — completed:** dispatcher capture limits now mark truncated whole-file reads explicitly, retain original/captured lengths and the captured line span, and carry that evidence through findings and prompt excerpts. A planner can therefore request the next uncovered range rather than mistaking a 12,000-character capture for a complete file.
 
 #### Post-M6 technical cleanup — 2026-10-18
 

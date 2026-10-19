@@ -192,7 +192,8 @@ def _record_progress(agent: dict[str, Any], observation: dict[str, Any]) -> None
     }][-12:]
     data = result.get("data") if isinstance(result.get("data"), dict) else {}
     if ok and action.get("tool") in {"read_file", "read_file_range"} and isinstance(data.get("content"), str) and data["content"]:
-        finding = {key: data.get(key) for key in ("path", "start_line", "end_line", "sha256", "content")}
+        finding = {key: data.get(key) for key in ("path", "start_line", "end_line", "sha256", "content",
+                                                    "truncated", "original_length", "captured_length")}
         if action.get("tool") == "read_file_range":
             finding["end_line"] = data.get("captured_end_line", data.get("last_line", finding["end_line"]))
         if isinstance(finding["path"], str):
@@ -263,7 +264,8 @@ def _agent_prompt(state: AgentRunState) -> str:
     if findings:
         headers = []
         for finding in findings:
-            header = {key: finding.get(key) for key in ("path", "start_line", "end_line", "sha256")}
+            header = {key: finding.get(key) for key in ("path", "start_line", "end_line", "sha256",
+                                                          "truncated", "original_length", "captured_length")}
             if isinstance(header["start_line"], int) and isinstance(header["end_line"], int):
                 content = finding["content"]
                 observed_end = (header["start_line"] + content.count("\n") - 1
@@ -298,6 +300,15 @@ def _agent_prompt(state: AgentRunState) -> str:
             for item in expandable:
                 content = item["content"].encode("utf-8")
                 item["content"] = content[:max(0, len(content) - reduction)].decode("utf-8", "ignore")
+        for item, source_size in zip(retained, source_sizes):
+            context_size = len(item["content"].encode("utf-8"))
+            item["context_truncated"] = context_size < source_size
+            start_line, end_line = item.get("start_line"), item.get("end_line")
+            if isinstance(start_line, int) and isinstance(end_line, int):
+                content = item["content"]
+                observed_end = (start_line + content.count("\n") - 1
+                                if content.endswith("\n") else start_line + content.count("\n"))
+                item["end_line"] = min(end_line, observed_end)
     prompt["code_findings"] = retained
     used += sum(len(json.dumps(item, ensure_ascii=False).encode("utf-8")) for item in retained)
     chosen: list[dict[str, Any]] = []

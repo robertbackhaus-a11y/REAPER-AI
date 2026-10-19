@@ -164,16 +164,13 @@ def read_file(workspace: str, path: str, max_chars: int | None = None) -> dict:
         content = target.read_text(encoding="utf-8")
         shown_path = _display_path(workspace, target)
         digest = _sha256(content)
+        shown = content if max_chars is None else content[:max_chars]
+        captured_end_line = (shown.count("\n") if shown.endswith("\n") else shown.count("\n") + 1)
+        metadata = {"path": shown_path, "start_line": 1, "end_line": captured_end_line,
+                    "original_length": len(content), "captured_length": len(shown), "sha256": digest}
         if max_chars is not None and len(content) > max_chars:
-            return {
-                "ok": True,
-                "path": shown_path,
-                "content": content[:max_chars],
-                "truncated": True,
-                "sha256": digest,
-            }
-        return {"ok": True, "path": shown_path, "content": content, "truncated": False,
-                "sha256": digest}
+            return {"ok": True, **metadata, "content": shown, "truncated": True}
+        return {"ok": True, **metadata, "content": shown, "truncated": False}
     except (OSError, UnicodeError, ValueError) as exc:
         return {"ok": False, "error": str(exc)}
 
