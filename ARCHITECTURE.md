@@ -34,7 +34,7 @@ The former REAPER-AI v0.x implementation is **not** an architectural baseline. T
 - **Evidence over claims.** A model's statement is not proof that a file changed or a check passed.
 - **Deterministic control, model-driven engineering.** Python determines allowed transitions, limits, and evidence collection; the model performs technical reasoning and proposes actions.
 - **Local and single-user.** No accounts, tenants, role management, cloud orchestration, or enterprise platform layers.
-- **Small, bounded work.** Focused repository inspection, limited execution attempts, and targeted verification rather than repeated full scans.
+- **Focused, budgeted work.** Focused repository inspection and targeted verification use wall-time and prompt/output budgets without fixed tool, file, or repair-attempt caps.
 - **Explicit failure.** A task that cannot be completed must finish with a precise explanation rather than a fabricated success.
 - **Minimal dependencies and clear boundaries.** Prefer mature libraries where they replace real infrastructure work; do not recreate an agent framework.
 - **No implicit publishing.** No automatic commits, pushes, tags, releases, deployments, or destructive repository operations.
@@ -167,7 +167,7 @@ The model can propose findings, a plan, and tool requests; the **engine owns cou
 
 ### M6/P01 agent foundation (implemented)
 
-`reaper_ai.agent.AgentState` is a compact, JSON-serializable state for every new run. It holds only the plan/current step, next action, compact observations, verification state, and tool-call accounting. Immutable task and workspace context remain in the enclosing LangGraph state; file hashes remain with individual guarded write actions. The existing SQLite checkpoint already stores the complete engine state, so no second persistence store or checkpoint mechanism is introduced. Older agent checkpoints may contain now-unused extra keys and remain readable.
+`reaper_ai.agent.AgentState` is a compact, JSON-serializable state for every new run. It holds the plan/current step, next action, compact observations, factual progress (including retained `code_findings`), verification state, and tool-call accounting. Immutable task and workspace context remain in the enclosing LangGraph state; file hashes remain with individual guarded write actions. The existing SQLite checkpoint already stores the complete engine state, so no second persistence store or checkpoint mechanism is introduced. Older agent checkpoints may contain now-unused extra keys and remain readable.
 
 `dispatch_tool` is the single execution boundary. A request has a tool name, structured arguments, and a context containing workspace and optional working directory. Its result always has `ok`, `exit_code` where applicable, stdout/stderr or structured data, `duration_ms`, `changes`, and a precise `error`. Output is bounded before it can become an observation. It does not elevate privileges; the operating system is the authority for every action.
 
@@ -180,55 +180,22 @@ START → agent_prepare → agent_decide → agent_execute → agent_observe
 agent_decide → agent_finalize → END
 ```
 
-`agent_decide` obtains a constrained JSON action or final-report decision from Ollama. The engine supplies project context; `agent_execute` calls `dispatch_tool`; and `agent_observe` appends the normalized result to state. Tool errors become observations for the next decision. A final report is accepted only after at least one successful observed tool result. The model's final prose remains an assessment separate from the `observed_tools` verification label.
+`agent_decide` obtains a constrained JSON action or final-report decision from Ollama. The engine supplies project context; `agent_execute` calls `dispatch_tool`; and `agent_observe` appends the normalized result to state. Tool errors and malformed or invalid model decisions become observations for the next decision with the available error message. A final report is accepted only after at least one successful observed tool result and no explicitly open verification point. The model's final prose remains an assessment separate from the `observed_tools` verification label.
 
-The agent has a wall-time budget, compact captured output, and a LangGraph recursion guard derived from wall time; it has no arbitrary model-call, tool-call, file, or repair cap. It checkpoints after prepare, decision, execution, and observation through the existing SQLite store. Recovery recognizes `agent_*` stages and starts at their stored next safe node; already-observed tools are not rerun. The API accepts any existing absolute project directory; Git is optional, and SSE carries the existing phase/model/tool/checkpoint events.
-
-### Historical pre-M6 target nodes (superseded)
-
-1. **Classify / prepare:** Identify task type, bind project root, capture repository baseline, apply safety constraints.
-2. **Inspect / plan:** Read the minimum relevant material and produce a concrete next action. A simple task can bypass extensive planning.
-3. **Execute:** Apply a focused edit or run a relevant technical operation through tools.
-4. **Verify:** Collect actual diff/check evidence, run task-appropriate checks, and compare outcomes with the objective.
-5. **Repair (conditional):** Feed concrete verification failures back into focused execution, with a small retry budget.
-6. **Finalize:** Produce `RunResult` from state and evidence; persist a concise, accurately labeled result.
-
-Routing is conditional rather than a rigid mandatory chain:
-
-```text
-START -> prepare -> inspect/plan
-                       |
-           +-----------+-------------+
-           |                         |
-      read-only task              coding task
-           |                         |
-      verify sources              execute
-           |                         |
-           |                       verify
-           |                         |
-           |             failed and retry budget?
-           |                  yes -> repair -> verify
-           |                  no  -> finalize
-           +------------------------> finalize -> END
-```
-
-A task may finish early if it is already satisfied or cannot be safely performed. The graph must not force meaningless file edits.
+The agent has a wall-time budget, compact planner observations, and a LangGraph recursion guard derived from wall time; it has no arbitrary model-call, tool-call, file, or repair cap. Full normalized tool results stay in the run state and SQLite checkpoint, but prompt views use excerpts and redact large write content to a hash and length. The newest file-read observation receives the available prompt space so its source text remains actionable; older observations remain compact. It checkpoints after prepare, decision, execution, and observation through the existing SQLite store. Recovery recognizes `agent_*` stages and starts at their stored next safe node; already-observed tools are not rerun. The API accepts any existing absolute project directory; Git is optional, and SSE carries the existing phase/model/tool/checkpoint events.
 
 ### On-demand file access and edit scope
 
-The agent requests file listing/searching and focused text or line-range reads through `tools.py`; there is no separate inventory, selection, proposal, or apply pipeline. Paths can be workspace-relative or absolute, subject to the started user's operating-system permissions. Text tools distinguish binary content from UTF-8 text, so binary files can be listed but are not silently treated as editable text.
+The agent requests file listing/searching and focused text or line-range reads through `tools.py`; there is no separate inventory, selection, proposal, or apply pipeline. Paths can be workspace-relative or absolute, subject to the started user's operating-system permissions. Ordinary project scans skip Git object storage so source files are not crowded out; `.git` and all other hidden paths remain available when explicitly targeted. Text tools distinguish binary content from UTF-8 text, so binary files can be listed but are not silently treated as editable text.
 
 The planner prompt is bounded by `REAPER_MODEL_CONTEXT_CHARS` (default 36,000 UTF-8 bytes, clamped to 8,000–96,000) and retains only compact recent observations. Existing-file writes require the SHA-256 value returned by a preceding read; `tools.py` compares that value immediately before writing and returns a conflict instead of overwriting an intervening change. The write result records before/after hashes as change evidence. Git can supply additional inspection evidence but is not a precondition.
 
 ### Progress and budgets
 
-- Bound **model calls**, execution time, tool output size, and repeated nonproductive inspection.
-- Track **meaningful progress** separately from tool-call count: scoped findings, a concrete implementation action, actual file changes, and recorded checks.
-- Before spending more inference on inspection, request a compact next-action decision; if nothing new emerges, return an evidence-based failure rather than loop.
-- Preserve small, source-linked findings across model-context compaction. Re-read a file only for a specific missing fact or changed version.
-- Repair attempts must be limited. A verification failure never silently converts into success.
-
-Budgets are configuration values, not hardwired assumptions that every task needs the same number of steps. They will be tuned against real tasks.
+- Bound wall-clock execution time, model prompt size, and captured output; there is no fixed model-call, tool-call, file, or repair-attempt cap.
+- Track meaningful progress separately from tool-call count: scoped findings, a concrete implementation action, actual file changes, and recorded checks.
+- Preserve source-linked findings across model-context compaction. Re-reading remains available when a different range or changed version is relevant.
+- A failed verification remains an observed error; it never silently converts into success.
 
 ## 6. Model roles and delegation
 
@@ -276,6 +243,10 @@ Tools must validate their working directory and report failures explicitly. An o
 Verification is based on agent-selected tool evidence, not a model self-assessment.
 
 For coding tasks, record every observed write, Git inspection, and check command. Success requires at least one successful tool result, while functional verification still requires the agent to choose an appropriate check. A successful syntax check is not equivalent to satisfying functional correctness.
+
+The iterative execution state also retains a small factual progress snapshot separate from the full observation history: the latest attributable change, recent check outcomes, explicitly open verification points, and recent errors. It is checkpointed with the run and precedes compact historical observations in the next planner prompt. A model action can tie itself to exact open verification points; only a successful observed result removes those points. This gives the model stable evidence for deciding whether to correct, verify, or return its `final` decision; it does not automatically declare a task complete or prohibit a repeat action when new evidence warrants one.
+
+Successful `read_file` and `read_file_range` observations also produce separate source findings with path, line range, source hash, and the observed text. Findings persist in the same agent state/checkpoint and precede call history in the next planner prompt. Re-reading is still permitted, but the model receives the existing source evidence when choosing whether a new range, a write, or a verification is the useful next step.
 
 The engine must distinguish:
 
@@ -355,7 +326,7 @@ SQLite failures before a run starts reject the request clearly; a post-run histo
 
 For a follow-up in the selected conversation, the API supplies a bounded context made only from prior user requests and structured, observed run metadata; stored assistant/model prose is excluded and repository facts must still be rechecked.
 
-P02 extends the same SQLite store with one versioned, digest-protected checkpoint per run. The engine writes it only after a stage returns a consistent state and records its stage result alongside the full state. The checkpoint states the next LangGraph node, allowing a recovery to begin there rather than replaying completed stages. On startup, stale `running` or `cancelling` database rows become visibly `interrupted`; they remain idle until the user explicitly calls the recovery API or presses the UI control.
+P02 extends the same SQLite store with one versioned, digest-protected checkpoint per run. The engine writes it only after a stage returns a consistent state and records its stage result alongside the full state, including the compact agent-progress snapshot. The checkpoint states the next LangGraph node, allowing a recovery to begin there rather than replaying completed stages. On startup, stale `running` or `cancelling` database rows become visibly `interrupted`; they remain idle until the user explicitly calls the recovery API or presses the UI control.
 
 Recovery accepts only `interrupted`, `cancelled`, or `timed_out` runs with a valid checkpoint. It validates format, integrity digest, workspace identity, and the saved source/write preconditions before invoking the saved next stage. A missing, corrupt, incompatible, or inconsistent checkpoint is surfaced as non-recoverable, never silently substituted or replayed. P02 is intentionally not general checkpointing infrastructure or automatic process restoration. P03 durable memory remains separate from checkpoint data and never uses it as knowledge.
 
@@ -405,7 +376,7 @@ The architecture is viable only if a prototype can demonstrate all of the follow
 
 **Architectural direction:** Build REAPER-AI from scratch around embedded **LangGraph + local Ollama + evidence-producing tools**. The custom lightweight UI, local FastAPI/SSE boundary, and single-file SQLite persistence are selected and implemented. Do not recreate the v0.x free-running stage runner.
 
-## Implementation status — M4, M5/P01–P03, and M6/P01–P02
+## Implementation status — M4, M5/P01–P03, and M6/P01–P06
 
 The lightweight browser UI is implemented with HTML, CSS and vanilla JavaScript, served locally by FastAPI.
 
@@ -422,4 +393,4 @@ Limitations:
 - Persistent sessions, completed run history, explicit stage-checkpoint recovery, and scoped durable memory are implemented in SQLite (M5/P01–P03).
 - Run-result presentation and public run-ID consistency require refinement.
 
-M5/P01–P03 verification is covered by focused storage/API tests for conversation/message/run association, persisted stage results/events, checkpoint integrity, stale-run detection, restart from the checkpoint's next stage, and durable-memory scope/source/restart behavior. M6 has focused dispatcher/agent tests for file list/read/range/search/write, a failed range followed by correction, recovery from the saved next decision without re-running tools, absolute-path writing, Git status, Python discovery, and PowerShell output/nonzero/timeout handling. A live `qwen3:8b` read-only run searched `def dispatch_tool`, read `src/reaper_ai/agent.py` lines 152–180, and completed with two successful observed tool results and no Git change. This does not claim general process restoration or semantic fact retrieval.
+M5/P01–P03 verification is covered by focused storage/API tests for conversation/message/run association, persisted stage results/events, checkpoint integrity, stale-run detection, restart from the checkpoint's next stage, and durable-memory scope/source/restart behavior. M6 has focused dispatcher/agent tests for file list/read/range/search/write, a failed PowerShell content check followed by guarded correction and successful recheck, recovery from the saved next decision without re-running tools, absolute-path writing, Git status, Python discovery, and PowerShell output/nonzero/timeout handling. A live `qwen3:8b` read-only run searched `def dispatch_tool`, read `src/reaper_ai/agent.py` lines 152–180, and completed with two successful observed tool results and no Git change. This does not claim general process restoration or semantic fact retrieval.

@@ -1,6 +1,7 @@
 """Local file and Git tools for REAPER-AI."""
 
 from pathlib import Path
+import os
 import subprocess
 import hashlib
 
@@ -36,8 +37,104 @@ def _sha256(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
-def list_files(workspace: str, path: str = ".", max_results: int | None = None) -> dict:
-    """List regular files below a directory, optionally with caller-requested truncation."""
+def _git_ignored_directories(workspace: str, directory: Path) -> set[str]:
+    """Return directory names that Git ignores directly below *directory*.
+
+    The result is used only to prune ordinary project scans.  It is intentionally
+    limited to names that Git reports as ignored at the requested directory level,
+    so explicit scans of those directories remain possible.
+    """
+    try:
+        workspace_root = Path(workspace).resolve()
+        directory = directory.resolve()
+        try:
+            rel_dir = directory.relative_to(workspace_root)
+        except ValueError:
+            rel_dir = Path()
+        names = os.listdir(directory)
+        if not names:
+            return set()
+        if rel_dir.parts:
+            prefix = rel_dir.as_posix() + "/"
+        else:
+            prefix = ""
+        args = ["git", "check-ignore", "--no-index"]
+        for name in names:
+            args.append(prefix + name)
+        result = subprocess.run(
+            args,
+            cwd=workspace,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return set()
+    ignored = set()
+    for line in result.stdout.splitlines():
+        name = line.strip()
+        if not name:
+            continue
+        if prefix and name.startswith(prefix):
+            name = name[len(prefix):]
+        if name and (directory / name).is_dir():
+            ignored.add(name)
+    return ignored
+
+
+def _is_git_ignored_directory(workspace: str, directory: Path) -> bool:
+    """Return whether an explicitly requested directory is itself Git-ignored."""
+    try:
+        workspace_root = Path(workspace).resolve()
+        relative = directory.resolve().relative_to(workspace_root)
+        if not relative.parts:
+            return False
+        result = subprocess.run(
+            ["git", "check-ignore", "--quiet", "--no-index", relative.as_posix()],
+            cwd=workspace,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+        )
+        return result.returncode == 0
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return False
+
+
+def _iter_regular_files(directory: Path, workspace: str | None = None):
+    """Traverse regular files while omitting Git-ignored generated directories.
+
+    Ordinary project scans skip directories that Git reports as ignored, such as
+    `.venv`, `__pycache__`, `dist`, and `build`.  Explicitly targeting `.git`,
+    `.venv`, or any other ignored directory still exposes its complete recursive
+    contents, including Git-ignored descendants.
+    """
+    include_git_metadata = ".git" in directory.parts
+    explicit_ignored_directory = bool(workspace and _is_git_ignored_directory(workspace, directory))
+    for current, directories, names in os.walk(directory):
+        if not include_git_metadata and not explicit_ignored_directory:
+            if workspace is not None:
+                ignored_names = _git_ignored_directories(workspace, Path(current))
+            else:
+                ignored_names = set()
+            directories[:] = [name for name in directories if name != ".git" and name not in ignored_names]
+        directories.sort()
+        for name in sorted(names):
+            target = Path(current, name)
+            if target.is_file():
+                yield target
+
+
+def list_files(workspace: str, path: str = ".", max_results: int | None = None,
+               include_sizes: bool = True) -> dict:
+    """List regular files below a directory, optionally with caller-requested truncation.
+
+    When *include_sizes* is False each entry contains only ``path`` without ``bytes``.
+    """
     try:
         if max_results is not None and (not isinstance(max_results, int) or max_results < 1):
             raise ValueError("max_results must be positive when supplied")
@@ -46,13 +143,14 @@ def list_files(workspace: str, path: str = ".", max_results: int | None = None) 
             raise ValueError("Path is not a directory")
         files = []
         truncated = False
-        for target in sorted(directory.rglob("*")):
-            if not target.is_file():
-                continue
+        for target in _iter_regular_files(directory, workspace):
             if max_results is not None and len(files) >= max_results:
                 truncated = True
                 break
-            files.append({"path": _display_path(workspace, target), "bytes": target.stat().st_size})
+            entry = {"path": _display_path(workspace, target)}
+            if include_sizes:
+                entry["bytes"] = target.stat().st_size
+            files.append(entry)
         return {"ok": True, "files": files, "truncated": truncated}
     except (OSError, ValueError) as exc:
         return {"ok": False, "error": str(exc), "files": [], "truncated": False}
@@ -130,9 +228,7 @@ def search_text(workspace: str, query: str, path: str = ".", max_results: int | 
         needle = query if case_sensitive else query.casefold()
         matches = []
         truncated = False
-        for target in sorted(directory.rglob("*")):
-            if not target.is_file():
-                continue
+        for target in _iter_regular_files(directory, workspace):
             try:
                 with target.open("r", encoding="utf-8") as source:
                     for line_number, line in enumerate(source, start=1):

@@ -19,6 +19,7 @@ class AgentState(TypedDict):
     current_step: int
     next_action: dict[str, Any] | None
     observations: list[dict[str, Any]]
+    progress: dict[str, Any]
     verification: dict[str, Any]
     budgets: dict[str, int]
 
@@ -106,6 +107,14 @@ def new_agent_state() -> AgentState:
         "current_step": 0,
         "next_action": None,
         "observations": [],
+        "progress": {
+            "last_change": None,
+            "checks": [],
+            "open_verifications": [],
+            "errors": [],
+            "last_reason": "",
+            "findings": [],
+        },
         "verification": {"status": "not_started", "checks": []},
         "budgets": {"tool_calls": 0},
     }
@@ -129,7 +138,8 @@ def dispatch_tool(action: ToolAction | dict[str, Any]) -> ToolResult:
         workspace, cwd = _context(action)
         if tool_name == "list_files":
             raw = tools.list_files(workspace, path=args.get("path", "."),
-                                   max_results=args.get("max_results"))
+                                   max_results=args.get("max_results"),
+                                   include_sizes=args.get("include_sizes", True))
         elif tool_name == "read_file":
             raw = tools.read_file(workspace, path=args["path"], max_chars=args.get("max_chars"))
         elif tool_name == "read_file_range":
@@ -140,7 +150,16 @@ def dispatch_tool(action: ToolAction | dict[str, Any]) -> ToolResult:
                                     max_results=args.get("max_results"),
                                     case_sensitive=args.get("case_sensitive", False))
         elif tool_name == "write_file":
-            raw = tools.write_file(workspace, path=args["path"], content=args["content"],
+            path = args.get("path")
+            content = args.get("content")
+            if not isinstance(path, str) or not path:
+                raise ValueError("write_file requires a file path")
+            if not isinstance(content, str):
+                raise ValueError("write_file requires text content")
+            # The model's action arguments are the sole source of file content.
+            # ``raw`` is deliberately assigned only after the write, so its
+            # result metadata can never become an input to ``write_file``.
+            raw = tools.write_file(workspace, path=path, content=content,
                                    expected_hash=args.get("expected_hash"))
         elif tool_name == "git_status":
             raw = tools.git_status(cwd)

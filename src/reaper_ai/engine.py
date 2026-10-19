@@ -123,23 +123,135 @@ find_python, shell(command, timeout?), write_file(path, content, expected_hash?)
 Paths may be relative to the project workspace or absolute. Shell commands and writes run with the started user's
 normal operating-system permissions; do not claim a fact without a tool result and do not claim an action succeeded
 unless its result says so. Before writing an existing text file, read it and pass its returned sha256 as expected_hash.
-Git is optional. Use errors returned by tools to correct your next action."""
+Git is optional. Use errors returned by tools to correct your next action. Use code_findings before rereading an unchanged
+range. Keep an existing plan unless evidence changes it. A verification point is resolved only by a successful action
+that names it in verification_for; return final only after all explicit verification points are resolved."""
+
+
+def _short_text(value: Any, limit: int = 500) -> str:
+    text = "" if value is None else str(value)
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
+def _string_list(value: Any) -> list[str] | None:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        return value
+    return None
+
+
+def _progress_snapshot(agent: dict[str, Any]) -> dict[str, Any]:
+    """Compact factual progress, separate from source findings and call history."""
+    progress = agent.get("progress") if isinstance(agent.get("progress"), dict) else {}
+    findings = progress.get("findings") if isinstance(progress.get("findings"), list) else []
+    return {
+        "last_change": progress.get("last_change"),
+        "checks": list(progress.get("checks", []))[-12:],
+        "open_verifications": list(progress.get("open_verifications", [])),
+        "errors": list(progress.get("errors", []))[-12:],
+        "last_reason": _short_text(progress.get("last_reason", "")),
+        "finding_locations": [{key: item.get(key) for key in ("path", "start_line", "end_line", "sha256")}
+                              for item in findings if isinstance(item, dict)],
+    }
+
+
+def _record_progress(agent: dict[str, Any], observation: dict[str, Any]) -> None:
+    """Persist checks plus read-source evidence without suppressing any action."""
+    progress = dict(agent.get("progress") or {})
+    action = observation.get("action") if isinstance(observation.get("action"), dict) else {}
+    result = observation.get("result") if isinstance(observation.get("result"), dict) else {}
+    ok = bool(result.get("ok"))
+    progress["checks"] = [*progress.get("checks", []), {
+        "step": observation.get("step"), "tool": action.get("tool"), "ok": ok,
+        "exit_code": result.get("exit_code"), "summary": _short_text(result.get("error") if not ok else "tool completed"),
+    }][-12:]
+    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    if ok and action.get("tool") in {"read_file", "read_file_range"} and isinstance(data.get("content"), str):
+        finding = {key: data.get(key) for key in ("path", "start_line", "end_line", "sha256", "content")}
+        if isinstance(finding["path"], str):
+            key = (finding["path"], finding["start_line"], finding["end_line"])
+            findings = list(progress.get("findings", []))
+            for index, previous in enumerate(findings):
+                if isinstance(previous, dict) and (previous.get("path"), previous.get("start_line"),
+                                                   previous.get("end_line")) == key:
+                    findings[index] = finding
+                    break
+            else:
+                findings.append(finding)
+            progress["findings"] = findings
+    changes = result.get("changes")
+    if isinstance(changes, list):
+        paths = [item.get("path") for item in changes if isinstance(item, dict) and isinstance(item.get("path"), str)]
+        if paths:
+            progress["last_change"] = {"step": observation.get("step"), "tool": action.get("tool"), "paths": paths}
+    if not ok:
+        progress["errors"] = [*progress.get("errors", []), {"step": observation.get("step"),
+                              "tool": action.get("tool"), "error": _short_text(result.get("error", "Tool failed"))}][-12:]
+    elif action.get("tool") not in {"read_file", "read_file_range"}:
+        resolved = _string_list(action.get("verification_for"))
+        if resolved:
+            progress["open_verifications"] = [item for item in progress.get("open_verifications", []) if item not in resolved]
+    agent["progress"] = progress
+
+
+def _decision_error(agent: dict[str, Any], error: str) -> dict[str, Any]:
+    observation = {"step": agent["current_step"] + 1, "action": {"tool": "model_decision", "args": {}},
+                   "result": {"tool": "model_decision", "ok": False, "exit_code": None, "stdout": "", "stderr": "",
+                              "data": {}, "changes": [], "error": error, "duration_ms": 0}}
+    agent["observations"] = [*agent["observations"], observation]
+    agent["current_step"] += 1
+    agent["next_action"] = None
+    _record_progress(agent, observation)
+    _emit_event("agent_decision", decision_kind="invalid", tool="model_decision", reason=_short_text(error),
+                progress=_progress_snapshot(agent), verification_status=agent["verification"].get("status"))
+    return {"agent": agent, "status": "agent_decision_error", "error": "", "details": agent["observations"],
+            "last_result": None}
 
 
 def _agent_prompt(state: AgentRunState) -> str:
-    """Give the model a compact, chronological observation window."""
+    """Prioritize retained source findings over disposable tool-call history."""
     agent = state["agent"]
     budget = _model_context_budget() - len(_AGENT_DECISION_SYSTEM.encode("utf-8")) - _MODEL_PROTOCOL_OVERHEAD_BYTES
     prompt = {"task": state["task"], "workspace": state["workspace"],
               "path_rule": "Paths may be workspace-relative or absolute.",
-              "plan": agent["plan"], "current_step": agent["current_step"], "previous_observations": []}
+              "plan": agent["plan"], "current_step": agent["current_step"],
+              "progress": _progress_snapshot(agent), "verification": agent["verification"],
+              "code_findings": [], "previous_observations": []}
     used = len(json.dumps(prompt, ensure_ascii=False).encode("utf-8"))
+    findings = agent.get("progress", {}).get("findings", [])
+    retained = []
+    for finding in reversed(findings if isinstance(findings, list) else []):
+        if not isinstance(finding, dict) or not isinstance(finding.get("content"), str):
+            continue
+        remaining = budget - used
+        item = {key: finding.get(key) for key in ("path", "start_line", "end_line", "sha256")}
+        item["content"] = finding["content"].encode("utf-8")[:max(0, remaining - 256)].decode("utf-8", "ignore")
+        encoded = json.dumps(item, ensure_ascii=False).encode("utf-8")
+        if remaining <= 0 or len(encoded) > remaining:
+            continue
+        retained.append(item)
+        used += len(encoded)
+    prompt["code_findings"] = list(reversed(retained))
     chosen: list[dict[str, Any]] = []
     for observation in reversed(agent["observations"]):
-        encoded = json.dumps(observation, ensure_ascii=False).encode("utf-8")
+        action = observation.get("action") if isinstance(observation.get("action"), dict) else {}
+        result = observation.get("result") if isinstance(observation.get("result"), dict) else {}
+        if action.get("tool") in {"read_file", "read_file_range"}:
+            continue
+        item = {"step": observation.get("step"), "tool": action.get("tool"), "ok": bool(result.get("ok"))}
+        if not result.get("ok"):
+            item["error"] = _short_text(result.get("error", "Tool failed"))
+        elif action.get("tool") == "write_file":
+            item["changes"] = result.get("changes", [])
+        else:
+            item["data"] = result.get("data", {})
+            if result.get("stdout"):
+                item["stdout"] = _short_text(result["stdout"], max(1_024, budget // 12))
+        encoded = json.dumps(item, ensure_ascii=False).encode("utf-8")
         if used + len(encoded) > budget:
             continue
-        chosen.append(observation)
+        chosen.append(item)
         used += len(encoded)
     prompt["previous_observations"] = list(reversed(chosen))
     return json.dumps(prompt, ensure_ascii=False)
@@ -156,7 +268,11 @@ def _agent_action(decision: dict[str, Any], workspace: str) -> dict[str, Any] | 
     requested_context = action.get("context")
     if isinstance(requested_context, dict) and isinstance(requested_context.get("cwd"), str):
         context["cwd"] = requested_context["cwd"]
-    return {"tool": action["tool"], "args": args, "context": context}
+    request: dict[str, Any] = {"tool": action["tool"], "args": args, "context": context}
+    verification_for = _string_list(decision.get("verification_for"))
+    if verification_for:
+        request["verification_for"] = verification_for
+    return request
 
 
 def agent_prepare(state: AgentRunState) -> dict[str, Any]:
@@ -166,38 +282,48 @@ def agent_prepare(state: AgentRunState) -> dict[str, Any]:
 
 def agent_decide(state: AgentRunState) -> dict[str, Any]:
     _emit_event("phase_changed", phase="agent_decide")
+    agent = dict(state["agent"])
+    agent["progress"] = dict(agent.get("progress") or {})
+    agent["verification"] = dict(agent.get("verification") or {})
     try:
         decision = ask_json(_AGENT_DECISION_SYSTEM, _agent_prompt(state))
     except (RunBudgetExceeded, httpx.TimeoutException):
         raise
     except Exception as exc:
-        return {"status": "agent_failed", "error": f"Agent decision failed: {exc}"}
-    agent = dict(state["agent"])
+        return _decision_error(agent, f"Agent decision failed: {exc}")
     plan = decision.get("plan")
-    if isinstance(plan, list) and all(isinstance(item, dict) for item in plan):
+    if isinstance(plan, list) and plan and all(isinstance(item, dict) for item in plan):
         agent["plan"] = plan
+    reason = _short_text(decision.get("reason", ""))
+    agent["progress"]["last_reason"] = reason
     kind = decision.get("kind")
     if kind == "final":
         successful = any(observation.get("result", {}).get("ok") for observation in agent["observations"])
         if not successful:
-            return {"agent": agent, "status": "agent_failed",
-                    "error": "Agent attempted final report without successful tool evidence"}
+            return _decision_error(agent, "Agent attempted final report without successful tool evidence")
+        if agent["progress"].get("open_verifications"):
+            return _decision_error(agent, "Agent attempted final report while explicit verification points remain open")
         verification = dict(agent["verification"])
         verification.update({"status": "ready", "summary": str(decision.get("summary", ""))[:4_000],
                              "model_assessment": str(decision.get("verification", ""))[:4_000],
                              "observed_tools": len(agent["observations"])})
         agent["verification"] = verification
         agent["next_action"] = None
+        _emit_event("agent_decision", decision_kind="final", tool="final", reason=reason,
+                    progress=_progress_snapshot(agent), verification_status=verification["status"])
         return {"agent": agent, "status": "agent_finalizing", "error": ""}
     if kind != "action":
-        return {"agent": agent, "status": "agent_failed",
-                "error": "Agent decision must be an action or final report"}
+        return _decision_error(agent, "Agent decision must be an action or final report")
+    open_points = _string_list(decision.get("open_verifications"))
+    if open_points is not None:
+        agent["progress"]["open_verifications"] = open_points
     action = _agent_action(decision, state["workspace"])
     if action is None:
-        return {"agent": agent, "status": "agent_failed",
-                "error": "Agent action requires a tool name and object arguments"}
+        return _decision_error(agent, "Agent action requires a tool name and object arguments")
     agent["next_action"] = action
-    _emit_event("agent_decision", tool=action["tool"], step=agent["current_step"] + 1)
+    _emit_event("agent_decision", decision_kind="action", tool=action["tool"], step=agent["current_step"] + 1,
+                reason=reason, progress=_progress_snapshot(agent),
+                verification_status=agent["verification"].get("status"))
     return {"agent": agent, "status": "agent_action_ready", "error": ""}
 
 
@@ -230,6 +356,7 @@ def agent_observe(state: AgentRunState) -> dict[str, Any]:
     agent["observations"] = observations
     agent["current_step"] += 1
     agent["next_action"] = None
+    _record_progress(agent, observation)
     _emit_event("agent_observation", step=agent["current_step"], tool=action.get("tool"), ok=result.get("ok"))
     return {"agent": agent, "status": "agent_observed", "error": "", "details": observations,
             "last_result": None}
@@ -251,6 +378,8 @@ def _agent_checkpoint_next_stage(stage: str, state: dict[str, Any]) -> str | Non
         return "agent_decide"
     if stage == "agent_decide" and status == "agent_action_ready":
         return "agent_execute"
+    if stage == "agent_decide" and status == "agent_decision_error":
+        return "agent_decide"
     if stage == "agent_execute" and status == "agent_executed":
         return "agent_observe"
     if stage == "agent_observe" and status == "agent_observed":
@@ -277,7 +406,8 @@ def _agent_checkpointed(stage: str, function):
 
 
 def _route_agent_decision(state: AgentRunState) -> str:
-    return {"agent_action_ready": "execute", "agent_finalizing": "finalize"}.get(state["status"], "end")
+    return {"agent_action_ready": "execute", "agent_finalizing": "finalize",
+            "agent_decision_error": "decide"}.get(state["status"], "end")
 
 
 def _route_agent_execute(state: AgentRunState) -> str:
@@ -300,7 +430,8 @@ def build_agent_graph(start_stage: str = "agent_prepare"):
     graph.add_edge(START, start_stage)
     graph.add_edge("agent_prepare", "agent_decide")
     graph.add_conditional_edges("agent_decide", _route_agent_decision,
-                                {"execute": "agent_execute", "finalize": "agent_finalize", "end": END})
+                                {"execute": "agent_execute", "finalize": "agent_finalize",
+                                 "decide": "agent_decide", "end": END})
     graph.add_conditional_edges("agent_execute", _route_agent_execute,
                                 {"observe": "agent_observe", "end": END})
     graph.add_conditional_edges("agent_observe", _route_agent_observe,
@@ -377,6 +508,7 @@ def run(task: str, workspace: str) -> dict[str, Any]:
                             "Cancellation requires the process supervisor"],
         }
         verification = outcome.get("agent", {}).get("verification", {})
+        result["progress"] = _progress_snapshot(outcome.get("agent", {}))
         result["summary"] = verification.get("summary", "")
         result["tool_calls"] = outcome.get("agent", {}).get("budgets", {}).get("tool_calls", 0)
         return _complete(result, run_id)

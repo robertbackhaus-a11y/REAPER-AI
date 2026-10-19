@@ -1,6 +1,6 @@
 # REAPER-AI — Development Roadmap
 
-**Status:** M0–M4, M5/P01–P03, and M6 iterative-agent transition implemented with documented limitations.
+**Status:** M0–M4, M5/P01–P03, and M6/P01–P06 iterative-agent work implemented with documented limitations.
 **Architecture baseline:** [ARCHITECTURE.md](ARCHITECTURE.md) (approved)  
 **Target:** Windows 11, local single-user autonomous coding agent  
 **Technology decisions:** Python, embedded LangGraph, Ollama, FastAPI, SSE, custom HTML/CSS/vanilla JavaScript UI  
@@ -258,11 +258,11 @@ The initial deliverable is **one dependable agent**. Multi-agent delegation and 
 - Run tools with the started user's normal permissions; no automatic elevation. Preserve timeouts, explicit errors, and file conflict detection.
 - Keep the current stage pipeline and its API/UI working while the iterative decision loop is not yet present.
 
-**Done when:** the state is checkpointed with an existing run; direct dispatcher calls can list/search/read project files and ranges, inspect Git, discover Python, run `Get-Location`, return command failure/timeout evidence, and block an unapproved shell action.
+**Done when:** the state is checkpointed with an existing run; direct dispatcher calls can list/search/read project files and ranges, inspect Git, discover Python, run `Get-Location`, and return command failure/timeout evidence.
 
 #### P01 implementation checkpoint — 2026-10-18
 
-- **Implemented:** `reaper_ai.agent` supplies the checkpoint-friendly minimal `AgentState` (plan, step, next action, observations, verification, and tool-call accounting) and central `dispatch_tool`. Immutable task/workspace state is held by the graph; `tools.py` provides file listing, line-range reads, and line-oriented text search; `system_tools.py` remains the shell/Python implementation.
+- **Implemented:** `reaper_ai.agent` supplies the checkpoint-friendly minimal `AgentState` (plan, step, next action, observations, factual progress, verification, and tool-call accounting) and central `dispatch_tool`. Immutable task/workspace state is held by the graph; `tools.py` provides file listing, line-range reads, and line-oriented text search; `system_tools.py` remains the shell/Python implementation.
 - **Safety:** no shell allow-list, blacklist, risk class, or approval workflow remains. The dispatcher has text writes protected by an observed SHA-256 precondition; conflicts never overwrite an intervening change.
 - **Integration:** state, tool results, and checkpoints use the existing SQLite store. Git is optional and a workspace is project context rather than a filesystem boundary.
 - **Focused verification:** one dispatcher test performs list/read/range/search/write, an absolute-path write, Python discovery, Git status, PowerShell `Get-Location`, a nonzero command, and a timeout.
@@ -279,7 +279,23 @@ The initial deliverable is **one dependable agent**. Multi-agent delegation and 
 - **Decisions and evidence:** Ollama must return JSON for one action or a final report. The engine adds the real workspace context, calls `dispatch_tool`, and persists the normalized result as an observation. Failed tool calls remain visible to the next decision, allowing a correction. A final report without a successful tool result is rejected.
 - **Budgets and recovery:** agent runs retain the wall-time limit, compact result capture, and a LangGraph recursion guard derived from the wall-time budget, but no artificial model, tool, file, or repair-operation cap. SQLite checkpoints are written after every safe agent node. An interrupted agent resumes at the saved `agent_*` next node with its observed tools intact; it does not replay completed actions.
 - **Execution:** shell commands and file operations use the launched user's OS permissions without elevation. Existing text writes require a matching read hash; tool errors remain observations so Sentinel can correct itself.
-- **Focused verification:** a deterministic end-to-end agent test performs text search, a failed missing-file range read, a corrected range read, completion, and restart at the saved next decision without rerunning the three tools. A live `qwen3:8b` read-only run searched `def dispatch_tool`, read `src/reaper_ai/agent.py` lines 152–180, used three model decisions/two successful tool calls, and left Git status unchanged.
+- **Focused verification:** a deterministic end-to-end agent test performs a source read, guarded write, failed PowerShell content check, corrective reread/write, successful repeated check, completion, and restart at the saved next decision without rerunning the six tools. A live `qwen3:8b` read-only run searched `def dispatch_tool`, read `src/reaper_ai/agent.py` lines 152–180, used three model decisions/two successful tool calls, and left Git status unchanged.
+
+#### BUG-012 implementation checkpoint — 2026-10-19
+
+- **Evidence-based progress:** each observed tool result updates a compact, checkpointed snapshot of the last attributable change, recent checks and their outcomes, open verification points, and recent errors. The snapshot is supplied before the compact observation history, so a newly requested decision retains prior successful checks even when older tool output is abbreviated. A verifying action can name exact open points; only a successful result clears those points.
+- **Decision contract and diagnostics:** action decisions can state a short reason and open verification points; final decisions explicitly state why work and verification are complete. Existing action/final JSON remains accepted for compatibility. Malformed or otherwise invalid decisions become a corrective `model_decision` observation. Persisted decision events record the decision type, tool/final choice, short reason, and progress/verification status without retaining complete model prose.
+- **Focused verification:** one deterministic temporary coding run performed an actual read, an initial guarded write, a failing PowerShell content check, a reread and corrected guarded write, then a successful repeated PowerShell check and `agent_finalize`. It also verified that the successful check and the failed-check error survive in checkpointed progress and that explicit recovery resumes at the final decision without replaying the six completed tool actions.
+
+#### BUG-016 implementation checkpoint — 2026-10-19
+
+- **Retained source evidence:** successful whole-file and line-range reads now add hash- and position-bound `code_findings` to the existing checkpointed progress state. The next decision receives these findings before compact action history, while an exact reread updates its existing finding rather than accumulating duplicate history. This is context retention only; it does not prohibit repeated reads or impose an iteration limit.
+- **Verification evidence:** an explicit verification point closes only when a successful action identifies it through `verification_for`; a failed result leaves it open and a subsequent `final` decision is rejected as corrective model evidence.
+
+#### P05/P06 implementation checkpoint — 2026-10-19
+
+- **P05 file scanning:** ordinary project scans omit Git-ignored generated directories, while an explicitly selected ignored or hidden directory is traversed recursively. Git remains optional; explicit `.git` access is supported.
+- **P06 agent consolidation:** the active graph retains factual progress and source findings in its checkpoint, returns malformed or invalid model decisions as corrective observations, and reaches `agent_finalize` only through an explicit final decision with observed evidence. Shell execution remains autonomous under the started user's operating-system permissions.
 
 #### Post-M6 technical cleanup — 2026-10-18
 

@@ -2,7 +2,7 @@
 
 **Local, single-user AI coding agent.** REAPER-AI turns engineering requests into observable work: it iteratively inspects files, makes changes, runs checks, and reports the evidence actually produced. A model assertion is never treated as proof of success.
 
-> **Status:** Development work after the v0.2.0 FastAPI/UI baseline adds M5/P01 history, M5/P02 explicit checkpoint recovery, M5/P03 scoped durable memory, and an iterative M6 tool agent. The optional external Basic Memory integration is deferred.
+> **Status:** Development work after the v0.2.0 FastAPI/UI baseline adds M5/P01 history, M5/P02 explicit checkpoint recovery, M5/P03 scoped durable memory, and the M6/P01–P06 iterative tool-agent work. The optional external Basic Memory integration is deferred.
 
 ## Requirements and installation
 
@@ -23,13 +23,15 @@ Choose any existing absolute project directory, an installed Ollama model, and a
 
 ## Iterative agent and tools (M6)
 
-`src/reaper_ai/agent.py` provides the serializable state and central dispatcher for Sentinel's single iterative LangGraph path. It uses file/Git adapters in `tools.py` and system adapters in `system_tools.py`; it does not introduce another tool implementation, service, or database.
+`src/reaper_ai/agent.py` provides the serializable state and central dispatcher for Sentinel's single iterative LangGraph path. Its checkpointed state includes a compact factual progress snapshot: most recent changed paths, recent tool checks with outcomes, open verification points, and recent tool/model errors. It uses file/Git adapters in `tools.py` and system adapters in `system_tools.py`; it does not introduce another tool implementation, service, or database.
 
-Dispatchable actions are file listing/searching, UTF-8 file and line-range reads, text search, guarded text writes, Git status/diff, Python-installation discovery, and shell commands. Every result has `ok`, exit code where applicable, stdout/stderr or structured data, duration, change evidence, and a precise error. Captured command output remains bounded so observations fit the model context.
+Dispatchable actions are file listing/searching, UTF-8 file and line-range reads, text search, guarded text writes, Git status/diff, Python-installation discovery, and shell commands. Every result has `ok`, exit code where applicable, stdout/stderr or structured data, duration, change evidence, and a precise error. Full tool results remain persisted, while the planner receives bounded observation excerpts. Ordinary project scans omit Git object storage but `.git` remains explicitly addressable.
 
 Commands and tools execute with the started user's ordinary operating-system permissions—there is no automatic elevation, shell allow-list, command blacklist, risk class, or approval workflow. Timeouts and supervisor cancellation remain active. Existing text files must be read first and written with their returned SHA-256 hash; a changed source causes a conflict instead of an overwrite.
 
-The active graph is `Prepare → Decide → Execute → Observe → Decide … → Finalize`. Ollama returns a JSON action or final-report decision; the engine supplies project context, dispatches deterministically, and stores the normalized result as an observation. A failed tool call becomes the next decision's evidence rather than ending the run. Completion requires at least one successful tool result; a final model statement remains an assessment, not independent verification. The former static coding graph has been removed; historical static checkpoints remain in SQLite for record retention but are rejected safely because they have no executable graph.
+The active graph is `Prepare → Decide → Execute → Observe → Decide … → Finalize`. Ollama returns a JSON action or final-report decision; action decisions state why work remains and may name open verification points. A verifying action can identify the exact open points it tests; only its successful result clears those points. The engine prioritizes checkpointed factual progress ahead of historical observations, dispatches deterministically, and stores the normalized result as an observation. A failed tool call, malformed JSON, or invalid decision becomes the next decision's evidence rather than ending the run. Decision events retain the decision type, chosen tool or final report, short reason, and progress/verification status without storing full model prose. Completion requires at least one successful tool result; a final model statement remains an assessment, not independent verification. The former static coding graph has been removed; historical static checkpoints remain in SQLite for record retention but are rejected safely because they have no executable graph.
+
+Successful file and line-range reads are additionally retained as hash- and position-bound `code_findings` in the checkpointed progress state. They are presented before disposable tool-call history in the next decision prompt, so context compaction does not discard an already inspected source area. This retains evidence without forbidding a later reread when the agent needs a different range or detects changed source.
 
 ## Local history
 
@@ -54,7 +56,7 @@ Assistant/model prose, ordinary chat messages, checkpoint state, and unsuccessfu
 
 After each completed, nonterminal engine stage, REAPER-AI replaces a versioned SQLite checkpoint containing the full execution state and that stage's result. On API startup, stale `running`/`cancelling` runs are marked `interrupted`; nothing restarts by itself. The browser shows a recovery status and an explicit **Ab … fortsetzen** button for an interrupted, cancelled, or timed-out run with a valid checkpoint. The same operation is available via `GET /runs/{run_id}/recovery` and `POST /runs/{run_id}/resume`.
 
-Recovery starts LangGraph at the checkpoint's next stage, so completed actions are not rerun. The agent saves the same SQLite checkpoint after `agent_prepare`, `agent_decide`, `agent_execute`, and `agent_observe`; a resumed agent starts at the stored safe stage with its plan, observations, and pending action intact. A missing, corrupt, incompatible, workspace-inconsistent, or historical static-pipeline checkpoint is reported as unavailable or fails safely after the explicit request; it is never guessed or replayed automatically.
+Recovery starts LangGraph at the checkpoint's next stage, so completed actions are not rerun. The agent saves the same SQLite checkpoint after `agent_prepare`, `agent_decide`, `agent_execute`, and `agent_observe`; a resumed agent starts at the stored safe stage with its plan, factual progress, observations, and pending action intact. A missing, corrupt, incompatible, workspace-inconsistent, or historical static-pipeline checkpoint is reported as unavailable or fails safely after the explicit request; it is never guessed or replayed automatically.
 
 ## API
 

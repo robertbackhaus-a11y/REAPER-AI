@@ -1,6 +1,8 @@
 import unittest
 import uuid
 import os
+import hashlib
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -104,45 +106,98 @@ class AgentDispatcherTests(unittest.TestCase):
         git_status = dispatch_tool({"tool": "git_status", "args": {},
                                     "context": {"workspace": str(Path.cwd())}})
         self.assertTrue(git_status["ok"], git_status)
+        git_diff = dispatch_tool({"tool": "git_diff", "args": {},
+                                  "context": {"workspace": str(Path.cwd())}})
+        self.assertTrue(git_diff["ok"], git_diff)
+        self.assertIn("diff", git_diff["data"])
+        self.assertIn("error", git_diff["data"])
 
-    def test_read_only_agent_corrects_tool_error_and_resumes_at_decision_checkpoint(self):
+    def test_agent_keeps_evidence_through_failed_check_correction_and_resume(self):
         root = Path.cwd() / f".reaper-agent-loop-{uuid.uuid4().hex}"
         root.mkdir()
         try:
-            (root / "sample.txt").write_text("first line\nneedle line\nthird line\n", encoding="utf-8")
+            initial = "VALUE = 'wrong'\n"
+            intermediate = "VALUE = 'still_wrong'\n"
+            fixed = "VALUE = 'fixed'\n"
+            (root / "sample.py").write_text(initial, encoding="utf-8")
             store = Store(root / "reaper-ai.sqlite3")
             store.create_run({"run_id": "agent-loop", "workspace": str(root), "model": "test-model",
-                              "task": "inspect sample", "timeout": 30, "status": "running", "started_at": "now"})
+                              "task": "Correct sample.py and verify it", "timeout": 30,
+                              "status": "running", "started_at": "now"})
             decisions = iter([
-                {"kind": "action", "plan": [{"step": "find the relevant text"}],
-                 "action": {"tool": "search_text", "args": {"query": "needle"}}},
-                {"kind": "action", "action": {"tool": "read_file_range",
-                                                    "args": {"path": "missing.txt", "start_line": 1, "end_line": 1}}},
-                {"kind": "action", "action": {"tool": "read_file_range",
-                                                    "args": {"path": "sample.txt", "start_line": 2, "end_line": 2}}},
-                {"kind": "final", "summary": "The selected line contains needle.",
-                 "verification": "search and targeted read succeeded"},
-                {"kind": "final", "summary": "The selected line contains needle.",
-                 "verification": "checkpointed observation remains valid"},
+                {"kind": "action", "reason": "Read the existing source before changing it.",
+                 "plan": [{"step": "inspect the incorrect value"}],
+                 "open_verifications": ["Confirm the corrected value with a command."],
+                 "action": {"tool": "read_file", "args": {"path": "sample.py"}}},
+                {"kind": "action", "reason": "Apply the first correction attempt.",
+                 "plan": [{"step": "write a corrected value"}],
+                 "open_verifications": ["Run the value check after the write."],
+                 "action": {"tool": "write_file", "args": {
+                     "path": "sample.py", "content": intermediate,
+                     "expected_hash": hashlib.sha256(initial.encode("utf-8")).hexdigest()}}},
+                {"kind": "action", "reason": "Verify the first correction attempt.",
+                 "verification_for": ["Run the value check after the write."],
+                 "action": {"tool": "shell", "args": {"command": (
+                     "if ([IO.File]::ReadAllText('sample.py') -eq \"VALUE = 'fixed'`r`n\") "
+                     "{ Write-Output verified } else { Write-Error 'wrong content'; exit 7 }"), "timeout": 10}}},
+                {"kind": "action", "reason": "Read the failed correction before replacing it.",
+                 "open_verifications": ["Correct the value and rerun the failing check."],
+                 "action": {"tool": "read_file", "args": {"path": "sample.py"}}},
+                {"kind": "action", "reason": "Correct the value reported by the failed check.",
+                 "plan": [{"step": "apply the verified correction"}],
+                 "open_verifications": ["Run the value check again."],
+                 "action": {"tool": "write_file", "args": {
+                     "path": "sample.py", "content": fixed,
+                     "expected_hash": hashlib.sha256(intermediate.encode("utf-8")).hexdigest()}}},
+                {"kind": "action", "reason": "Verify the corrected file with the same failing check.",
+                 "verification_for": ["Run the value check again."],
+                 "action": {"tool": "shell", "args": {"command": (
+                     "if ([IO.File]::ReadAllText('sample.py') -eq \"VALUE = 'fixed'`r`n\") "
+                     "{ Write-Output verified } else { Write-Error 'wrong content'; exit 7 }"), "timeout": 10}}},
+                {"kind": "final", "reason": "The corrected value passed the repeated command check.",
+                 "summary": "sample.py now contains the fixed value.",
+                 "verification": "The final PowerShell check returned verified with exit code 0.",
+                 "open_verifications": []},
+                {"kind": "final", "reason": "The checkpoint retains the successful verification.",
+                 "summary": "sample.py remains fixed.",
+                 "verification": "The checkpointed successful command remains observed.",
+                 "open_verifications": []},
             ])
-
+            events = []
             with patch.dict("os.environ", {"REAPER_DATA_DIR": str(root), "REAPER_API_RUN_ID": "agent-loop"},
-                            clear=False), patch.object(engine, "ask_json", side_effect=lambda *_: next(decisions)):
-                result = engine.run("Inspect sample.txt without edits", str(root))
+                            clear=False), patch.object(engine, "ask_json", side_effect=lambda *_: next(decisions)), \
+                    patch.object(engine, "_emit_event", side_effect=lambda event, **payload: events.append((event, payload))):
+                result = engine.run("Correct sample.py and verify it", str(root))
                 checkpoint = store.get_checkpoint("agent-loop")
                 self.assertEqual(checkpoint["stage"], "agent_observe")
                 self.assertEqual(checkpoint["next_stage"], "agent_decide")
                 self.assertEqual(result["status"], "completed", result)
-                self.assertEqual(result["tool_calls"], 3)
-                self.assertFalse(result["checks"][1]["result"]["ok"])
-                self.assertTrue(result["checks"][2]["result"]["ok"])
+                self.assertEqual(result["internal_status"], "agent_completed")
+                self.assertEqual(result["tool_calls"], 6)
+                self.assertEqual((root / "sample.py").read_text(encoding="utf-8"), fixed)
+                self.assertFalse(result["checks"][2]["result"]["ok"])
+                self.assertTrue(result["checks"][-1]["result"]["ok"], result["checks"][-1])
+                self.assertEqual(result["progress"]["last_change"]["paths"], ["sample.py"])
+                self.assertEqual(result["progress"]["open_verifications"], [])
+                self.assertTrue(result["progress"]["checks"][-1]["ok"])
+                self.assertIn("wrong content", result["progress"]["errors"][0]["error"])
+                prompt = engine._agent_prompt(checkpoint["state"])
+                prompt_data = json.loads(prompt)
+                self.assertIn("progress", prompt_data)
+                self.assertLess(prompt.index('"progress"'), prompt.index('"previous_observations"'))
+                self.assertTrue(prompt_data["progress"]["checks"][-1]["ok"])
+                self.assertEqual(prompt_data["progress"]["open_verifications"], [])
+                decision_events = [payload for event, payload in events if event == "agent_decision"]
+                self.assertTrue(all("decision_kind" in payload and "progress" in payload and
+                                    "verification_status" in payload for payload in decision_events))
+                self.assertEqual(decision_events[-1]["decision_kind"], "final")
 
                 store.update_run_status("agent-loop", "interrupted")
                 with patch.dict("os.environ", {"REAPER_RESUME": "1"}, clear=False):
                     resumed = engine.run("ignored after checkpoint", str(root))
             self.assertEqual(resumed["status"], "completed", resumed)
-            self.assertEqual(resumed["tool_calls"], 3)
-            self.assertIn("needle", resumed["summary"])
+            self.assertEqual(resumed["tool_calls"], 6)
+            self.assertIn("fixed", resumed["summary"])
         finally:
             for path in root.glob("*"):
                 path.unlink()
