@@ -2,9 +2,9 @@
 
 **Local, single-user AI coding agent.** REAPER-AI turns engineering requests into observable work: it iteratively inspects files, makes changes, runs checks, and reports the evidence actually produced. A model assertion is never treated as proof of success.
 
-> **Version 0.6.0:** M5/P01–P03 local history, explicit recovery, scoped durable memory, the Variante-B multi-project core, repository index, hybrid per-run working memory, and index-guided Sentinel navigation are implemented, alongside the completed M6/P01–P06 iterative tool-agent work. P0 adds hash-bound targeted edits; P1 consolidates run working memory.
+> **Version 0.7.0:** M5/P01–P03 local history, explicit recovery, scoped durable memory, the Variante-B multi-project core, repository index, hybrid per-run working memory, and index-guided Sentinel navigation are implemented, alongside the completed M6/P01–P06 iterative tool-agent work. P0 adds hash-bound targeted edits; P1 consolidates run working memory. D01 autonomous-agent acceptance is recorded as passed.
 
-v0.6.0 modernizes the existing local interface without changing the backend stack. The project sidebar, conversation tabs, top-right settings dialog, chat, persisted results, recovery controls, and SSE-backed agent-activity panel remain the same HTML/CSS/vanilla-JavaScript application. The activity panel displays only recorded run events, decision traces, and available Ollama/log data; it does not invent progress or thinking. Live events, Decision Trace, and Ollama Thinking / runtime log can remain open together in independent, bounded scroll areas so long diagnostic data does not cover adjacent panels.
+v0.7.0 includes the v0.6.0 interface modernization and the D01 completion work: checkpointed source facts from every successful read, context prioritization for current targeted ranges, explicit reconciliation of satisfied read-only verification points, and visible no-information-gain evidence for identical reads. The browser retains the same HTML/CSS/vanilla-JavaScript stack: projects and chats can be permanently deleted with their owned run history while project/global memory remains scoped correctly, and chat results now use the full available content width. The activity panel displays only recorded run events, decision traces, and available Ollama/log data; it does not invent progress or thinking. Live events, Decision Trace, and Ollama Thinking / runtime log can remain open together in independent, bounded scroll areas so long diagnostic data does not cover adjacent panels.
 
 ## Requirements and installation
 
@@ -102,6 +102,7 @@ These tests cover history, durable-memory scope/source/restart behavior, checkpo
 - Tool execution uses the started user's permissions. There is no automatic privilege elevation, commit, push, tag, release, or deployment.
 - The v0.5.0 end-to-end acceptance run `f852b6ce174e` autonomously changed two source files with `apply_patch`, recovered from a cancelled checkpoint, corrected a failed verification script, and verified `GET /projects/{project_id}/index/top-python-files` through FastAPI `TestClient` against real index data. This is one successful coding workflow, not a claim that every coding task is reliably solved.
 - The current workspace Git diff is an inspection result, not an immutable per-run diff snapshot.
+- A terminal SSE replay can have a small status/event ordering inconsistency after a run ends. Persisted run status and result remain authoritative; this is non-blocking for v0.7.0.
 
 ## Development, test, and acceptance history
 

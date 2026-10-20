@@ -19,8 +19,8 @@ REAPER-AI runs locally and does not commit or push changes automatically.
 
 # REAPER-AI — Architecture
 
-**Version:** 0.6.0
-**Status:** M0–M4, M5/P01–P03, M6/P01–P06, P0 targeted edits, and P1 working-memory consolidation are implemented. One checkpoint-recovered end-to-end Sentinel coding acceptance is recorded; broader task reliability remains an explicit limitation. v0.6.0 delivers the UI-only modernization on this unchanged stack.
+**Version:** 0.7.0
+**Status:** M0–M4, M5/P01–P03, M6/P01–P06, P0 targeted edits, and P1 working-memory consolidation are implemented. One checkpoint-recovered end-to-end Sentinel coding acceptance and the D01 read-only acceptance are recorded; broader task reliability remains an explicit limitation. v0.7.0 adds D01 evidence handling, permanent chat/project deletion, and full-width chat presentation on the same stack.
 **Scope:** Local, single-user autonomous coding agent  
 **Language:** English for repository documentation; user interaction follows the user's language.
 

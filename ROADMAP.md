@@ -1,6 +1,6 @@
 # REAPER-AI — Development Roadmap
 
-**Current release:** v0.6.0
+**Current release:** v0.7.0
 **Next planned release:** targeted acceptance and evidence-backed fixes
 **Scope:** local, single-user autonomous coding agent
 
@@ -14,7 +14,7 @@ REAPER-AI turns an engineering request into observable local work: Sentinel insp
 - Preserve explicit checkpoint recovery, file-hash conflict detection, process timeouts, and observable tool results.
 - Document only implemented behaviour and observed acceptance evidence.
 
-## 2. Current state — v0.6.0
+## 2. Current state — v0.7.0
 
 | Area | State |
 | --- | --- |
@@ -22,12 +22,12 @@ REAPER-AI turns an engineering request into observable local work: Sentinel insp
 | M1 — Engine | Implemented |
 | M2 — Reliability | Implemented with documented limitations |
 | M3 — FastAPI | Accepted |
-| M4 — Web UI | v0.6.0 GUI modernization implemented |
+| M4 — Web UI | v0.7.0 GUI and persisted-history improvements implemented |
 | M5 — Persistence | Implemented |
 | M6 — Autonomous Agent | First autonomous end-to-end coding acceptance passed |
 | Variante B — Multi-project | Steps 1–5 implemented |
 
-v0.6.0 includes the v0.5.0 project-scoped repository index, hybrid checkpointed working memory, durable project memory, explicit checkpoint recovery, index-guided Sentinel navigation, P0 hash-bound `apply_patch`, and P1 working-memory consolidation, plus the completed GUI modernization.
+v0.7.0 includes the v0.5.0 project-scoped repository index, hybrid checkpointed working memory, durable project memory, explicit checkpoint recovery, index-guided Sentinel navigation, P0 hash-bound `apply_patch`, P1 working-memory consolidation, the completed GUI modernization, and accepted D01 evidence handling. It also permanently removes selected chats or inactive projects with their owned persisted history while preserving scoped memory boundaries.
 
 ## 3. Completed milestones M0–M6
 
@@ -134,10 +134,13 @@ The Qwen A/B measurement for the same reconstructed decision situation observed 
 | v0.4.0 | Historical pre-release | Earlier M5/M6 and Variante-B baseline; tag retained |
 | v0.5.0 | Current published milestone | P0/P1, `think: false`, repository-index endpoint, copyright notices, and checkpoint-recovered autonomous coding acceptance |
 | v0.6.0 | Current published milestone | GUI modernization: project tabs, settings entry point, compact chat/result presentation, activity dashboard, and bounded independent diagnostic scrolling |
+| v0.7.0 | Current release | Accepted D01 read-only completion, source-fact/context and verification-closure corrections, permanent chat/project-history deletion, full-width chat output, and documented acceptance history |
 
 Historical tags remain immutable from this roadmap forward. Repository publication status and an installed local application are separate states.
 
 ## 7. v0.6.0 — GUI Modernization
+
+![REAPER-AI v0.6.0 UI preview](docs/assets/reaper-ai-v0.6.0-ui-preview.png)
 
 **Goal:** provide a compact, technically oriented Sentinel development interface without changing the backend stack.
 
@@ -195,9 +198,9 @@ The existing FastAPI, HTML, CSS, vanilla JavaScript, SSE, and SQLite stack remai
 - README, architecture, and roadmap describe the implemented state.
 - The local installation is checked after implementation.
 
-## 8. Open work after v0.6.0
+## 8. Open work after v0.7.0
 
-Do not invent feature milestones in advance. Continue with the remaining D01 acceptance cases and concrete limitations observed during v0.6.0 use. Prioritize evidence-backed fixes over new platform layers.
+Do not invent feature milestones in advance. Continue with concrete limitations observed during v0.7.0 use, including the small terminal SSE replay ordering inconsistency. Prioritize evidence-backed fixes over new platform layers.
 
 ## 9. Deliberately deferred functionality
 
