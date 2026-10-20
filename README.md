@@ -1,5 +1,11 @@
 # REAPER-AI
 
+<p align="center">
+  <img src="docs/assets/reaper-ai-v0.6.0-ui-preview.png"
+       alt="REAPER-AI Web Interface"
+       width="80%">
+</p>
+
 **Local, single-user AI coding agent.** REAPER-AI turns engineering requests into observable work: it iteratively inspects files, makes changes, runs checks, and reports the evidence actually produced. A model assertion is never treated as proof of success.
 
 > **Version 0.7.0:** M5/P01–P03 local history, explicit recovery, scoped durable memory, the Variante-B multi-project core, repository index, hybrid per-run working memory, and index-guided Sentinel navigation are implemented, alongside the completed M6/P01–P06 iterative tool-agent work. P0 adds hash-bound targeted edits; P1 consolidates run working memory. D01 autonomous-agent acceptance is recorded as passed.
