@@ -1,7 +1,7 @@
 # REAPER-AI
 
 <p align="center">
-  <img src="docs/assets/reaper-ai-v0.6.0-ui-preview.png"
+  <img src="docs/assets/reaper-ai-v0.9.0-ui-preview.png"
        alt="REAPER-AI Web Interface"
        width="80%">
 </p>
