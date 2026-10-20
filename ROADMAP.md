@@ -1,6 +1,6 @@
 # REAPER-AI — Development Roadmap
 
-**Current release:** v0.7.0
+**Current release:** v0.8.0
 **Next planned release:** targeted acceptance and evidence-backed fixes
 **Scope:** local, single-user autonomous coding agent
 
@@ -14,7 +14,7 @@ REAPER-AI turns an engineering request into observable local work: Sentinel insp
 - Preserve explicit checkpoint recovery, file-hash conflict detection, process timeouts, and observable tool results.
 - Document only implemented behaviour and observed acceptance evidence.
 
-## 2. Current state — v0.7.0
+## 2. Current state — v0.8.0
 
 | Area | State |
 | --- | --- |
@@ -25,9 +25,17 @@ REAPER-AI turns an engineering request into observable local work: Sentinel insp
 | M4 — Web UI | v0.7.0 GUI and persisted-history improvements implemented |
 | M5 — Persistence | Implemented |
 | M6 — Autonomous Agent | First autonomous end-to-end coding acceptance passed |
+| MCP-01 + MCP-02 — Native MCP integration | Released in v0.8.0; optional stdio and Streamable-HTTP server tools extend the existing dispatcher |
 | Variante B — Multi-project | Steps 1–5 implemented |
 
 v0.7.0 includes the v0.5.0 project-scoped repository index, hybrid checkpointed working memory, durable project memory, explicit checkpoint recovery, index-guided Sentinel navigation, P0 hash-bound `apply_patch`, P1 working-memory consolidation, the completed GUI modernization, and accepted D01 evidence handling. It also permanently removes selected chats or inactive projects with their owned persisted history while preserving scoped memory boundaries.
+
+### MCP-01 + MCP-02 — native optional MCP tools (released in v0.8.0)
+
+- `mcp>=2,<3` is the only added runtime dependency. A local `mcp.json` configuration supports standard stdio (`command`/`args`) and Streamable-HTTP (`url`) server entries without built-in server names, commands, or URLs.
+- Sentinel discovers `tools/list` once at run preparation. The checkpointed tool snapshot contains server-qualified names, descriptions, and input schemas; local REAPER tools remain available when discovery fails.
+- Model-selected `mcp:<server>:<tool>` actions go through the existing dispatcher and the SDK's `tools/call` path. Normalized content and structured content become observed evidence, while connection, timeout, schema, and tool failures are returned as ordinary tool errors for the next decision.
+- Acceptance evidence: a real stdio server and a real Streamable-HTTP server advertised and executed `join_words`; autonomous temporary API run `c17192807e47` (`qwen3.8-q5:latest`) selected `mcp:local-test:join_words`, returned `autonomous MCP`, and reached `completed` / exit code `0` with no writes. Local regression run `d95118cd1436` used `list_files`, reached `completed`, and did not require an MCP configuration.
 
 ## 3. Completed milestones M0–M6
 
@@ -134,7 +142,8 @@ The Qwen A/B measurement for the same reconstructed decision situation observed 
 | v0.4.0 | Historical pre-release | Earlier M5/M6 and Variante-B baseline; tag retained |
 | v0.5.0 | Current published milestone | P0/P1, `think: false`, repository-index endpoint, copyright notices, and checkpoint-recovered autonomous coding acceptance |
 | v0.6.0 | Current published milestone | GUI modernization: project tabs, settings entry point, compact chat/result presentation, activity dashboard, and bounded independent diagnostic scrolling |
-| v0.7.0 | Current release | Accepted D01 read-only completion, source-fact/context and verification-closure corrections, permanent chat/project-history deletion, full-width chat output, and documented acceptance history |
+| v0.7.0 | Released | Accepted D01 read-only completion, source-fact/context and verification-closure corrections, permanent chat/project-history deletion, full-width chat output, and documented acceptance history |
+| v0.8.0 | Current release | Native optional MCP client integration through the existing Sentinel dispatcher, including stdio and Streamable HTTP discovery/execution, configuration, and local acceptance evidence |
 
 Historical tags remain immutable from this roadmap forward. Repository publication status and an installed local application are separate states.
 
@@ -198,9 +207,9 @@ The existing FastAPI, HTML, CSS, vanilla JavaScript, SSE, and SQLite stack remai
 - README, architecture, and roadmap describe the implemented state.
 - The local installation is checked after implementation.
 
-## 8. Open work after v0.7.0
+## 8. Open work after v0.8.0
 
-Do not invent feature milestones in advance. Continue with concrete limitations observed during v0.7.0 use, including the small terminal SSE replay ordering inconsistency. Prioritize evidence-backed fixes over new platform layers.
+Do not invent feature milestones in advance. Continue with concrete limitations observed during v0.8.0 use, including the small terminal SSE replay ordering inconsistency. Prioritize evidence-backed fixes over new platform layers.
 
 ## 9. Deliberately deferred functionality
 

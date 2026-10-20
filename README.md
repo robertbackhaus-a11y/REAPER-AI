@@ -8,9 +8,9 @@
 
 **Local, single-user AI coding agent.** REAPER-AI turns engineering requests into observable work: it iteratively inspects files, makes changes, runs checks, and reports the evidence actually produced. A model assertion is never treated as proof of success.
 
-> **Version 0.7.0:** M5/P01–P03 local history, explicit recovery, scoped durable memory, the Variante-B multi-project core, repository index, hybrid per-run working memory, and index-guided Sentinel navigation are implemented, alongside the completed M6/P01–P06 iterative tool-agent work. P0 adds hash-bound targeted edits; P1 consolidates run working memory. D01 autonomous-agent acceptance is recorded as passed.
+> **Version 0.8.0:** M5/P01–P03 local history, explicit recovery, scoped durable memory, the Variante-B multi-project core, repository index, hybrid per-run working memory, index-guided Sentinel navigation, and completed M6/P01–P06 iterative tool-agent work are implemented. P0 adds hash-bound targeted edits; P1 consolidates run working memory. D01 autonomous-agent acceptance is recorded as passed. v0.8.0 adds optional native MCP tool discovery and execution through the official Python SDK.
 
-v0.7.0 includes the v0.6.0 interface modernization and the D01 completion work: checkpointed source facts from every successful read, context prioritization for current targeted ranges, explicit reconciliation of satisfied read-only verification points, and visible no-information-gain evidence for identical reads. The browser retains the same HTML/CSS/vanilla-JavaScript stack: projects and chats can be permanently deleted with their owned run history while project/global memory remains scoped correctly, and chat results now use the full available content width. The activity panel displays only recorded run events, decision traces, and available Ollama/log data; it does not invent progress or thinking. Live events, Decision Trace, and Ollama Thinking / runtime log can remain open together in independent, bounded scroll areas so long diagnostic data does not cover adjacent panels.
+v0.8.0 retains the v0.6.0 interface modernization and the D01 completion work: checkpointed source facts from every successful read, context prioritization for current targeted ranges, explicit reconciliation of satisfied read-only verification points, and visible no-information-gain evidence for identical reads. The browser retains the same HTML/CSS/vanilla-JavaScript stack: projects and chats can be permanently deleted with their owned run history while project/global memory remains scoped correctly, and chat results now use the full available content width. The activity panel displays only recorded run events, decision traces, and available Ollama/log data; it does not invent progress or thinking. Live events, Decision Trace, and Ollama Thinking / runtime log can remain open together in independent, bounded scroll areas so long diagnostic data does not cover adjacent panels.
 
 ## Requirements and installation
 
@@ -33,11 +33,35 @@ REAPER-AI uses the local Ollama API at `http://127.0.0.1:11434`. Start Ollama be
 
 Choose any existing absolute project directory, an installed Ollama model, and a bounded timeout in the browser. Git is an optional inspection tool, not a run precondition. The workspace supplies initial project context; tool paths may also be absolute and are subject to the started user's operating-system permissions. REAPER-AI never elevates permissions. It does not automatically commit, push, tag, publish, or release.
 
+### Model choice
+
+The current D01 comparison retains `qwen3.8-q5:latest` as Sentinel's primary model: it produced the strongest autonomous result among the three tested local models, although its factual-analysis quality still needs improvement. `qwen3.6:35b` was faster but too shallow, while Devstral Small 2 timed out in an unproductive index loop. The measured configurations, run evidence, limitations, and full evaluation are documented in [MODELCHOICE.md](MODELCHOICE.md).
+
 ## Iterative agent and tools (M6)
 
 `src/reaper_ai/agent.py` provides the serializable state and central dispatcher for Sentinel's single iterative LangGraph path. Its checkpointed state includes a compact factual progress snapshot: most recent changed paths, recent tool checks with outcomes, open verification points, and recent tool/model errors. It uses file/Git adapters in `tools.py` and system adapters in `system_tools.py`; it does not introduce another tool implementation, service, or database.
 
 Dispatchable actions are file listing/searching, UTF-8 file and line-range reads, text search, guarded whole-file writes, exact guarded text replacements, Git status/diff, Python-installation discovery, and shell commands. `apply_patch(path, expected_text, replacement, expected_hash)` changes one uniquely occurring source fragment without transferring or rewriting the rest of the file. Every result has `ok`, exit code where applicable, stdout/stderr or structured data, duration, change evidence, and a precise error. Full tool results remain persisted, while the planner receives bounded observation excerpts. Ordinary project scans omit Git object storage but `.git` remains explicitly addressable.
+
+### MCP tools
+
+REAPER-AI can also discover tools from configured Model Context Protocol (MCP) servers through the official Python MCP SDK. Put an optional `mcp.json` beside the application database (normally `%LOCALAPPDATA%\REAPER-AI\mcp.json`), or set `REAPER_MCP_CONFIG` to a different JSON file. A run discovers configured servers once during preparation; unavailable MCP servers are reported in its decision context but do not block local tools. Discovered tools are qualified as `mcp:<server>:<tool>`, with their description and input schema available to Sentinel. Each selected MCP action reconnects through the SDK, calls the tool, and becomes an ordinary observed result with no automatic semantic verification.
+
+```json
+{
+  "mcpServers": {
+    "example-local": {
+      "command": "uvx",
+      "args": ["example-mcp-server"]
+    },
+    "example-http": {
+      "url": "http://127.0.0.1:8001/mcp"
+    }
+  }
+}
+```
+
+`command` starts a local stdio server; `url` selects Streamable HTTP. An optional positive `timeout` (seconds), `env`, and `cwd` may be supplied for a stdio server. No server is bundled or started by REAPER-AI automatically.
 
 Commands and tools execute with the started user's ordinary operating-system permissions—there is no automatic elevation, shell allow-list, command blacklist, risk class, or approval workflow. Timeouts and supervisor cancellation remain active. Existing text files must be read first and supplied with their returned SHA-256 hash; a changed source causes a conflict instead of an overwrite. `apply_patch` also requires that its exact original text occurs once, otherwise it leaves the file unchanged.
 
@@ -108,7 +132,7 @@ These tests cover history, durable-memory scope/source/restart behavior, checkpo
 - Tool execution uses the started user's permissions. There is no automatic privilege elevation, commit, push, tag, release, or deployment.
 - The v0.5.0 end-to-end acceptance run `f852b6ce174e` autonomously changed two source files with `apply_patch`, recovered from a cancelled checkpoint, corrected a failed verification script, and verified `GET /projects/{project_id}/index/top-python-files` through FastAPI `TestClient` against real index data. This is one successful coding workflow, not a claim that every coding task is reliably solved.
 - The current workspace Git diff is an inspection result, not an immutable per-run diff snapshot.
-- A terminal SSE replay can have a small status/event ordering inconsistency after a run ends. Persisted run status and result remain authoritative; this is non-blocking for v0.7.0.
+- A terminal SSE replay can have a small status/event ordering inconsistency after a run ends. Persisted run status and result remain authoritative; this is non-blocking for v0.8.0.
 
 ## Development, test, and acceptance history
 

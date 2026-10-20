@@ -18,6 +18,7 @@ import httpx
 from langgraph.graph import END, START, StateGraph
 
 from reaper_ai.agent import AgentState, dispatch_tool, new_agent_state
+from reaper_ai.mcp_client import discover_mcp_tools
 from reaper_ai.persistence import StorageError, Store
 
 OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
@@ -199,7 +200,9 @@ read_file(path, max_chars?), read_file_range(path, start_line, end_line, max_cha
 find_python, shell(command, timeout?), write_file(path, content, expected_hash?),
 apply_patch(path, expected_text, replacement, expected_hash), index_status,
 index_files(query?, language?, limit?), index_symbols(name, path?, limit?), index_file_symbols(path),
-index_imports(path?). Index tools are project-scoped metadata/navigation only; use `read_file_range` to retrieve source.
+index_imports(path?), plus the exact qualified tools dynamically advertised in `mcp_tools` (for example
+`mcp:server-name:tool-name`). MCP tools are external tools: use their advertised input schema and treat their result
+as tool evidence, not automatically verified fact. Index tools are project-scoped metadata/navigation only; use `read_file_range` to retrieve source.
 Paths may be workspace-relative or
 absolute. Git is optional. Shell commands and writes use the started user's normal operating-system permissions.
 On Windows, `shell` executes Windows PowerShell (`powershell -Command`), not CMD, Bash, or PowerShell 7. Use
@@ -232,6 +235,9 @@ def _ensure_work_memory(agent: dict[str, Any]) -> None:
     if not isinstance(agent.get("current_task"), str):
         agent["current_task"] = ""
     for key in ("facts", "decisions", "information_gaps"):
+        if not isinstance(agent.get(key), list):
+            agent[key] = []
+    for key in ("mcp_tools", "mcp_errors"):
         if not isinstance(agent.get(key), list):
             agent[key] = []
     progress = agent.get("progress") if isinstance(agent.get("progress"), dict) else {}
@@ -323,6 +329,13 @@ def _repository_map_snapshot(repository_map: Any) -> dict[str, Any]:
     return result
 
 
+def _mcp_tools_snapshot(agent: dict[str, Any]) -> list[dict[str, Any]]:
+    """Expose run-start discovery compactly without contacting MCP servers again."""
+    tools = agent.get("mcp_tools") if isinstance(agent.get("mcp_tools"), list) else []
+    return [{key: item.get(key) for key in ("tool", "server", "name", "description", "input_schema")}
+            for item in tools if isinstance(item, dict) and isinstance(item.get("tool"), str)]
+
+
 def _memory_text_items(value: Any, *, field: str, source_hashes: set[tuple[str, str]]) -> list[dict[str, Any]]:
     """Normalize model-supplied working notes without upgrading them to facts."""
     raw_items = value if isinstance(value, list) else [value] if isinstance(value, str) else []
@@ -379,7 +392,8 @@ def _compact_memory_item(item: dict[str, Any]) -> dict[str, Any]:
         ]
     elif isinstance(evidence, dict):
         compact["evidence"] = {key: evidence.get(key) for key in
-                               ("file_count", "symbol_count", "git_branch", "git_head", "scanned_at") if key in evidence}
+                               ("file_count", "symbol_count", "git_branch", "git_head", "scanned_at",
+                                "server", "name", "structured_content") if key in evidence}
     return compact
 
 
@@ -791,6 +805,17 @@ def _observed_tool_knowledge(action: dict[str, Any], result: dict[str, Any]) -> 
         # Actual changes already have their own hash-bound progress evidence.
         # Do not duplicate that record as a generic fact.
         pass
+    elif isinstance(tool, str) and tool.startswith("mcp:"):
+        content = data.get("content") if isinstance(data.get("content"), list) else []
+        text = "\n".join(item.get("text", "") for item in content if isinstance(item, dict) and
+                         isinstance(item.get("text"), str))
+        structured = data.get("structured_content")
+        facts.append({"status": "observed", "kind": "mcp_tool_result",
+                      "summary": _short_text(f"{tool} returned: {text}" if text else f"{tool} succeeded", 900),
+                      "tool": tool, "args": args,
+                      "evidence": {"server": data.get("server"), "name": data.get("name"),
+                                   "structured_content": _short_text(json.dumps(structured, ensure_ascii=False), 1_200)
+                                   if structured is not None else ""}})
     else:
         output = result.get("stdout") if isinstance(result.get("stdout"), str) else ""
         evidence = {key: _short_text(value, 1_200) for key, value in data.items()
@@ -982,6 +1007,7 @@ def _agent_prompt(state: AgentRunState) -> str:
               "code_findings": [], "visible_source_coverage": [],
               "working_memory": _work_memory_snapshot(agent), "progress": progress, "verification": agent["verification"],
               "source_coverage": [], "repository_map": _repository_map_snapshot(agent.get("repository_map")),
+              "mcp_tools": _mcp_tools_snapshot(agent), "mcp_discovery_errors": agent.get("mcp_errors", []),
               "plan": plan, "current_step": agent["current_step"], "previous_observations": []}
     used = len(json.dumps(prompt, ensure_ascii=False).encode("utf-8"))
     findings = [finding for finding in agent.get("progress", {}).get("sources", [])
@@ -1127,6 +1153,8 @@ def _trace_context(prompt: str, system: str) -> dict[str, Any]:
         "confirmed_facts": memory.get("confirmed_facts", []),
         "model_decisions": memory.get("decisions", []),
         "information_gaps": memory.get("information_gaps", []),
+        "mcp_tools": payload.get("mcp_tools", []),
+        "mcp_discovery_errors": payload.get("mcp_discovery_errors", []),
         "visible_source_coverage": payload.get("visible_source_coverage", []),
         "source_excerpts": excerpts,
         "open_verifications": payload.get("progress", {}).get("open_verifications", []),
@@ -1193,6 +1221,9 @@ def agent_prepare(state: AgentRunState) -> dict[str, Any]:
     agent = dict(state["agent"])
     _ensure_work_memory(agent)
     agent["repository_map"] = _repository_map(agent, state["workspace"], state["task"])
+    discovery = discover_mcp_tools()
+    agent["mcp_tools"] = discovery.get("tools", [])
+    agent["mcp_errors"] = discovery.get("errors", [])
     return {"agent": agent, "status": "agent_prepared", "error": "", "last_result": None}
 
 

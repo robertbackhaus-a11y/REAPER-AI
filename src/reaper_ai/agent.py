@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 from typing import Any, TypedDict
 
+from reaper_ai import mcp_client
 from reaper_ai import system_tools
 from reaper_ai import tools
 from reaper_ai.persistence import StorageError, Store
@@ -32,6 +33,8 @@ class AgentState(TypedDict):
     decisions: list[dict[str, Any]]
     information_gaps: list[dict[str, Any]]
     repository_map: dict[str, Any]
+    mcp_tools: list[dict[str, Any]]
+    mcp_errors: list[dict[str, Any]]
     pending_decision_trace: dict[str, Any] | None
 
 
@@ -148,6 +151,8 @@ def new_agent_state() -> AgentState:
         "decisions": [],
         "information_gaps": [],
         "repository_map": {},
+        "mcp_tools": [],
+        "mcp_errors": [],
         "pending_decision_trace": None,
     }
 
@@ -194,6 +199,8 @@ def dispatch_tool(action: ToolAction | dict[str, Any]) -> ToolResult:
             raw = tools.search_text(workspace, query=args["query"], path=args.get("path", "."),
                                     max_results=args.get("max_results"),
                                     case_sensitive=args.get("case_sensitive", False))
+        elif tool_name.startswith("mcp:"):
+            raw = mcp_client.call_mcp_tool(tool_name, args)
         elif tool_name == "write_file":
             path = args.get("path")
             content = args.get("content")
