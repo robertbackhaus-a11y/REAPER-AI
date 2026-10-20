@@ -160,7 +160,7 @@ Return exactly one decision:
  "information_gaps":["unresolved question"]}
 or
 {"kind":"final","outcome":"completed or partial","reason":"short completion or blockage rationale","summary":"concise evidence-based result",
- "verification":"what observed tool results establish"}
+ "verification":"what observed tool results establish","open_verifications":[]}
 `plan`, `open_verifications`, and `verification_for` are optional. `action.tool` must be supported and `action.args`
 must be an object. The work-memory fields are optional and incremental: provide only additions or changes; never repeat
 the whole memory merely to restate it. `decisions` and `information_gaps` are model proposals, not proof of a file
@@ -191,7 +191,8 @@ Work method for every decision:
    it after the successful result. Do not overwrite a still-needed open point, and do not finalize while one remains.
 7. Return `kind: final` only with successful tool evidence. Use `outcome: "completed"` when observed results sufficiently
    satisfy the user goal. Use `outcome: "partial"` when observed evidence establishes a concrete blocker or incomplete
-   result; state the remaining work truthfully and do not describe it as success.
+   result; state the remaining work truthfully and do not describe it as success. If you previously set an open
+   verification point that the observed evidence now satisfies, include `open_verifications: []` in the final decision.
 
 Supported tools: list_files(path?, max_results?), search_text(query, path? file-or-directory, max_results?, case_sensitive?),
 read_file(path, max_chars?), read_file_range(path, start_line, end_line, max_chars?), git_status, git_diff,
@@ -588,9 +589,11 @@ def _context_range_scores(agent: dict[str, Any], findings: list[dict[str, Any]])
         matches = sum(term in path_terms or re.search(rf"\b{re.escape(term)}\b", content) is not None
                       for term in terms)
         score = matches * 100
-        # A dispatcher-truncated full read is weaker edit context than a later,
-        # complete targeted range from the same file.
-        if finding.get("truncated"):
+        # A dispatcher-truncated *full-file* read is weaker edit context than
+        # a targeted range. A range can be truncated only at its final source
+        # line and still be the newest, most relevant evidence; penalizing it
+        # here used to hide it from the very next decision.
+        if finding.get("truncated") and isinstance(finding.get("original_length"), int):
             score -= 5_000
         # A latest, focused read is direct evidence about the active edit.  It
         # wins ties over an older range from the same file without hiding a
@@ -631,9 +634,11 @@ def _select_context_findings(agent: dict[str, Any], findings: list[dict[str, Any
             overlap = max(0, min(end, selected_end) - max(start, selected_start) + 1)
             if not overlap:
                 continue
-            # A clipped broad capture adds no usable context beside the focused
-            # range it overlaps. Near-identical reads are likewise redundant.
-            if candidate.get("truncated") or overlap * 2 >= end - start + 1:
+            # A clipped range can still contain a large, useful tail after a
+            # one-line boundary overlap.  Let _non_overlapping_findings()
+            # remove only the duplicated lines; reject only a near-identical
+            # range that contributes no meaningful new source.
+            if overlap * 2 >= end - start + 1:
                 duplicate = True
                 break
         if not duplicate:
@@ -660,7 +665,7 @@ def _progress_snapshot(agent: dict[str, Any]) -> dict[str, Any]:
 
 
 def _source_fact_finding(finding: dict[str, Any]) -> dict[str, Any] | None:
-    """Summarize source facts confirmed by a successful read, never model prose."""
+    """Summarize every source read as tool-confirmed evidence, never model prose."""
     path, digest, content = finding.get("path"), finding.get("sha256"), finding.get("content")
     start_line, end_line = finding.get("start_line"), finding.get("end_line")
     if not all((isinstance(path, str), isinstance(digest, str), isinstance(content, str),
@@ -694,13 +699,18 @@ def _source_fact_finding(finding: dict[str, Any]) -> dict[str, Any] | None:
                              r"from\s+[^\s]+\s+import\s+.+|import\s+.+)$", line)
             if match:
                 facts.append(f"{match.group(1).strip()} at line {start_line + offset}")
-    if not facts:
-        return None
     unique = list(dict.fromkeys(facts))[:8]
+    range_summary = f"Observed {path} lines {start_line}-{end_line}"
+    detail = "; ".join(unique)
     return {
         "status": "observed",
         "kind": "source_fact",
-        "summary": _short_text(f"Observed in {path}: " + "; ".join(unique), 1_200),
+        # A targeted excerpt frequently starts or ends inside a scope and
+        # therefore cannot be parsed as a standalone Python module.  The read
+        # is still a confirmed fact: without this record, an identical read
+        # produces no memory update and the following decision cannot tell
+        # that it gained no new information.
+        "summary": _short_text(range_summary + (f": {detail}" if detail else "."), 1_200),
         "source": {"path": path, "sha256": digest, "start_line": start_line, "end_line": end_line},
     }
 
@@ -734,6 +744,7 @@ def _observed_tool_knowledge(action: dict[str, Any], result: dict[str, Any]) -> 
             finding["end_line"] = data.get("captured_end_line", data.get("last_line", finding["end_line"]))
         source_fact = _source_fact_finding(finding)
         if source_fact is not None:
+            source_fact["tool"] = tool
             facts.append(source_fact)
         if data.get("truncated"):
             gaps.append({"status": "observed", "kind": "source_gap",
@@ -1232,6 +1243,13 @@ def agent_decide(state: AgentRunState) -> dict[str, Any]:
     kind = decision.get("kind")
     _emit_model_thinking(trace_id=trace_id, step=step)
     if kind == "final":
+        # A final decision may explicitly reconcile verification points that
+        # its observed evidence satisfies.  The action branch already applies
+        # this field, but handling it only there made a read-only run unable to
+        # finish after the model had set an analysis proof point for itself.
+        final_open_points = _string_list(decision.get("open_verifications"))
+        if final_open_points is not None:
+            agent["progress"]["open_verifications"] = final_open_points
         _emit_event("decision_trace", trace_state="decision", trace_id=trace_id, run_id=run_id, step=step,
                     model=MODEL, context=trace["context"], phase_before=trace["phase_before"],
                     decision_kind="final", reason=reason, action=None)

@@ -16,6 +16,58 @@ from reaper_ai.persistence import Store
 
 
 class AgentDispatcherTests(unittest.TestCase):
+    def test_fragment_read_is_retained_and_an_identical_repeat_is_visible(self):
+        agent = new_agent_state()
+        action = {"tool": "read_file_range", "args": {"path": "sample.py", "start_line": 10, "end_line": 10}}
+        result = {"tool": "read_file_range", "ok": True, "exit_code": 0, "stdout": "", "stderr": "",
+                  "data": {"path": "sample.py", "start_line": 10, "end_line": 10,
+                           "captured_end_line": 10, "sha256": "a" * 64,
+                           # An indented line cannot be parsed as a standalone module.
+                           "content": "    return value\n", "truncated": False},
+                  "changes": [], "error": "", "duration_ms": 1}
+
+        engine._record_progress(agent, {"step": 1, "action": action, "result": result})
+        engine._record_progress(agent, {"step": 2, "action": action, "result": result})
+
+        prompt = json.loads(engine._agent_prompt({"task": "Inspect sample.py", "workspace": str(Path.cwd()),
+                                                   "agent": agent}))
+        facts = prompt["working_memory"]["confirmed_facts"]
+        self.assertTrue(any(item["kind"] == "source_fact" and "lines 10-10" in item["summary"] for item in facts))
+        self.assertTrue(any(item["kind"] == "repeat" and "no new confirmed knowledge" in item["summary"]
+                            for item in facts))
+        self.assertEqual(prompt["visible_source_coverage"][0]["covered_ranges"], [[10, 10]])
+
+    def test_final_decision_can_explicitly_reconcile_its_open_proof(self):
+        agent = new_agent_state()
+        agent["progress"]["open_verifications"] = ["Support the read-only analysis with inspected source."]
+        agent["observations"] = [{"step": 1, "action": {"tool": "read_file", "args": {"path": "sample.py"}},
+                                  "result": {"ok": True}}]
+        state = {"task": "Inspect sample.py", "workspace": str(Path.cwd()), "agent": agent,
+                 "status": "pending", "error": "", "details": [], "last_result": None}
+        final = {"kind": "final", "outcome": "completed", "reason": "The inspected source supports the analysis.",
+                 "summary": "Observed result.", "verification": "The source read succeeded.",
+                 "open_verifications": []}
+        with patch.object(engine, "ask_json", return_value=final), patch.object(engine, "_emit_event"):
+            update = engine.agent_decide(state)
+        self.assertEqual(update["status"], "agent_finalizing")
+        self.assertEqual(update["agent"]["progress"]["open_verifications"], [])
+
+    def test_current_truncated_range_outranks_an_older_full_read(self):
+        agent = new_agent_state()
+        agent["current_task"] = "Inspect api.py error handling and state execution"
+        agent["phase"] = "plan"
+        agent["progress"]["sources"] = [
+            {"path": "src/reaper_ai/tools.py", "sha256": "a" * 64, "start_line": 1, "end_line": 200,
+             "content": "error handling state execution\n" * 100, "truncated": False},
+            {"path": "src/reaper_ai/api.py", "sha256": "b" * 64, "start_line": 401, "end_line": 654,
+             "content": "api error handling and state execution\n" * 300, "truncated": True,
+             # Targeted ranges do not report whole-file original_length.
+             "captured_length": 12_000},
+        ]
+        selected = engine._select_context_findings(agent, agent["progress"]["sources"])
+        self.assertEqual((selected[0]["path"], selected[0]["start_line"]),
+                         ("src/reaper_ai/api.py", 401))
+
     def test_event_output_is_utf8_with_legacy_windows_codepage(self):
         env = os.environ.copy()
         env["PYTHONIOENCODING"] = "cp1252"

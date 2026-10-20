@@ -120,6 +120,30 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(store.get_conversation_detail(first["id"])["runs"][0]["run_id"], "run-first")
         self.assertEqual(store.get_conversation_detail(second["id"])["runs"][0]["run_id"], "run-second")
 
+    def test_deleting_conversations_removes_owned_history_but_keeps_global_memory(self):
+        store = Store(self.path)
+        first = store.create_conversation(workspace="C:/project", title="First")
+        second = store.create_conversation(workspace="C:/project", title="Second")
+        store.create_run({"run_id": "delete-me", "conversation_id": first["id"], "workspace": "C:/project",
+                          "model": "model", "task": "delete", "timeout": 30, "status": "interrupted", "started_at": "now"})
+        store.save_checkpoint("delete-me", stage="agent_observe", next_stage="agent_decide",
+                              state={"workspace": "C:/project"}, stage_result={"status": "agent_observed"})
+        store.add_memory(content="Global decision", kind="user_decision", workspace="C:/project", verification="user_confirmed")
+        store.add_memory(content="Chat-only decision", kind="user_decision", workspace="C:/project",
+                         source_conversation_id=first["id"], verification="user_confirmed")
+
+        self.assertTrue(store.delete_conversation(first["id"]))
+        self.assertIsNone(store.get_conversation(first["id"]))
+        self.assertIsNone(store.get_run("delete-me"))
+        self.assertIsNone(store.get_checkpoint("delete-me"))
+        self.assertEqual(store.get_conversation(second["id"])["title"], "Second")
+        remembered = store.list_memory(workspace="C:/project")
+        self.assertEqual([item["content"] for item in remembered], ["Global decision"])
+
+        self.assertEqual(store.delete_conversations(), 1)
+        self.assertEqual(store.list_conversations(), [])
+        self.assertEqual([item["content"] for item in store.list_memory(workspace="C:/project")], ["Global decision"])
+
     def test_project_migration_is_idempotent_and_projects_with_same_workspace_stay_separate(self):
         store = Store(self.path)
         legacy = store.create_conversation(workspace="C:/legacy", model="old-model", title="Legacy")

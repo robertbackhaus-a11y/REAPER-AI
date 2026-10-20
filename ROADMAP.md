@@ -67,16 +67,33 @@ Run `f852b6ce174e` is the current end-to-end acceptance record:
 
 This demonstrates one complete autonomous coding workflow. It is not a claim that every coding task, repository, model response, or external command is reliably handled.
 
-### D01 — autonomous-agent acceptance (partially complete)
+### D01 — autonomous-agent acceptance (accepted 2026-10-20)
 
-Existing focused tests already cover tool dispatch, failed-check correction, checkpoint recovery, persistence, project isolation, UTF-8 events, process timeout reporting, and explicit recovery availability. The following are targeted remaining acceptance cases, not unproven defects:
+Existing focused tests cover tool dispatch, failed-check correction, checkpoint recovery, persistence, project isolation, UTF-8 events, process timeout reporting, and explicit recovery availability. The following acceptance evidence is intentionally kept factual:
 
-- read-only analysis that completes without modifying code;
-- behaviour with a repository already modified before a run starts;
-- rejection of unsupported or insufficient success claims;
-- unproductive-loop detection and controlled terminal behaviour;
-- cancellation of a process tree including child processes;
-- browser representation of actual engine events, cancellation, recovery, and terminal status.
+| Criterion | Result | Evidence |
+| --- | --- | --- |
+| Autonomous coding | PASS | Historical run `f852b6ce174e`: two guarded source changes, recovery, failed-check correction, and FastAPI `TestClient` verification against real index data. |
+| Read-only analysis | PASS (grade 4, accepted) | Run `d01-1792496155` completed without writes after 17 tool actions, did not repeat a successful range, and produced a line-cited report. External review classified the report's technical quality as sufficient, while retaining its known limitations below. |
+| Error correction | PASS | `f852b6ce174e`; the focused `test_agent_keeps_evidence_through_failed_check_correction_and_resume` also preserves the failure/correction/check evidence path. |
+| Unsupported success claim | PASS | The focused agent-dispatcher test retains a failed check and reaches `completed` only after a later successful verification; model prose alone is excluded from persisted factual context. |
+| Existing changes protected | PASS | Run `33ea6c56dd7a` in a separate Git repository created only `agent_output.txt`; the pre-existing uncommitted `protected-notes.txt` remained byte-identical and `README.md` was unchanged. |
+| Unproductive loop | PASS (fresh targeted run) | `d01-1792496155` completed after progressive, non-identical source ranges. It recovered from two out-of-range reads by changing files/ranges; it did not repeat a successful range. Historic failed runs remain retained as regression evidence. |
+| Cancellation/process tree | PASS (bounded evidence) | Existing M2 R04 synthetic timeout evidence verified parent/child-process termination; the API cancellation of `218b6ffa761b` reached `cancelled` and emitted a terminal event. |
+| GUI events/status | PASS | The browser rendered the persisted live timeline for `218b6ffa761b`, including tool events, decision traces, terminal cancellation status, and its explicit recovery control. |
+
+D01 is **accepted**. The assessment combines technical execution (grade 2), factual-result quality (grade 4), and an overall grade of 3. Run `d01-1792496155` reached `completed` / exit code 0 in 128.9 seconds with 18 model calls, 17 tool calls, no file changes, a valid checkpoint, strategy changes after two invalid range requests, and no repeated successful range read. The report was externally reviewed: bounded check/error history is a deliberate context trade-off; an open verification after a failed check is correct; the claimed missing Git timeouts was false; active-run process liveness has a small residual risk mitigated by `_watch()`; and replay has a possible small terminal-stream inconsistency. These are retained as limitations rather than blockers for this acceptance.
+
+### REAPER-AI — development, test, and acceptance history
+
+This history records evidence that remains available in project documents, source, Git history, focused tests, or persisted run data. Historic runs whose logs are no longer retained are identified by their recorded symptoms rather than reconstructed as new evidence.
+
+- Earlier D01 runs showed repeated reads of `engine.py:220–450` and later `engine.py:320–549`. The retained diagnosis attributed this to successful range fragments that produced no source fact when they could not be parsed independently, and to prompt selection that could demote a current truncated range.
+- The corrective path retains every successful read as a hash- and range-bound observed source fact, even for a fragment inside a declaration; independently parseable excerpts add declarations, signatures, and imports. An identical later read is recorded as no new confirmed knowledge. This state is checkpointed.
+- Range selection now scores individual excerpts and does not treat a truncated, targeted range as a weak full-file capture. Persisted source coverage and `visible_source_coverage` remain separate, so the decision trace shows only what was actually sent to the model.
+- A final decision may explicitly reconcile a satisfied read-only proof with `open_verifications: []`; it does not implicitly remove unrelated verification requirements. This fixed the former stale-proof closure path while preserving failed-check evidence.
+- The fresh D01 integration run `d01-1792496155` demonstrated progressive source navigation, autonomous recovery from invalid requested line ranges, a regular terminal state, and no writes. Its report was reviewed as sufficient rather than perfect; the detailed assessment above records the one false timeout claim and the remaining API/replay observations.
+- Focused dispatcher, persistence, checkpoint/recovery, project-isolation, UTF-8, supervisor timeout/cancellation, source-coverage, and agent-decision tests were run during the corresponding changes. Python syntax and `git diff --check` were also used as targeted technical checks. No claim is made for historical raw logs that have since been removed with application history.
 
 ### D02 — published baseline
 

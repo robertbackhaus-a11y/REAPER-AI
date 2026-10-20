@@ -77,13 +77,13 @@ h1 { margin: 0; color: #f0f7ff; font-size: 18px; letter-spacing: .01em; }
 .thread { flex: 1; overflow: auto; padding: 24px clamp(20px, 4vw, 58px); display: flex; flex-direction: column; gap: 18px; background: radial-gradient(circle at 60% 10%, #143b6112, transparent 48%); scrollbar-color: #315b82 transparent; }
 .welcome { margin: auto; max-width: 470px; color: var(--text-muted); text-align: center; }
 .welcome h2 { color: #ddecff; font-size: 23px; }
-.bubble { max-width: 900px; padding: 16px 19px; border: 1px solid #25405e; border-radius: 13px; color: #e3edf9; background: linear-gradient(145deg, #111e2d, #0c1725); white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.55; box-shadow: 0 8px 20px #00000020; }
+.bubble { align-self: stretch; width: 100%; max-width: none; min-width: 0; padding: 16px 19px; border: 1px solid #25405e; border-radius: 13px; color: #e3edf9; background: linear-gradient(145deg, #111e2d, #0c1725); white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.55; box-shadow: 0 8px 20px #00000020; }
 .bubble.user { align-self: flex-end; border-color: #285a94; background: linear-gradient(145deg, #123d70, #10264c); }
-.bubble.agent { align-self: flex-start; width: min(100%, 900px); }
+.bubble.agent { align-self: flex-start; width: 100%; }
 .bubble.final-answer { border-color: #2584c8; box-shadow: 0 0 0 1px #2ab9ff20, 0 10px 27px #00000032; }
 .answer-head { display: flex; align-items: center; gap: 10px; margin-bottom: 11px; color: #36c8ff; }
 .answer-head .copy { margin-left: auto; padding: 4px 8px; font-size: 11px; }
-.bubble pre, .detail pre { margin: 10px 0; max-height: 320px; padding: 13px; overflow: auto; border: 1px solid #213d5b; border-radius: 8px; color: #c9e4ff; background: #050d18; font-family: "Cascadia Code", Consolas, monospace; font-size: 12px; line-height: 1.55; white-space: pre-wrap; scrollbar-color: #315b82 transparent; }
+.bubble pre, .detail pre { margin: 10px 0; max-width: 100%; max-height: 320px; padding: 13px; overflow: auto; border: 1px solid #213d5b; border-radius: 8px; color: #c9e4ff; background: #050d18; font-family: "Cascadia Code", Consolas, monospace; font-size: 12px; line-height: 1.55; white-space: pre; scrollbar-color: #315b82 transparent; }
 .detail { margin-top: 12px; padding: 8px 10px; border: 1px solid #213a55; border-radius: 8px; background: #0b1623; }
 .detail summary, .activity-section summary { cursor: pointer; color: #aed7f7; font-weight: 650; }
 .detail .copy { padding: 5px 9px; font-size: 11px; }
@@ -135,6 +135,11 @@ h1 { margin: 0; color: #f0f7ff; font-size: 18px; letter-spacing: .01em; }
 .path-row input, .path-row select { min-width: 0; flex: 1; }
 .settings-section pre { max-height: 210px; margin: 0; padding: 9px; overflow: auto; border: 1px solid #213d5b; border-radius: 7px; color: #bbd7ef; background: #060f1a; white-space: pre-wrap; }
 .danger { color: #ffb8c1; border-color: #804252; }
+.confirm-dialog { width: min(470px, calc(100vw - 32px)); padding: 0; border: 1px solid #804252; border-radius: 13px; color: #e8f1ff; background: #0b1522; box-shadow: 0 25px 70px #000000aa; }
+.confirm-dialog::backdrop { background: #020713bb; }
+.confirm-dialog form { display: grid; gap: 15px; padding: 20px; }
+.confirm-dialog p { margin: 0; color: #c3d4e8; line-height: 1.5; white-space: pre-line; }
+.dialog-actions { display: flex; justify-content: flex-end; gap: 8px; }
 
 .layout.left-collapsed .app-columns { grid-template-columns: minmax(480px, 1fr) 390px; }
 .layout.left-collapsed .sidebar { display: none; }

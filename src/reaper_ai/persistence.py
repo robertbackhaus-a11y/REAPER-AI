@@ -352,12 +352,18 @@ class Store:
         return dict(row)
 
     def delete_project(self, project_id: str) -> bool:
-        """Delete only empty projects; historical records are never cascaded away."""
+        """Delete one project and its project-scoped history in one transaction."""
         try:
             with self._connect() as connection:
-                for table in ("conversations", "runs", "durable_memory"):
-                    if connection.execute(f"SELECT 1 FROM {table} WHERE project_id = ? LIMIT 1", (project_id,)).fetchone():
-                        return False
+                # The project_id columns were added to existing history tables, so
+                # they do not have foreign-key cascades. Delete only matching rows;
+                # legacy rows without a project_id intentionally remain untouched.
+                connection.execute("DELETE FROM durable_memory WHERE project_id = ?", (project_id,))
+                connection.execute("DELETE FROM runs WHERE project_id = ?", (project_id,))
+                connection.execute("DELETE FROM conversations WHERE project_id = ?", (project_id,))
+                # Deleting the project cascades its repository-index rows through
+                # the existing foreign keys. Runs cascade events, stage results,
+                # and checkpoints through theirs.
                 return connection.execute("DELETE FROM projects WHERE project_id = ?", (project_id,)).rowcount == 1
         except sqlite3.Error as exc:
             raise StorageError(f"Could not delete project: {exc}") from exc
@@ -612,13 +618,38 @@ class Store:
         return [dict(row) for row in rows]
 
     def delete_conversation(self, conversation_id: str) -> bool:
-        """Delete one conversation and its messages while retaining its run records."""
+        """Delete one conversation and the data owned exclusively by it."""
         try:
             with self._connect() as connection:
+                exists = connection.execute("SELECT 1 FROM conversations WHERE id = ?", (conversation_id,)).fetchone()
+                if exists is None:
+                    return False
+                # Durable memory without a conversation source is project/global
+                # knowledge. Only remove facts tied exclusively to this chat.
+                connection.execute("DELETE FROM durable_memory WHERE source_conversation_id = ?", (conversation_id,))
+                # Child event, stage-result, and checkpoint rows cascade from runs.
+                connection.execute("DELETE FROM runs WHERE conversation_id = ?", (conversation_id,))
                 cursor = connection.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
                 return cursor.rowcount == 1
         except sqlite3.Error as exc:
             raise StorageError(f"Could not delete conversation: {exc}") from exc
+
+    def delete_conversations(self, project_id: str | None = None) -> int:
+        """Delete all chats in one scope without touching project/global memory."""
+        try:
+            with self._connect() as connection:
+                condition, parameters = ("project_id = ?", (project_id,)) if project_id is not None else ("1 = 1", ())
+                rows = connection.execute(f"SELECT id FROM conversations WHERE {condition}", parameters).fetchall()
+                conversation_ids = [row["id"] for row in rows]
+                if not conversation_ids:
+                    return 0
+                placeholders = ",".join("?" for _ in conversation_ids)
+                connection.execute(f"DELETE FROM durable_memory WHERE source_conversation_id IN ({placeholders})", conversation_ids)
+                connection.execute(f"DELETE FROM runs WHERE conversation_id IN ({placeholders})", conversation_ids)
+                cursor = connection.execute(f"DELETE FROM conversations WHERE id IN ({placeholders})", conversation_ids)
+                return cursor.rowcount
+        except sqlite3.Error as exc:
+            raise StorageError(f"Could not delete conversations: {exc}") from exc
 
     def add_message(
         self, conversation_id: str, *, role: str, content: str, run_id: str | None = None,

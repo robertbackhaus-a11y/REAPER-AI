@@ -79,6 +79,15 @@ def _entry(run_id: str) -> dict:
     return stored
 
 
+def _active_conversation_ids() -> set[str]:
+    """Return conversations that still own a live supervisor process."""
+    with _lock:
+        return {
+            entry["conversation_id"] for entry in _runs.values()
+            if entry.get("status") in {"running", "cancelling"} and isinstance(entry.get("conversation_id"), str)
+        }
+
+
 def _terminal_summary(run_id: str, status: str, result: dict | None) -> str:
     """A compact, observed-only chat record; raw model prose is not saved here."""
     changed = result.get("changed_files", []) if isinstance(result, dict) else []
@@ -291,9 +300,13 @@ def update_project(project_id: str, request: ProjectUpdateRequest):
 @app.delete("/projects/{project_id}", status_code=204)
 def delete_project(project_id: str):
     _project_or_404(project_id)
+    with _lock:
+        active = _runs.get(_active) if _active else None
+        if active is not None and active.get("project_id") == project_id and active.get("status") in {"running", "cancelling"}:
+            raise HTTPException(status_code=409, detail=f"Project cannot be deleted while run {_active} is active")
     try:
         if not _store.delete_project(project_id):
-            raise HTTPException(status_code=409, detail="Project has historical chats, runs, or project knowledge and cannot be deleted")
+            raise HTTPException(status_code=404, detail="Unknown project")
     except StorageError as exc:
         raise _storage_failure(exc) from exc
     return Response(status_code=204)
@@ -406,13 +419,27 @@ def get_conversation(conversation_id: str):
 
 @app.delete("/conversations/{conversation_id}", status_code=204)
 def delete_conversation(conversation_id: str):
-    with _lock:
-        if any(entry.get("conversation_id") == conversation_id and entry.get("status") in {"running", "cancelling"}
-               for entry in _runs.values()):
-            raise HTTPException(status_code=409, detail="Conversation has an active run")
+    if conversation_id in _active_conversation_ids():
+        raise HTTPException(status_code=409, detail="Conversation has an active run")
     try:
         if not _store.delete_conversation(conversation_id):
             raise HTTPException(status_code=404, detail="Unknown conversation")
+    except StorageError as exc:
+        raise _storage_failure(exc) from exc
+    return Response(status_code=204)
+
+
+@app.delete("/conversations", status_code=204)
+def delete_all_conversations(project_id: str | None = None):
+    try:
+        conversations = _store.list_conversations(project_id=project_id)
+    except StorageError as exc:
+        raise _storage_failure(exc) from exc
+    active = _active_conversation_ids()
+    if any(item.get("id") in active for item in conversations):
+        raise HTTPException(status_code=409, detail="A conversation has an active run")
+    try:
+        _store.delete_conversations(project_id=project_id)
     except StorageError as exc:
         raise _storage_failure(exc) from exc
     return Response(status_code=204)
