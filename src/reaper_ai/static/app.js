@@ -82,4 +82,107 @@ $('validate').addEventListener('click', validate); $('reload').addEventListener(
 $('new-project').addEventListener('click', newProject); $('save-project').addEventListener('click', saveProject); $('delete-project').addEventListener('click', deleteProject); $('refresh-index').addEventListener('click', refreshIndex); $('search-index').addEventListener('click', searchIndex); $('index-query').addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); searchIndex(); } });
 $('new-conversation').addEventListener('click', newConversation); $('delete-conversation').addEventListener('click', deleteConversation); $('delete-all-conversations').addEventListener('click', deleteAllConversations); $('start').addEventListener('click', start); $('cancel').addEventListener('click', cancel); $('save-memory').addEventListener('click', saveMemory);
 $('copy-events').addEventListener('click', () => copyText([...$('active-timeline').children].map(item => item.innerText).join('\n'))); $('copy-trace').addEventListener('click', () => copyText($('decision-trace').textContent)); $('copy-log').addEventListener('click', () => copyText($('active-log').textContent)); $('task').addEventListener('keydown', event => { if (event.key === 'Enter' && event.ctrlKey) { event.preventDefault(); start(); } });
-(async () => { await models(); await loadProjects(); await loadProjectMemory(); await loadIndexStatus(); restoreActive(); })();
+(async () => { await models(); await loadProjects(); await loadProjectMemory(); await loadIndexStatus(); await loadFileTree(); restoreActive(); })();
+
+// Project files stay in the existing index; the editor keeps only the files the
+// user has explicitly opened and relies on the API's existing hash protection.
+const editorFiles = new Map();
+let activeEditorFile = '';
+
+function editorLanguage(path) {
+  const extension = path.split('.').pop()?.toLowerCase() || '';
+  return ({ py: 'python', js: 'javascript', mjs: 'javascript', cjs: 'javascript', json: 'json', html: 'html', htm: 'html', css: 'css', md: 'markdown', markdown: 'markdown' })[extension] || 'text';
+}
+function escapeHtml(value) { return value.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&#39;'); }
+function tokenClass(token, language) {
+  if (/^(#|\/\/|\/\*)/.test(token)) return 'token-comment';
+  if (/^['"`]/.test(token)) return 'token-string';
+  if (/^\d/.test(token)) return 'token-number';
+  if (language === 'html' && /^<\/?/.test(token)) return 'token-tag';
+  if (language === 'json' && /^['"]/.test(token) && /:\s*$/.test(token)) return 'token-property';
+  return 'token-keyword';
+}
+function highlightLine(line, language) {
+  if (language === 'text') return escapeHtml(line);
+  const keywords = language === 'python' ? 'and|as|assert|async|await|break|class|def|del|elif|else|except|False|finally|for|from|if|import|in|is|lambda|None|not|or|pass|raise|return|True|try|while|with|yield' : language === 'javascript' ? 'async|await|break|case|catch|class|const|continue|default|delete|else|export|false|finally|for|from|function|if|import|in|let|new|null|return|switch|throw|true|try|typeof|undefined|while' : language === 'css' ? 'color|display|flex|grid|margin|padding|position|background|border|width|height' : 'true|false|null';
+  const pattern = new RegExp(`(#[^\\n]*|//[^\\n]*|/\\*.*?\\*/|</?[A-Za-z][^>]*?>|\"(?:\\\\.|[^\"])*\"|'(?:\\\\.|[^'])*'|\\b(?:${keywords})\\b|\\b\\d+(?:\\.\\d+)?\\b)`, 'g');
+  let cursor = 0;
+  let output = '';
+  for (const match of line.matchAll(pattern)) {
+    output += escapeHtml(line.slice(cursor, match.index));
+    output += `<span class="${tokenClass(match[0], language)}">${escapeHtml(match[0])}</span>`;
+    cursor = match.index + match[0].length;
+  }
+  return output + escapeHtml(line.slice(cursor));
+}
+function editorCurrent() { return editorFiles.get(activeEditorFile) || null; }
+function renderEditor() {
+  const file = editorCurrent();
+  const empty = $('editor-empty'); const workspace = $('editor-workspace');
+  empty.hidden = Boolean(file); workspace.hidden = !file;
+  if (!file) return;
+  $('editor-content').value = file.content;
+  $('editor-path').textContent = file.path;
+  $('editor-notice').textContent = file.notice || '';
+  $('editor-file-status').textContent = file.truncated ? 'Nur Teilansicht' : file.dirty ? 'Ungespeichert' : 'Gespeichert';
+  $('save-file').disabled = Boolean(file.truncated) || !file.dirty;
+  const language = editorLanguage(file.path);
+  $('editor-highlight').innerHTML = file.content.split('\n').map((line, index) => `<span class="editor-line"><span class="editor-line-number">${index + 1}</span>${highlightLine(line, language) || ' '}</span>`).join('');
+  const tabs = $('editor-file-tabs'); tabs.replaceChildren();
+  for (const [path, item] of editorFiles) { const tab = document.createElement('button'); tab.type = 'button'; tab.className = `editor-file-tab${path === activeEditorFile ? ' active' : ''}`; tab.textContent = `${item.dirty ? '● ' : ''}${path.split('/').at(-1)}`; tab.title = path; tab.addEventListener('click', () => { activeEditorFile = path; renderEditor(); }); tabs.appendChild(tab); }
+  renderFileTree();
+}
+function showWorkspaceView(view) {
+  const editor = view === 'editor';
+  $('chat-panel').hidden = editor; $('editor-panel').hidden = !editor;
+  $('show-chat').classList.toggle('active', !editor); $('show-editor').classList.toggle('active', editor);
+  if (editor) renderEditor();
+}
+function treeNode() { return { folders: new Map(), files: [] }; }
+function renderFileTree() {
+  const root = $('file-tree'); root.replaceChildren();
+  if (!activeProject) { root.innerHTML = '<p class="muted">Projekt auswählen, um Dateien anzuzeigen.</p>'; return; }
+  const items = root._files || [];
+  if (!items.length) { root.innerHTML = '<p class="muted">Keine indexierten Dateien.</p>'; return; }
+  const tree = treeNode();
+  for (const item of items) { let node = tree; const parts = item.path.split('/'); for (const part of parts.slice(0, -1)) { if (!node.folders.has(part)) node.folders.set(part, treeNode()); node = node.folders.get(part); } node.files.push(item); }
+  const renderBranch = (node, container) => {
+    for (const [name, child] of [...node.folders].sort(([left], [right]) => left.localeCompare(right))) { const details = document.createElement('details'); details.open = true; const summary = document.createElement('summary'); summary.textContent = name; const nested = document.createElement('div'); renderBranch(child, nested); details.append(summary, nested); container.appendChild(details); }
+    for (const item of [...node.files].sort((left, right) => left.path.localeCompare(right.path))) { const button = document.createElement('button'); button.type = 'button'; button.className = `file-leaf${item.path === activeEditorFile ? ' active' : ''}`; button.textContent = item.path.split('/').at(-1); button.title = `${item.path} · ${item.line_count || 0} Zeilen`; button.addEventListener('click', () => openEditorFile(item.path)); container.appendChild(button); }
+  };
+  renderBranch(tree, root);
+}
+async function loadFileTree() {
+  const tree = $('file-tree');
+  if (!activeProject) { renderFileTree(); return; }
+  tree.innerHTML = '<p class="muted">Dateibaum wird geladen …</p>';
+  try { const data = await request(`/projects/${encodeURIComponent(activeProject)}/index/files?limit=2000`); tree._files = data.files || []; renderFileTree(); }
+  catch (error) { tree.innerHTML = `<p class="err">Dateibaum: ${escapeHtml(error.message)}</p>`; }
+}
+async function openEditorFile(path) {
+  if (!activeProject) return;
+  showWorkspaceView('editor');
+  $('editor-empty').textContent = `Lade ${path} …`; $('editor-empty').hidden = false; $('editor-workspace').hidden = true;
+  try {
+    const file = await request(`/projects/${encodeURIComponent(activeProject)}/files/content?path=${encodeURIComponent(path)}`);
+    editorFiles.set(path, { path: file.path || path, content: file.content || '', hash: file.sha256, truncated: Boolean(file.truncated), dirty: false, notice: file.truncated ? `Große Datei: ${file.captured_length} von ${file.original_length} Zeichen geladen. Speichern ist deaktiviert.` : `${file.end_line || 0} Zeilen · ${editorLanguage(path)}` });
+    activeEditorFile = path; renderEditor();
+  } catch (error) {
+    $('editor-empty').textContent = `Keine Textvorschau: ${error.message}`;
+  }
+}
+async function saveEditorFile() {
+  const file = editorCurrent(); if (!file || file.truncated || !file.dirty || !activeProject) return;
+  $('save-file').disabled = true; $('editor-file-status').textContent = 'Speichert …';
+  try { const saved = await request(`/projects/${encodeURIComponent(activeProject)}/files/content`, { method: 'PUT', body: JSON.stringify({ path: file.path, content: file.content, expected_hash: file.hash }) }); file.hash = saved.after_hash; file.dirty = false; file.notice = `Gespeichert · ${saved.bytes} Bytes`; renderEditor(); await loadFileTree(); info('activity', `Datei gespeichert: ${file.path}`, 'ok'); }
+  catch (error) { file.notice = error.message.includes('conflict') ? 'Konflikt: Die Datei wurde extern geändert. Neu laden, bevor gespeichert wird.' : error.message; renderEditor(); info('activity', `Speichern fehlgeschlagen: ${error.message}`, 'err'); }
+}
+
+const baseSelectProject = selectProject;
+selectProject = async function(projectId) { await baseSelectProject(projectId); editorFiles.clear(); activeEditorFile = ''; showWorkspaceView('chat'); await loadFileTree(); };
+$('refresh-file-tree').addEventListener('click', loadFileTree);
+$('show-chat').addEventListener('click', () => showWorkspaceView('chat'));
+$('show-editor').addEventListener('click', () => showWorkspaceView('editor'));
+$('editor-content').addEventListener('input', event => { const file = editorCurrent(); if (!file) return; file.content = event.target.value; file.dirty = true; renderEditor(); });
+$('editor-content').addEventListener('scroll', event => { $('editor-highlight').scrollTop = event.target.scrollTop; $('editor-highlight').scrollLeft = event.target.scrollLeft; });
+$('save-file').addEventListener('click', saveEditorFile);

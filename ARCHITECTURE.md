@@ -19,8 +19,8 @@ REAPER-AI runs locally and does not commit or push changes automatically.
 
 # REAPER-AI — Architecture
 
-**Version:** 0.8.0
-**Status:** M0–M4, M5/P01–P03, M6/P01–P06, P0 targeted edits, P1 working-memory consolidation, and optional native MCP discovery/execution are implemented. One checkpoint-recovered end-to-end Sentinel coding acceptance and the D01 read-only acceptance are recorded; broader task reliability remains an explicit limitation. v0.8.0 adds MCP tool support through the existing dispatcher while retaining D01 evidence handling, permanent chat/project deletion, and full-width chat presentation on the same stack.
+**Version:** 0.9.0
+**Status:** M0–M4, M5/P01–P03, M6/P01–P06, P0 targeted edits, P1 working-memory consolidation, and optional native MCP discovery/execution are implemented. One checkpoint-recovered end-to-end Sentinel coding acceptance and the D01 read-only acceptance are recorded; broader task reliability remains an explicit limitation. v0.8.0 adds MCP tool support through the existing dispatcher; v0.9.0 adds project file navigation and a hash-guarded browser editor on the same stack.
 **Scope:** Local, single-user autonomous coding agent  
 **Language:** English for repository documentation; user interaction follows the user's language.
 
@@ -283,6 +283,8 @@ The same database also keeps a project-local repository index. `project_index_fi
 The index adds neither a second state store nor new LangGraph nodes. The existing vanilla-JavaScript browser UI lists and selects projects in its left sidebar, presents project conversations as non-destructive top tabs, and groups project creation/editing, project memory, and index status/refresh/search in a top-right settings control. Legacy/unassigned chats remain accessible through their own project selection. Closing a tab is UI-only; permanent chat deletion removes only that conversation's messages, runs and cascading event/checkpoint records, plus memory sourced by that chat. Project/global memory and workspace files remain outside that operation. Project-specific prompt text supplements the fixed Sentinel technical contract; it cannot replace tool definitions or execution rules.
 
 The same browser surface uses a local transparent Wolf/Kanji brand asset and a compact dark blue/cyan presentation layer. It is purely a static UI asset plus CSS: it does not change FastAPI routing, SQLite records, SSE event contents, or LangGraph state. The right activity panel continues to render only persisted/live event timeline entries, decision traces, and the available Ollama-thinking or runtime-log data.
+
+The project sidebar obtains its expandable file tree from the existing project index; it does not add another filesystem service. The browser editor is a separate view from the chat and keeps only explicitly opened files client-side. It reads text through `GET /projects/{project_id}/files/content` and saves through the existing hash-guarded `tools.write_file` path exposed by `PUT /projects/{project_id}/files/content`. The editor overlays an editable textarea on a local syntax-highlight layer, so highlighting, cursor positions, text selection, and line numbers remain one visual code surface without a third-party editor dependency. Partial captures disable saving, and non-UTF-8 results are reported as unavailable previews.
 
 ### Variante B / hybrid run working memory (step 3)
 

@@ -18,10 +18,11 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
+from reaper_ai import tools
 from reaper_ai.persistence import StorageError, Store
 from reaper_ai.repository_index import RepositoryIndexError, refresh_project_index
 
-app = FastAPI(title="REAPER-AI", version="0.8.0")
+app = FastAPI(title="REAPER-AI", version="0.9.0")
 _lock = threading.Lock()
 _runs: dict[str, dict] = {}
 _active: str | None = None
@@ -232,6 +233,12 @@ class ProjectUpdateRequest(BaseModel):
     num_ctx: int | None = Field(default=None, ge=1_024, le=131_072)
 
 
+class EditorFileRequest(BaseModel):
+    path: str = Field(min_length=1, max_length=10_000)
+    content: str = Field(max_length=500_000)
+    expected_hash: str = Field(min_length=1, max_length=128)
+
+
 def _validate_workspace(workspace: str) -> Path:
     # Workspace must be explicitly supplied as an absolute path, not a path
     # relative to the API process or the current user directory.
@@ -366,6 +373,31 @@ def get_top_python_files(project_id: str):
         return {"files": _store.top_python_files_by_symbols(project_id, limit=5)}
     except StorageError as exc:
         raise _storage_failure(exc) from exc
+
+
+@app.get("/projects/{project_id}/files/content")
+def get_project_file(project_id: str, path: str):
+    """Read a project text file for the browser editor with its source hash."""
+    project = _project_or_404(project_id)
+    result = tools.read_file(project["workspace"], path, max_chars=500_000)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("error", "File cannot be read as UTF-8 text"))
+    return result
+
+
+@app.put("/projects/{project_id}/files/content")
+def save_project_file(project_id: str, request: EditorFileRequest):
+    """Save one editor file only when it still matches the displayed hash."""
+    project = _project_or_404(project_id)
+    result = tools.write_file(project["workspace"], request.path, request.content,
+                              expected_hash=request.expected_hash)
+    if not result.get("ok"):
+        detail = result.get("error", "File could not be saved")
+        status = 409 if "conflict" in detail.casefold() else 400
+        raise HTTPException(status_code=status, detail=detail)
+    if result.get("changed"):
+        _refresh_index(project)
+    return result
 
 
 class ConversationRequest(BaseModel):
