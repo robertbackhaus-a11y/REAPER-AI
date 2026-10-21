@@ -11,7 +11,7 @@ REAPER-AI is a local single-user coding agent built on FastAPI, LangGraph, Ollam
 | v0.8.0 | Native MCP integration | Released |
 | v0.9.0 | Web editor and file navigation | Released |
 | v0.9.1 | Sentinel evidence and context | Released |
-| v0.10.0 | Autonomous coding quality | In progress — C01/C02 complete |
+| v0.10.0 | Autonomous coding quality | In progress — C01/C02/C03 complete |
 | v0.11.0 | Cross-platform and workflow UI | Planned |
 | v1.0.0 | Stable autonomous coding agent | Target |
 
@@ -32,6 +32,7 @@ The following work is implemented and released. Completion means that the descri
 - Structured S03 assessments and question updates are optional decision fields and were not emitted reliably by every tested model; they were diagnostics, not acceptance criteria for the model comparisons.
 - `completed` alone does not demonstrate functional task fulfillment; observed changes and independent verification remain authoritative.
 - Repeated tool calls and verification loops can still occur in untested model/task combinations. C02 removes one demonstrated cause by preserving shell exit code, stdout, and stderr in the next decision context.
+- Terminal usage totals for a recovered run currently cover its resumed process; retained decision traces and event logs provide the complete cross-process measurement.
 - The autonomous process supervisor is currently Windows-specific. Linux and macOS installation/API-start commands are documented, but autonomous run start, recovery, and cancellation require a POSIX supervisor before they can be supported.
 - Terminal SSE replay can expose a minor status/event ordering inconsistency after a run ends; persisted terminal status and results remain authoritative.
 
@@ -64,6 +65,8 @@ The following work is implemented and released. Completion means that the descri
 - Re-run failed checks after a correction.
 - Continue interrupted coding runs through the existing checkpoint mechanism.
 - Avoid repeating already completed actions without a concrete reason.
+
+**Completed.** In `8f7670dc9ebf`, Sentinel diagnosed and patched a refund-calculation defect, then was deliberately cancelled before completion. The valid `agent_observe → agent_decide` checkpoint retained the changed file and outstanding checks across a REAPER restart. Recovery continued the same run without rereading the implementation or reapplying the patch. Sentinel recovered from an unavailable `pytest` module by using `unittest`, passed both fixture tests, verified `books: 15.00` through the CLI, updated the fixture README, and finished `completed`. Combined trace data records 17 model calls, 16 tool calls, and 147.7 seconds including the interruption/restart. One failed pre-patch `pytest` command was repeated once; no sustained tool loop occurred. **C03: passed, grade 2.** One successful controlled recovery does not establish universal recovery reliability.
 
 ### C04 — Existing changes
 
