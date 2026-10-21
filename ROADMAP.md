@@ -1,135 +1,202 @@
 # REAPER-AI — Development Roadmap
 
-**Baseline:** v0.9.1 · 21 October 2026 · Development direction through v1.0
+**Baseline:** v0.9.1 · 21 October 2026 · Development direction through v1.0.0
 
-REAPER-AI has completed M0–M6, multi-project support, checkpoint recovery, persistent memory, the web interface, and native MCP integration. The next work therefore concentrates on making Sentinel a substantially more reliable autonomous coding agent instead of expanding the feature set.
+REAPER-AI is a local single-user coding agent built on FastAPI, LangGraph, Ollama, SQLite, the existing tool dispatcher, and a vanilla HTML/CSS/JavaScript web interface. This roadmap distinguishes released, evidence-backed capability from planned work. Release targets are planning states, not delivery commitments.
 
 ## 1. Release overview
 
-| Release | Status | Focus |
+| Version | Focus | Status |
 | --- | --- | --- |
-| v0.8.0 — Native MCP | Released | Existing functional baseline |
-| v0.9.0 — Browser editor | Released | Project file navigation and hash-guarded browser editing |
-| v0.9.1 — Sentinel evidence handling | Released | S02/S03 source selection, tool evidence, model assessments, and open questions |
-| v0.10.0 — Coding Quality | Planned | Multi-file implementation, verification, recovery |
-| v0.11.0 — Workflow & Efficiency | Conditional | Only improvements justified by measured coding tasks |
-| v1.0.0 — Stable Autonomous Agent | Target | Reproducible, reliable daily use |
+| v0.8.0 | Native MCP integration | Released |
+| v0.9.0 | Web editor and file navigation | Released |
+| v0.9.1 | Sentinel evidence and context | Released |
+| v0.10.0 | Autonomous coding quality | Planned |
+| v0.11.0 | Cross-platform and workflow UI | Planned |
+| v1.0.0 | Stable autonomous coding agent | Target |
 
-These versions are proposed milestones, not release commitments. In particular, v0.11.0 may be unnecessary if earlier work already meets the acceptance criteria.
+## 2. v0.9.1 — Completed development state
 
-## 2. Prioritized development matrix
+The following work is implemented and released. Completion means that the described code path and its focused evidence were recorded; it does not imply universal reliability for every model or task.
 
-| Priority | Work package | Objective | Source of requirement |
-| --- | --- | --- | --- |
-| P0 | Decision quality | Reduce unsupported technical claims | D01 Qwen3.8 |
-| P0 | Progress awareness | Recognize satisfied information gaps and change strategy | Devstral D01 |
-| P0 | Context selection | Keep multiple relevant functions visible | Token analysis |
-| P1 | Multi-file coding | Reliably change related modules | Agent comparison |
-| P1 | Verification and correction | Detect and repair real implementation errors | Coding acceptance |
-| P1 | Recovery in practice | Continue interrupted coding work correctly | Existing checkpoints |
-| P2 | Context efficiency | Reduce tokens without reducing quality | Token experiments |
-| P2 | Skills | Reuse task-specific instructions only if needed | Goose / Pi comparison |
-| P3 | Developer integrations | Improve CLI or IDE workflow only where useful | Competitive analysis |
+- **S01 — Decision-trace analysis and failure classification:** decision traces distinguish observed context, model decisions, tool outcomes, phase/strategy changes, and available thinking data.
+- **S02 — Relevance-based source selection:** source excerpts are individually relevance-ranked; historical source coverage remains distinct from the source ranges actually visible to the next model decision.
+- **S03 — Evidence-aware working state:** observed tool facts, model proposals, open questions, evidence references, checkpoint persistence, and finalization diagnostics are kept distinct. A successful read is evidence of that read, not automatic proof of a semantic conclusion.
+- **Native MCP integration:** v0.8.0 provides native MCP discovery and execution through the existing dispatcher for stdio and Streamable HTTP servers.
+- **Project workflow:** project management, project-scoped chat history and durable memory, a repository index, and the integrated web editor are available.
+- **Model comparison:** Qwen 3.8 Q5, Qwen 3.6 35B-A3B, and Devstral Small 2 were evaluated with recorded model-specific outcomes. Qwen 3.8 Q5 remains the reference model because it showed the strongest observed autonomous analysis and functional coding result in this agent configuration.
 
-Capability gaps take precedence over convenience features.
+### Known limitations
 
-## 3. v0.9.1 — Sentinel Reliability
+- The factual interpretation of observed source remains substantially dependent on the selected LLM.
+- Structured S03 assessments and question updates are optional decision fields and were not emitted reliably by every tested model; they were diagnostics, not acceptance criteria for the model comparisons.
+- `completed` alone does not demonstrate functional task fulfillment; observed changes and independent verification remain authoritative.
+- Repeated tool calls and verification loops can still occur.
+- The autonomous process supervisor is currently Windows-specific. Linux and macOS installation/API-start commands are documented, but autonomous run start, recovery, and cancellation require a POSIX supervisor before they can be supported.
+- Terminal SSE replay can expose a minor status/event ordering inconsistency after a run ends; persisted terminal status and results remain authoritative.
 
-**Goal:** Improve Sentinel decision quality without adding another agent, model-specific workarounds, or additional orchestration.
+**D01** remains a diagnostic benchmark and model-comparison exercise, not the primary product target. Its accepted Qwen 3.8 run demonstrated a viable read-only workflow, while the externally reviewed report also showed that a completed technical analysis can contain factual errors.
 
-| ID | Task | Expected result |
-| --- | --- | --- |
-| S01 | Decision-trace analysis | Completed: distinguish missing context, incorrect reasoning, and insufficient investigation |
-| S02 | Source-context selection | Completed: prioritize individually relevant source ranges without changing checkpoint or source-coverage formats |
-| S03 | Progress and information gaps | Completed: retain observed tool facts separately from model assessments, evidence needs, and open questions |
-| S04 | Evidence-based findings | Separate verified defects, plausible risks, and intended design decisions |
-| S05 | D01 acceptance | Demonstrate measurable improvement without regression |
+## 3. v0.10.0 — Autonomous Coding Quality
 
-S02 does not distribute the context budget blindly: source ranges remain relevance-ranked and non-overlapping. S03 does not authorize arbitrary read limits or forced strategy changes; it records evidence needs and preserves the distinction between observed tool facts and model interpretations. The current model comparisons show that these mechanisms improve traceability but do not guarantee that every model will emit structured assessments, avoid verification repeats, or reach a correct completion.
+**Goal:** Achieve repeatably reliable autonomous coding tasks with Qwen 3.8 Q5 using the existing Sentinel architecture.
 
-### Acceptance criteria
+### C01 — Multi-file coding
 
-- Technical execution: grade 2 or better.
-- Factual analysis: target grade 2 and demonstrably better than the current grade-4 baseline.
-- No loss of autonomous operation.
-- No newly introduced repeated-tool loops.
-- No significant increase in model calls without a demonstrated quality benefit.
-- Repeat the relevant evaluation in more than one run before declaring improvement.
+- Change existing projects across multiple related files.
+- Respect interfaces and dependencies.
+- Preserve existing behavior unless the task explicitly changes it.
 
-Retain only changes supported by decision-trace evidence.
+### C02 — Verification and completion
 
-## 4. v0.10.0 — Autonomous Coding Quality
+- Base success reports on observed file changes and actual test or functional results.
+- Recognize successfully completed work and finish without unnecessary further verification.
+- Analyze the known refund benchmark's 18 unnecessary verification repetitions.
+- Do not add blanket tool limits or approval mechanisms.
 
-**Goal:** Move from successful individual coding demonstrations to dependable everyday coding tasks.
+### C03 — Error correction and recovery
 
-| ID | Task | Expected result |
-| --- | --- | --- |
-| C01 | Multi-file changes | Consistent implementation across related modules |
-| C02 | Change verification | Verify actual behavior rather than accepting model claims |
-| C03 | Failed implementation recovery | Correct errors through the existing tool and checkpoint mechanisms |
-| C04 | Existing changes | Preserve unrelated working-tree modifications |
-| C05 | Coding acceptance | Three representative real coding tasks |
+- Diagnose and correct implementation errors autonomously.
+- Re-run failed checks after a correction.
+- Continue interrupted coding runs through the existing checkpoint mechanism.
+- Avoid repeating already completed actions without a concrete reason.
 
-Suggested acceptance tasks:
+### C04 — Existing changes
 
-1. Correct a small functional bug and demonstrate the fix.
-2. Implement a feature affecting two or three existing modules.
-3. Refactor a small component without changing externally observable behavior.
+- Work with a dirty working tree.
+- Preserve unrelated user changes.
+- Make changes traceable and task-scoped.
 
-Each task must use the normal REAPER toolchain and Qwen3.8-Q5, without a special-case prompt designed solely to pass the acceptance. A successful autonomous coding run exists in the v0.8.0 baseline; this milestone is about repeatability, not a new execution mechanism.
+### C05 — Coding acceptance
 
-## 5. v0.11.0 — Workflow and Efficiency
+Evaluate three representative coding tasks:
 
-This optional release exists only if practical use reveals worthwhile improvements.
+1. Diagnose and correct a functional defect.
+2. Implement a feature across two or three existing modules.
+3. Demonstrate correction and recovery after an interrupted run.
 
-- Improve prompt/context efficiency using measured real runs.
-- Consider reusable skills only when repeated tasks justify them.
-- Improve CLI or IDE workflows where the web UI is inconvenient.
-- Resolve the known terminal SSE replay-order inconsistency.
-- Evaluate model changes only with the established D01 and coding-quality tests.
+Each task requires an independent functional check. Assess autonomy, code quality, correctness, error handling, and efficiency separately. The target is grade 2 or better. Do not add REAPER-specific rules constructed solely to pass these tasks.
 
-No automatic multi-model routing, RAG database, additional agent hierarchy, or elaborate plugin management is planned.
+## 4. v0.11.0 — Cross-platform and workflow UI
 
-## 6. v1.0.0 — Stable Autonomous Coding Agent
+**Goal:** Operate REAPER on Windows, Linux, and macOS, and complete the existing web interface for day-to-day coding use.
 
-The version number represents a demonstrated level of reliability, not a collection of features.
+### P01 — Cross-platform supervisor
+
+- Retain the existing Windows Job Object supervisor.
+- Use native POSIX process groups and signal handling on Linux and macOS.
+- Support run start, timeout, cancellation, and process-tree termination.
+- Preserve checkpoint and recovery behavior.
+- Do not add a separate supervisor platform or elaborate abstraction layer.
+
+### P02 — Cross-platform acceptance
+
+Practically verify on Windows, Linux, and macOS:
+
+- Installation.
+- API start.
+- Autonomous coding run.
+- Cancellation of a running run.
+- Timeout and process termination.
+- Recovery after interruption.
+
+Document only platforms that have actually been tested as supported.
+
+### P03 — Workflow and efficiency
+
+- Investigate and, if confirmed, correct the terminal SSE replay inconsistency.
+- Optimize context and token efficiency only where measured runs show a benefit.
+- Consider CLI/IDE integrations and skills only when a concrete workflow need is demonstrated.
+
+### P04 — Visual diff and code review
+
+**Goal:** Make Sentinel's observed code changes directly reviewable in the web interface.
+
+- List changed files for each agent run.
+- Show line-by-line before/after differences.
+- Visually distinguish additions and removals.
+- Switch between a diff and the integrated code editor.
+- Reuse existing Git, hash, and change-evidence data.
+- Support projects without Git where sufficient observed change data exists.
+- Show only observed file changes, never model-claimed changes without evidence.
+
+**Acceptance:** After a coding run, a user can identify changed files, compare changes, and open affected files in the editor. No manual approval workflow is required.
+
+### P05 — MCP server and tool-management UI
+
+**Goal:** Manage the v0.8.0 MCP integration through the existing web interface.
+
+- Add, edit, and remove MCP servers.
+- Support stdio and Streamable HTTP.
+- Show connection status and concrete errors.
+- List discovered tools with names, descriptions, and input parameters.
+- Manually run connection checks and tool discovery.
+- Continue using `mcp.json` as the configuration source.
+- Integrate controls into the existing project settings or settings UI.
+
+**Acceptance:** A user can configure, test, and inspect an MCP server and its discovered tools without manually editing JSON. No additional database, second MCP orchestrator, or separate permission system is planned.
+
+### P06 — Agent status and run summary
+
+**Goal:** Make autonomous work understandable without reviewing complete decision traces continuously.
+
+- Show the current phase and subtask.
+- Show the current or most recently completed tool action.
+- Summarize observed changes, checks, and errors.
+- After a run, show actual changed files, successful/failed checks, and open points.
+- Reuse existing events, tool facts, and run data.
+- Keep decision traces available as a technical detail view.
+
+**Acceptance:** During and after a run, users can see actual progress and observed outcome at a glance. No additional model-assessment or status system is planned.
+
+### P07 — Tool-to-code navigation
+
+**Goal:** Connect chat, agent activity, diff, and editor views.
+
+- Make file paths and line references in tool results clickable.
+- Open the relevant file in the integrated editor.
+- Navigate to the referenced line where possible.
+- Open the associated diff from activity-panel change references.
+- Reuse the existing file tree and editor.
+
+**Acceptance:** Selecting a relevant file reference in agent activity reaches the corresponding code position or change. No new editor library or frontend framework is planned.
+
+## 5. v1.0.0 — Stable Autonomous Coding Agent
+
+v1.0.0 is released only on demonstrated reliability, not on feature count.
 
 | Area | Acceptance target |
 | --- | --- |
-| Autonomous planning and execution | Grade ≤ 2 |
-| Technical repository analysis | Grade ≤ 2 |
-| Coding changes and verification | Grade ≤ 2 |
-| Error correction and recovery | Grade ≤ 2 |
-| Local model execution | Stable with the selected reference model |
-| MCP | Existing v0.8.0 functionality preserved |
-| Persistence and project isolation | Existing functionality preserved |
-| Installation | Reproducible Git-based installation |
-| Documentation | Matches the released implementation |
+| Autonomous planning and coding execution | Grade 2 or better |
+| Multi-file implementation | Reliably demonstrated |
+| Functional verification | Independently observed |
+| Error diagnosis and correction | Reliably demonstrated |
+| Checkpoint recovery | Successfully demonstrated |
+| Tool loops | No systematic unproductive loops in acceptance runs |
+| Existing user changes | Preserved |
+| Cross-platform operation | Windows, Linux, and macOS practically accepted |
+| Existing functions | MCP, projects, persistence, memory, and editor retained |
+| Workflow UI | MCP management, change review, and understandable run outcomes available |
+| Installation | Reproducible |
+| Documentation | Matches the implemented system |
 
-The grade targets are evaluation goals, not guarantees that every possible task will succeed.
+Technical repository reviews remain a supporting capability. D01 remains a diagnostic and model-comparison benchmark rather than an independent v1.0 blocking criterion.
 
-## 7. Out of scope
+## 6. Binding development principles
 
-REAPER remains a lightweight local single-user coding agent. The following are not roadmap objectives without a concrete demonstrated need:
+REAPER remains a lean local single-user coding agent.
 
-- Multi-agent platforms and delegation frameworks.
-- Enterprise security, roles, or tenant management.
-- Separate MCP orchestration.
-- Additional databases or services.
-- Custom tool and file-type restrictions.
-- Large regression suites unrelated to observed failures.
-- Cloud dependency or automatic model routing.
-- Replacing the existing frontend stack.
-
-## 8. Recommended immediate action
-
-Start with **S01 — decision-trace analysis**. Before changing `engine.py`, use completed model evaluations to establish which failures arise from context visibility, which from model reasoning, and which from insufficient investigation.
-
-A small read-only analysis should produce:
-
-1. The five most consequential incorrect technical claims or failed decisions.
-2. Their source evidence and relevant decision-trace entries.
-3. A classification of each failure.
-4. At most three proposed corrections, ordered by likely value and implementation effort.
-
-S01–S03 are implemented. The next code change, if justified by a measured failure, is S04 or a targeted correction of the observed verification-output retention issue. This keeps the next milestone focused on making the existing Sentinel more reliable rather than making REAPER more complicated.
+- No enterprise architecture.
+- No role, tenant, or approval systems.
+- No additional agents or orchestration layers without a concrete need.
+- No redundant databases or services.
+- No custom shell, file-type, or workspace whitelists.
+- No artificial tool-call or repair limits.
+- No model-specific special mechanisms.
+- Qwen 3.8 Q5 remains the reference model.
+- Reuse existing architecture and components.
+- Retain HTML, CSS, and vanilla JavaScript for the frontend.
+- No unnecessary frontend frameworks.
+- Prefer small, reviewable changes.
+- Keep tests proportional to the actual change.
+- Update documentation when relevant behavior changes.
