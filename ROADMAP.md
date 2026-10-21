@@ -11,7 +11,7 @@ REAPER-AI is a local single-user coding agent built on FastAPI, LangGraph, Ollam
 | v0.8.0 | Native MCP integration | Released |
 | v0.9.0 | Web editor and file navigation | Released |
 | v0.9.1 | Sentinel evidence and context | Released |
-| v0.10.0 | Autonomous coding quality | Planned |
+| v0.10.0 | Autonomous coding quality | In progress — C01/C02 complete |
 | v0.11.0 | Cross-platform and workflow UI | Planned |
 | v1.0.0 | Stable autonomous coding agent | Target |
 
@@ -31,7 +31,7 @@ The following work is implemented and released. Completion means that the descri
 - The factual interpretation of observed source remains substantially dependent on the selected LLM.
 - Structured S03 assessments and question updates are optional decision fields and were not emitted reliably by every tested model; they were diagnostics, not acceptance criteria for the model comparisons.
 - `completed` alone does not demonstrate functional task fulfillment; observed changes and independent verification remain authoritative.
-- Repeated tool calls and verification loops can still occur.
+- Repeated tool calls and verification loops can still occur in untested model/task combinations. C02 removes one demonstrated cause by preserving shell exit code, stdout, and stderr in the next decision context.
 - The autonomous process supervisor is currently Windows-specific. Linux and macOS installation/API-start commands are documented, but autonomous run start, recovery, and cancellation require a POSIX supervisor before they can be supported.
 - Terminal SSE replay can expose a minor status/event ordering inconsistency after a run ends; persisted terminal status and results remain authoritative.
 
@@ -47,12 +47,16 @@ The following work is implemented and released. Completion means that the descri
 - Respect interfaces and dependencies.
 - Preserve existing behavior unless the task explicitly changes it.
 
+**Completed.** In `183ee8ae8303`, Qwen 3.8 Q5 autonomously implemented `validate` across related configuration, validation, and CLI modules; it preserved the existing `show` output, updated the fixture README, corrected a BOM-related negative-test probe, and passed independent functional checks. The run completed with 20 model calls, 19 tool calls, 202.4 seconds, and no identical repeated action. **C01: passed, grade 2.** This is a successful acceptance case, not a general repeatability claim.
+
 ### C02 — Verification and completion
 
 - Base success reports on observed file changes and actual test or functional results.
 - Recognize successfully completed work and finish without unnecessary further verification.
 - Analyze the known refund benchmark's 18 unnecessary verification repetitions.
 - Do not add blanket tool limits or approval mechanisms.
+
+**Completed.** The refund benchmark showed that a successful `unittest -v` result written to stderr was reduced to `shell succeeded` in the next prompt. C02 preserves the shell exit code and bounded stdout/stderr in the existing observation path. In `183ee8ae8303`, this information was practically carried through the end-to-end workflow and the run completed without identical verification repetitions. This confirms the corrected information flow for one run; it does not establish universal completion behavior.
 
 ### C03 — Error correction and recovery
 

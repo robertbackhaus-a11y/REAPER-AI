@@ -186,6 +186,8 @@ Work method for every decision:
    `information_gaps` states what tool evidence still does not establish. `code_findings` contain the corresponding source; do not reread an unchanged range unless
    new evidence makes it necessary. Inspect only information needed for the next useful action. Stop analysis once it
    is sufficient to implement or verify the current subgoal.
+   Evidence references on an open question name tool-observed source already visible in `code_findings`; assess that
+   evidence before requesting the same unchanged source again.
 3. Choose the action with the clearest contribution to the remaining work. For a development request, move from focused
    inspection to a concrete, minimal change, then to a proportionate verification; planning and reading are means, not
    an end. Keep the existing plan when it remains valid; update it only when evidence changes the work.
@@ -494,13 +496,16 @@ def _compact_memory_item(item: dict[str, Any]) -> dict[str, Any]:
     if isinstance(evidence, list):
         compact["evidence"] = [
             {key: value for key, value in entry.items()
-             if key in {"path", "name", "qualname", "kind", "start_line", "end_line", "module", "local_module"}}
+             if key in {"path", "sha256", "name", "qualname", "kind", "start_line", "end_line", "module", "local_module"}}
             for entry in evidence[:4] if isinstance(entry, dict)
         ]
     elif isinstance(evidence, dict):
-        compact["evidence"] = {key: evidence.get(key) for key in
-                               ("file_count", "symbol_count", "git_branch", "git_head", "scanned_at",
-                                "server", "name", "structured_content") if key in evidence}
+        compact["evidence"] = {
+            key: (_short_text(evidence[key], 1_200) if isinstance(evidence[key], str) else evidence[key])
+            for key in ("file_count", "symbol_count", "git_branch", "git_head", "scanned_at",
+                        "server", "name", "structured_content", "exit_code", "stdout", "stderr")
+            if key in evidence
+        }
     return compact
 
 
@@ -707,6 +712,29 @@ def _reconcile_information_gaps(agent: dict[str, Any]) -> None:
     )]
 
 
+def _link_question_evidence(agent: dict[str, Any]) -> None:
+    """Attach an explicitly requested source to an open question without resolving it."""
+    sources = [item for item in agent.get("progress", {}).get("sources", []) if isinstance(item, dict)]
+    for question in agent.get("information_gaps", []):
+        if not isinstance(question, dict) or question.get("kind") != "question" or question.get("resolution", "open") != "open":
+            continue
+        requested = " ".join(str(question.get(key, "")) for key in ("summary", "evidence_needed")).casefold()
+        evidence = [item for item in question.get("evidence", []) if isinstance(item, dict)]
+        for source in sources:
+            path, digest, start, end = (source.get(key) for key in ("path", "sha256", "start_line", "end_line"))
+            if not all((isinstance(path, str), isinstance(digest, str), isinstance(start, int), isinstance(end, int))):
+                continue
+            # A filename named by the model is an objective link to the
+            # requested evidence. Do not infer semantic closure from it.
+            if Path(path).name.casefold() not in requested and path.casefold() not in requested:
+                continue
+            reference = {"path": path, "sha256": digest, "start_line": start, "end_line": end}
+            if reference not in evidence:
+                evidence.append(reference)
+        if evidence:
+            question["evidence"] = evidence
+
+
 def _context_range_scores(agent: dict[str, Any], findings: list[dict[str, Any]]) -> list[int]:
     """Rank individual source ranges for the next action, not their whole file."""
     notes = [agent.get("current_task", "")]
@@ -766,18 +794,60 @@ def _context_range_scores(agent: dict[str, Any], findings: list[dict[str, Any]])
                     continue
                 evidence_start, evidence_end = evidence.get("start_line"), evidence.get("end_line")
                 if isinstance(evidence_start, int) and isinstance(evidence_end, int) and start <= evidence_end and end >= evidence_start:
-                    score += 400
+                    # An open question explicitly names this observed range as
+                    # its needed evidence. Keep it visible ahead of generic
+                    # history, but leave the question open for model assessment.
+                    score += 10_000
         scores.append(score + index)
     return scores
 
 
+def _task_bound_finding_indexes(agent: dict[str, Any], findings: list[dict[str, Any]]) -> set[int]:
+    """Identify observed ranges explicitly named by the active work."""
+    notes = [agent.get("current_task", "")]
+    notes.extend(item.get("summary", "") for item in agent.get("decisions", []) if isinstance(item, dict))
+    open_questions = [
+        item for item in agent.get("information_gaps", [])
+        if isinstance(item, dict) and item.get("kind") == "question" and item.get("resolution", "open") == "open"
+    ]
+    for question in open_questions:
+        notes.extend((question.get("summary", ""), question.get("evidence_needed", "")))
+    text = " ".join(note.casefold() for note in notes if isinstance(note, str))
+    indexes: set[int] = set()
+    for index, finding in enumerate(findings):
+        path, digest = finding.get("path"), finding.get("sha256")
+        start, end = finding.get("start_line"), finding.get("end_line")
+        if not all((isinstance(path, str), isinstance(digest, str), isinstance(start, int), isinstance(end, int))):
+            continue
+        if path.casefold() in text or Path(path).name.casefold() in text:
+            indexes.add(index)
+            continue
+        for question in open_questions:
+            evidence_items = question.get("evidence", [])
+            for evidence in evidence_items if isinstance(evidence_items, list) else []:
+                if (isinstance(evidence, dict) and evidence.get("path") == path and
+                        evidence.get("sha256") in (None, digest)):
+                    evidence_start, evidence_end = evidence.get("start_line"), evidence.get("end_line")
+                    if isinstance(evidence_start, int) and isinstance(evidence_end, int) and start <= evidence_end and end >= evidence_start:
+                        indexes.add(index)
+                        break
+            if index in indexes:
+                break
+    return indexes
+
+
 def _select_context_findings(agent: dict[str, Any], findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Prefer a few task-relevant, coherent ranges over every historical fragment."""
+    """Keep active source evidence before filling context with ranked history."""
     scores = _context_range_scores(agent, findings)
-    selected_indexes: set[int] = set()
-    for index, candidate in sorted(enumerate(findings), key=lambda entry: scores[entry[0]], reverse=True):
-        if len(selected_indexes) == 3:
-            break
+    task_bound = _task_bound_finding_indexes(agent, findings)
+    ordered_indexes = [
+        *(index for index in sorted(task_bound, key=lambda item: scores[item], reverse=True)),
+        *(index for index, _ in sorted(enumerate(findings), key=lambda entry: scores[entry[0]], reverse=True)
+          if index not in task_bound),
+    ]
+    selected_indexes: list[int] = []
+    for index in ordered_indexes:
+        candidate = findings[index]
         path, digest = candidate.get("path"), candidate.get("sha256")
         start, end = candidate.get("start_line"), candidate.get("end_line")
         if not all((isinstance(path, str), isinstance(digest, str), isinstance(start, int), isinstance(end, int))):
@@ -800,14 +870,19 @@ def _select_context_findings(agent: dict[str, Any], findings: list[dict[str, Any
                 duplicate = True
                 break
         if not duplicate:
-            selected_indexes.add(index)
+            selected_indexes.append(index)
     # Deduplicate only the ranges that will be shown. Doing so before ranking
     # can fuse a full-file capture with a later targeted range, after which
     # truncation keeps only the unrelated beginning of the combined excerpt.
-    selected = [finding for index, finding in enumerate(findings) if index in selected_indexes]
-    coherent = _coherent_findings(_non_overlapping_findings(selected))
+    selected = [findings[index] for index in selected_indexes]
+    coherent = _coherent_findings(_non_overlapping_findings(list(reversed(selected))))
     coherent_scores = _context_range_scores(agent, coherent)
-    return [entry[1] for entry in sorted(enumerate(coherent), key=lambda entry: coherent_scores[entry[0]], reverse=True)]
+    coherent_bound = _task_bound_finding_indexes(agent, coherent)
+    return [
+        *(coherent[index] for index in sorted(coherent_bound, key=lambda item: coherent_scores[item], reverse=True)),
+        *(entry[1] for entry in sorted(enumerate(coherent), key=lambda entry: coherent_scores[entry[0]], reverse=True)
+          if entry[0] not in coherent_bound),
+    ]
 
 
 def _progress_snapshot(agent: dict[str, Any]) -> dict[str, Any]:
@@ -962,8 +1037,15 @@ def _observed_tool_knowledge(action: dict[str, Any], result: dict[str, Any]) -> 
                                    if structured is not None else ""}})
     else:
         output = result.get("stdout") if isinstance(result.get("stdout"), str) else ""
+        stderr = result.get("stderr") if isinstance(result.get("stderr"), str) else ""
         evidence = {key: _short_text(value, 1_200) for key, value in data.items()
                     if key in {"output", "diff", "error"} and isinstance(value, str) and value.strip()}
+        if tool == "shell":
+            evidence["exit_code"] = result.get("exit_code")
+            if output.strip():
+                evidence["stdout"] = _short_text(output, 1_200)
+            if stderr.strip():
+                evidence["stderr"] = _short_text(stderr, 1_200)
         facts.append({"status": "observed", "kind": "tool_result",
                       "summary": _short_text(f"{tool} succeeded" + (f": {output.strip()}" if output.strip() else ""), 900),
                       "tool": tool, "args": args, "evidence": evidence})
@@ -1116,6 +1198,10 @@ def _record_progress(agent: dict[str, Any], observation: dict[str, Any]) -> None
     facts, gaps = _observed_tool_knowledge(action, result)
     _record_observed_knowledge(agent, facts, gaps)
     _reconcile_information_gaps(agent)
+    # Evidence linking must see the source captured by this observation, not
+    # the previous progress snapshot.
+    agent["progress"] = progress
+    _link_question_evidence(agent)
     _advance_phase_from_evidence(agent, action, result)
     if not ok:
         progress["errors"] = [*progress.get("errors", []), {"step": observation.get("step"),
@@ -1124,7 +1210,6 @@ def _record_progress(agent: dict[str, Any], observation: dict[str, Any]) -> None
         resolved = _string_list(action.get("verification_for"))
         if resolved:
             progress["open_verifications"] = [item for item in progress.get("open_verifications", []) if item not in resolved]
-    agent["progress"] = progress
 
 
 def _decision_error(agent: dict[str, Any], error: str) -> dict[str, Any]:
@@ -1153,6 +1238,7 @@ def _agent_prompt(state: AgentRunState) -> str:
               "shell_environment": "Windows PowerShell (powershell -Command); use PowerShell syntax, never Bash/CMD `||` or `2>nul`.",
               "working_memory": _work_memory_snapshot(agent), "progress": progress, "verification": agent["verification"],
               "code_findings": [], "visible_source_coverage": [],
+              "context_omissions": [],
               "source_coverage": [], "repository_map": _repository_map_snapshot(agent.get("repository_map")),
               "mcp_tools": _mcp_tools_snapshot(agent), "mcp_discovery_errors": agent.get("mcp_errors", []),
               "plan": plan, "current_step": agent["current_step"], "previous_observations": []}
@@ -1162,11 +1248,12 @@ def _agent_prompt(state: AgentRunState) -> str:
     prompt["source_coverage"] = _source_coverage(findings)
     used = len(json.dumps(prompt, ensure_ascii=False).encode("utf-8"))
     findings = _select_context_findings(agent, findings)
+    task_bound = _task_bound_finding_indexes(agent, findings)
     retained: list[dict[str, Any]] = []
     source_sizes: list[int] = []
     if findings:
-        headers = []
-        for finding in findings:
+        available = max(0, budget - used)
+        for index, finding in enumerate(findings):
             header = {key: finding.get(key) for key in ("path", "start_line", "end_line", "sha256",
                                                           "truncated", "original_length", "captured_length")}
             if isinstance(header["start_line"], int) and isinstance(header["end_line"], int):
@@ -1174,21 +1261,21 @@ def _agent_prompt(state: AgentRunState) -> str:
                 observed_end = (header["start_line"] + content.count("\n") - 1
                                 if content.endswith("\n") else header["start_line"] + content.count("\n"))
                 header["end_line"] = min(header["end_line"], observed_end)
-            headers.append(header)
-        header_bytes = sum(len(json.dumps({**header, "content": ""}, ensure_ascii=False).encode("utf-8"))
-                           for header in headers)
-        available = max(0, budget - used - header_bytes)
-        source_sizes = [len(finding["content"].encode("utf-8")) for finding in findings]
-        # Findings are ordered by relevance. Preserve a coherent, current edit
-        # range before spending remaining context on older supporting source.
-        shares = []
-        for size in source_sizes:
-            share = min(size, available)
-            shares.append(share)
-            available -= share
-        for finding, header, share in zip(findings, headers, shares):
+            header_size = len(json.dumps({**header, "content": ""}, ensure_ascii=False).encode("utf-8"))
+            if header_size >= available:
+                if index in task_bound:
+                    prompt["context_omissions"].append({
+                        "path": header.get("path"), "sha256": header.get("sha256"),
+                        "start_line": header.get("start_line"), "end_line": header.get("end_line"),
+                        "reason": "context_budget",
+                    })
+                continue
+            source_size = len(finding["content"].encode("utf-8"))
+            share = min(source_size, available - header_size)
             item = {**header, "content": finding["content"].encode("utf-8")[:share].decode("utf-8", "ignore")}
             retained.append(item)
+            source_sizes.append(source_size)
+            available -= header_size + len(item["content"].encode("utf-8"))
         while retained and used + sum(len(json.dumps(item, ensure_ascii=False).encode("utf-8")) for item in retained) > budget:
             overflow = used + sum(len(json.dumps(value, ensure_ascii=False).encode("utf-8")) for value in retained) - budget
             expandable = [item for item in reversed(retained) if item["content"]]
@@ -1239,6 +1326,8 @@ def _agent_prompt(state: AgentRunState) -> str:
         if action.get("tool") in {"read_file", "read_file_range"}:
             continue
         item = {"step": observation.get("step"), "tool": action.get("tool"), "ok": bool(result.get("ok"))}
+        if action.get("tool") == "shell":
+            item["exit_code"] = result.get("exit_code")
         if not result.get("ok"):
             item["error"] = _short_text(result.get("error", "Tool failed"))
         elif action.get("tool") in {"write_file", "apply_patch"}:
@@ -1247,6 +1336,8 @@ def _agent_prompt(state: AgentRunState) -> str:
             item["data"] = result.get("data", {})
             if result.get("stdout"):
                 item["stdout"] = _short_text(result["stdout"], max(1_024, budget // 12))
+            if action.get("tool") == "shell" and result.get("stderr"):
+                item["stderr"] = _short_text(result["stderr"], max(1_024, budget // 12))
         encoded = json.dumps(item, ensure_ascii=False).encode("utf-8")
         if used + len(encoded) > budget:
             continue
@@ -1304,6 +1395,7 @@ def _trace_context(prompt: str, system: str) -> dict[str, Any]:
         "mcp_tools": payload.get("mcp_tools", []),
         "mcp_discovery_errors": payload.get("mcp_discovery_errors", []),
         "visible_source_coverage": payload.get("visible_source_coverage", []),
+        "context_omissions": payload.get("context_omissions", []),
         "source_excerpts": excerpts,
         "open_verifications": payload.get("progress", {}).get("open_verifications", []),
     }

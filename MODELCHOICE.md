@@ -311,8 +311,11 @@ passed independent functional verification.
 
 This is not an unconditional endorsement:
 
-- Qwen3.8 still needs evidence-preserving tool-result handling to avoid repeated
-  verification after a successful shell command.
+- Qwen3.8's successful-shell observation now preserves exit code and bounded
+  stdout/stderr in the next decision context (C02), removing the demonstrated
+  `shell succeeded` information loss. The C01.2 run `183ee8ae8303` completed
+  without identical repetitions, but one run does not establish universal
+  verification-loop reliability.
 - Qwen3.6 is not suitable as the primary autonomous implementation or
   repository-analysis model under the current Sentinel contract because it can
   complete while asserting unperformed work.

@@ -37,6 +37,28 @@ class AgentDispatcherTests(unittest.TestCase):
                             for item in facts))
         self.assertEqual(prompt["visible_source_coverage"][0]["covered_ranges"], [[10, 10]])
 
+    def test_shell_observation_keeps_exit_code_stdout_and_stderr_in_prompt(self):
+        agent = new_agent_state()
+        action = {"tool": "shell", "args": {"command": "python -m unittest -v", "timeout": 30}}
+        result = {"tool": "shell", "ok": True, "exit_code": 0, "stdout": "setup complete\n",
+                  "stderr": "test_example ... ok\n", "data": {}, "changes": [], "error": "",
+                  "duration_ms": 1}
+
+        observation_data = {"step": 1, "action": action, "result": result}
+        agent["observations"].append(observation_data)
+        engine._record_progress(agent, observation_data)
+        prompt = json.loads(engine._agent_prompt({"task": "Run tests", "workspace": str(Path.cwd()), "agent": agent}))
+
+        fact = next(item for item in prompt["working_memory"]["tool_facts"]
+                    if item["kind"] == "tool_result" and item["tool"] == "shell")
+        self.assertEqual(fact["evidence"]["exit_code"], 0)
+        self.assertIn("setup complete", fact["evidence"]["stdout"])
+        self.assertIn("test_example ... ok", fact["evidence"]["stderr"])
+        observation = prompt["previous_observations"][-1]
+        self.assertEqual(observation["exit_code"], 0)
+        self.assertIn("setup complete", observation["stdout"])
+        self.assertIn("test_example ... ok", observation["stderr"])
+
     def test_final_decision_can_explicitly_reconcile_its_open_proof(self):
         agent = new_agent_state()
         agent["progress"]["open_verifications"] = ["Support the read-only analysis with inspected source."]
