@@ -22,7 +22,7 @@ from reaper_ai import tools
 from reaper_ai.persistence import StorageError, Store
 from reaper_ai.repository_index import RepositoryIndexError, refresh_project_index
 
-app = FastAPI(title="REAPER-AI", version="0.9.0")
+app = FastAPI(title="REAPER-AI", version="0.9.1")
 _lock = threading.Lock()
 _runs: dict[str, dict] = {}
 _active: str | None = None

@@ -1,225 +1,135 @@
 # REAPER-AI — Development Roadmap
 
-**Current release:** v0.9.0
-**Next planned release:** targeted acceptance and evidence-backed fixes
-**Scope:** local, single-user autonomous coding agent
+**Baseline:** v0.9.1 · 21 October 2026 · Development direction through v1.0
 
-## 1. Project goal and architecture principles
+REAPER-AI has completed M0–M6, multi-project support, checkpoint recovery, persistent memory, the web interface, and native MCP integration. The next work therefore concentrates on making Sentinel a substantially more reliable autonomous coding agent instead of expanding the feature set.
 
-REAPER-AI turns an engineering request into observable local work: Sentinel inspects relevant repository facts, makes focused changes, runs checks, and reports the evidence actually produced. A model assertion is never proof by itself.
+## 1. Release overview
 
-- Keep one local stack: FastAPI, LangGraph, Ollama, SQLite, HTML/CSS/vanilla JavaScript, and SSE.
-- Prefer existing components over a second agent, state store, service, frontend, or persistence layer.
-- Keep Git optional and never commit, push, tag, release, or elevate permissions automatically.
-- Preserve explicit checkpoint recovery, file-hash conflict detection, process timeouts, and observable tool results.
-- Document only implemented behaviour and observed acceptance evidence.
-
-## 2. Current state — v0.9.0
-
-| Area | State |
-| --- | --- |
-| M0 — Foundation | Implemented |
-| M1 — Engine | Implemented |
-| M2 — Reliability | Implemented with documented limitations |
-| M3 — FastAPI | Accepted |
-| M4 — Web UI | v0.7.0 GUI and persisted-history improvements implemented |
-| M5 — Persistence | Implemented |
-| M6 — Autonomous Agent | First autonomous end-to-end coding acceptance passed |
-| MCP-01 + MCP-02 — Native MCP integration | Released in v0.8.0; optional stdio and Streamable-HTTP server tools extend the existing dispatcher |
-| Variante B — Multi-project | Steps 1–5 implemented |
-| v0.9.0 — Browser code editor | Released; indexed project tree, local syntax highlighting, and SHA-256-guarded text saves |
-
-v0.7.0 includes the v0.5.0 project-scoped repository index, hybrid checkpointed working memory, durable project memory, explicit checkpoint recovery, index-guided Sentinel navigation, P0 hash-bound `apply_patch`, P1 working-memory consolidation, the completed GUI modernization, and accepted D01 evidence handling. It also permanently removes selected chats or inactive projects with their owned persisted history while preserving scoped memory boundaries.
-
-v0.9.0 adds an expandable project file tree and a separate browser editor view. Text content is loaded with its SHA-256 and saved only when the displayed hash still matches; binary/undecodable files have no preview, and truncated captures cannot be written back.
-
-### MCP-01 + MCP-02 — native optional MCP tools (released in v0.8.0)
-
-- `mcp>=2,<3` is the only added runtime dependency. A local `mcp.json` configuration supports standard stdio (`command`/`args`) and Streamable-HTTP (`url`) server entries without built-in server names, commands, or URLs.
-- Sentinel discovers `tools/list` once at run preparation. The checkpointed tool snapshot contains server-qualified names, descriptions, and input schemas; local REAPER tools remain available when discovery fails.
-- Model-selected `mcp:<server>:<tool>` actions go through the existing dispatcher and the SDK's `tools/call` path. Normalized content and structured content become observed evidence, while connection, timeout, schema, and tool failures are returned as ordinary tool errors for the next decision.
-- Acceptance evidence: a real stdio server and a real Streamable-HTTP server advertised and executed `join_words`; autonomous temporary API run `c17192807e47` (`qwen3.8-q5:latest`) selected `mcp:local-test:join_words`, returned `autonomous MCP`, and reached `completed` / exit code `0` with no writes. Local regression run `d95118cd1436` used `list_files`, reached `completed`, and did not require an MCP configuration.
-
-## 3. Completed milestones M0–M6
-
-| Milestone | Completed scope |
-| --- | --- |
-| M0 — Foundation | Python package, local workspace conventions, development baseline |
-| M1 — Engine | LangGraph-based execution and Ollama-backed structured decisions |
-| M2 — Reliability | File/Git/process adapters, explicit errors, bounded execution, source and write conflict evidence |
-| M3 — FastAPI | Local API, run control, SSE events, supervisor integration, persisted run access |
-| M4 — Web UI | Functional browser UI with projects, conversations, run status, events, recovery, and diagnostics |
-| M5 — Persistence | SQLite conversations, messages, runs, events, stage results, checkpoints/recovery, and scoped durable memory |
-| M6 — Autonomous Agent | Iterative `Prepare → Decide → Execute → Observe → Finalize` graph, dispatcher, decision traces, evidence-based completion, and recovery |
-
-### Variante B — multi-project implementation
-
-| Step | Completed scope |
-| --- | --- |
-| 1 — Project core | Stable project IDs, project workspaces, per-project model settings, project-scoped chats/runs/memory |
-| 2 — Repository index | Incremental project-scoped file metadata, Python AST symbols/imports, Git branch/HEAD metadata, index queries |
-| 3 — Hybrid run working memory | Checkpointed current task/phase, confirmed facts, proposed decisions, information gaps, source and verification evidence |
-| 4 — Sentinel integration | Repository map and index tools guide targeted source access without loading the whole repository |
-| 5 — Multi-project UI | Project management, project-scoped conversations/memory, index status/search, and existing live-run UI integration |
-
-Historic BUG-003 through BUG-019 work is consolidated in these completed capabilities: unrestricted project inspection, source-capture metadata, context-visible coverage, structured decision traces, robust UTF-8 event handling, source-aware working memory, targeted edits, and evidence-based final status. Detailed incident logs remain in Git history and persisted run records rather than being repeated here.
-
-## 4. Demonstrated Sentinel capabilities and remaining acceptance
-
-### Successful autonomous coding acceptance
-
-Run `f852b6ce174e` is the current end-to-end acceptance record:
-
-- resumed the same valid checkpoint and reached `completed` with exit code `0`;
-- used hash-protected `apply_patch` to change `src/reaper_ai/persistence.py` and `src/reaper_ai/api.py`;
-- detected and corrected its own failed verification script;
-- used the REAPER Venv FastAPI `TestClient` for functional verification;
-- received HTTP 200 with real project repository-index data from `GET /projects/{project_id}/index/top-python-files`.
-
-This demonstrates one complete autonomous coding workflow. It is not a claim that every coding task, repository, model response, or external command is reliably handled.
-
-### D01 — autonomous-agent acceptance (accepted 2026-10-20)
-
-Existing focused tests cover tool dispatch, failed-check correction, checkpoint recovery, persistence, project isolation, UTF-8 events, process timeout reporting, and explicit recovery availability. The following acceptance evidence is intentionally kept factual:
-
-| Criterion | Result | Evidence |
+| Release | Status | Focus |
 | --- | --- | --- |
-| Autonomous coding | PASS | Historical run `f852b6ce174e`: two guarded source changes, recovery, failed-check correction, and FastAPI `TestClient` verification against real index data. |
-| Read-only analysis | PASS (grade 4, accepted) | Run `d01-1792496155` completed without writes after 17 tool actions, did not repeat a successful range, and produced a line-cited report. External review classified the report's technical quality as sufficient, while retaining its known limitations below. |
-| Error correction | PASS | `f852b6ce174e`; the focused `test_agent_keeps_evidence_through_failed_check_correction_and_resume` also preserves the failure/correction/check evidence path. |
-| Unsupported success claim | PASS | The focused agent-dispatcher test retains a failed check and reaches `completed` only after a later successful verification; model prose alone is excluded from persisted factual context. |
-| Existing changes protected | PASS | Run `33ea6c56dd7a` in a separate Git repository created only `agent_output.txt`; the pre-existing uncommitted `protected-notes.txt` remained byte-identical and `README.md` was unchanged. |
-| Unproductive loop | PASS (fresh targeted run) | `d01-1792496155` completed after progressive, non-identical source ranges. It recovered from two out-of-range reads by changing files/ranges; it did not repeat a successful range. Historic failed runs remain retained as regression evidence. |
-| Cancellation/process tree | PASS (bounded evidence) | Existing M2 R04 synthetic timeout evidence verified parent/child-process termination; the API cancellation of `218b6ffa761b` reached `cancelled` and emitted a terminal event. |
-| GUI events/status | PASS | The browser rendered the persisted live timeline for `218b6ffa761b`, including tool events, decision traces, terminal cancellation status, and its explicit recovery control. |
+| v0.8.0 — Native MCP | Released | Existing functional baseline |
+| v0.9.0 — Browser editor | Released | Project file navigation and hash-guarded browser editing |
+| v0.9.1 — Sentinel evidence handling | Released | S02/S03 source selection, tool evidence, model assessments, and open questions |
+| v0.10.0 — Coding Quality | Planned | Multi-file implementation, verification, recovery |
+| v0.11.0 — Workflow & Efficiency | Conditional | Only improvements justified by measured coding tasks |
+| v1.0.0 — Stable Autonomous Agent | Target | Reproducible, reliable daily use |
 
-D01 is **accepted**. The assessment combines technical execution (grade 2), factual-result quality (grade 4), and an overall grade of 3. Run `d01-1792496155` reached `completed` / exit code 0 in 128.9 seconds with 18 model calls, 17 tool calls, no file changes, a valid checkpoint, strategy changes after two invalid range requests, and no repeated successful range read. The report was externally reviewed: bounded check/error history is a deliberate context trade-off; an open verification after a failed check is correct; the claimed missing Git timeouts was false; active-run process liveness has a small residual risk mitigated by `_watch()`; and replay has a possible small terminal-stream inconsistency. These are retained as limitations rather than blockers for this acceptance.
+These versions are proposed milestones, not release commitments. In particular, v0.11.0 may be unnecessary if earlier work already meets the acceptance criteria.
 
-### REAPER-AI — development, test, and acceptance history
+## 2. Prioritized development matrix
 
-This history records evidence that remains available in project documents, source, Git history, focused tests, or persisted run data. Historic runs whose logs are no longer retained are identified by their recorded symptoms rather than reconstructed as new evidence.
+| Priority | Work package | Objective | Source of requirement |
+| --- | --- | --- | --- |
+| P0 | Decision quality | Reduce unsupported technical claims | D01 Qwen3.8 |
+| P0 | Progress awareness | Recognize satisfied information gaps and change strategy | Devstral D01 |
+| P0 | Context selection | Keep multiple relevant functions visible | Token analysis |
+| P1 | Multi-file coding | Reliably change related modules | Agent comparison |
+| P1 | Verification and correction | Detect and repair real implementation errors | Coding acceptance |
+| P1 | Recovery in practice | Continue interrupted coding work correctly | Existing checkpoints |
+| P2 | Context efficiency | Reduce tokens without reducing quality | Token experiments |
+| P2 | Skills | Reuse task-specific instructions only if needed | Goose / Pi comparison |
+| P3 | Developer integrations | Improve CLI or IDE workflow only where useful | Competitive analysis |
 
-- Earlier D01 runs showed repeated reads of `engine.py:220–450` and later `engine.py:320–549`. The retained diagnosis attributed this to successful range fragments that produced no source fact when they could not be parsed independently, and to prompt selection that could demote a current truncated range.
-- The corrective path retains every successful read as a hash- and range-bound observed source fact, even for a fragment inside a declaration; independently parseable excerpts add declarations, signatures, and imports. An identical later read is recorded as no new confirmed knowledge. This state is checkpointed.
-- Range selection now scores individual excerpts and does not treat a truncated, targeted range as a weak full-file capture. Persisted source coverage and `visible_source_coverage` remain separate, so the decision trace shows only what was actually sent to the model.
-- A final decision may explicitly reconcile a satisfied read-only proof with `open_verifications: []`; it does not implicitly remove unrelated verification requirements. This fixed the former stale-proof closure path while preserving failed-check evidence.
-- The fresh D01 integration run `d01-1792496155` demonstrated progressive source navigation, autonomous recovery from invalid requested line ranges, a regular terminal state, and no writes. Its report was reviewed as sufficient rather than perfect; the detailed assessment above records the one false timeout claim and the remaining API/replay observations.
-- Focused dispatcher, persistence, checkpoint/recovery, project-isolation, UTF-8, supervisor timeout/cancellation, source-coverage, and agent-decision tests were run during the corresponding changes. Python syntax and `git diff --check` were also used as targeted technical checks. No claim is made for historical raw logs that have since been removed with application history.
+Capability gaps take precedence over convenience features.
 
-### D02 — published baseline
+## 3. v0.9.1 — Sentinel Reliability
 
-v0.5.0 is the published autonomous-coding baseline. v0.6.0 adds the GUI modernization while preserving that evidence. Follow-up work must preserve it and add only targeted acceptance for an observed gap.
+**Goal:** Improve Sentinel decision quality without adding another agent, model-specific workarounds, or additional orchestration.
 
-## 5. Technical decisions
-
-### Agent, state, and source evidence
-
-LangGraph remains the embedded iterative graph. The dispatcher deterministically executes model-selected tools; SQLite persists conversations, runs, events, checkpoints, index data, and durable memory. The run state keeps confirmed facts, model-proposed decisions, information gaps, sources, changes, and verification as distinct evidence kinds.
-
-Historical source coverage records what was captured from a file. Visible source coverage records only excerpts that were actually sent in the current model prompt. The distinction prevents a context-truncated excerpt from being represented as a complete read. Source-linked facts are invalidated after a changed hash.
-
-### Editing and verification
-
-`write_file` remains available for new files or full replacement. `apply_patch(path, expected_text, replacement, expected_hash)` is the focused existing-file edit path: it requires a matching hash and exactly one original-text occurrence, and returns before/after hashes. Tool results, not model prose, provide change and verification evidence.
-
-### Ollama structured-decision configuration
-
-The active Sentinel decision request uses:
-
-```python
-"think": False,
-"format": "json",
-"stream": False,
-"temperature": 0.0,
-"top_p": 0.9,
-"top_k": 40,
-"num_ctx": 16384,
-```
-
-The Qwen A/B measurement for the same reconstructed decision situation observed 54.14 seconds with thinking enabled and 4.99 seconds with thinking disabled. With `think: true`, several production decisions produced long separate reasoning while `message.content` was empty; `think: false` returned valid JSON and allowed the acceptance run to finish. This setting applies to Sentinel's structured decision path only, not to reasoning use in unrelated LLM applications.
-
-## 6. Release history
-
-| Release | Status | Notes |
+| ID | Task | Expected result |
 | --- | --- | --- |
-| v0.4.0 | Historical pre-release | Earlier M5/M6 and Variante-B baseline; tag retained |
-| v0.5.0 | Current published milestone | P0/P1, `think: false`, repository-index endpoint, copyright notices, and checkpoint-recovered autonomous coding acceptance |
-| v0.6.0 | Current published milestone | GUI modernization: project tabs, settings entry point, compact chat/result presentation, activity dashboard, and bounded independent diagnostic scrolling |
-| v0.7.0 | Released | Accepted D01 read-only completion, source-fact/context and verification-closure corrections, permanent chat/project-history deletion, full-width chat output, and documented acceptance history |
-| v0.8.0 | Released | Native optional MCP client integration through the existing Sentinel dispatcher, including stdio and Streamable HTTP discovery/execution, configuration, and local acceptance evidence |
-| v0.9.0 | Current release | Expandable project file tree and separate single-surface browser editor with built-in syntax highlighting, line numbers, and hash-guarded text saves |
+| S01 | Decision-trace analysis | Completed: distinguish missing context, incorrect reasoning, and insufficient investigation |
+| S02 | Source-context selection | Completed: prioritize individually relevant source ranges without changing checkpoint or source-coverage formats |
+| S03 | Progress and information gaps | Completed: retain observed tool facts separately from model assessments, evidence needs, and open questions |
+| S04 | Evidence-based findings | Separate verified defects, plausible risks, and intended design decisions |
+| S05 | D01 acceptance | Demonstrate measurable improvement without regression |
 
-Historical tags remain immutable from this roadmap forward. Repository publication status and an installed local application are separate states.
+S02 does not distribute the context budget blindly: source ranges remain relevance-ranked and non-overlapping. S03 does not authorize arbitrary read limits or forced strategy changes; it records evidence needs and preserves the distinction between observed tool facts and model interpretations. The current model comparisons show that these mechanisms improve traceability but do not guarantee that every model will emit structured assessments, avoid verification repeats, or reach a correct completion.
 
-## 7. v0.6.0 — GUI Modernization
+### Acceptance criteria
 
-![REAPER-AI v0.6.0 UI preview](docs/assets/reaper-ai-v0.6.0-ui-preview.png)
+- Technical execution: grade 2 or better.
+- Factual analysis: target grade 2 and demonstrably better than the current grade-4 baseline.
+- No loss of autonomous operation.
+- No newly introduced repeated-tool loops.
+- No significant increase in model calls without a demonstrated quality benefit.
+- Repeat the relevant evaluation in more than one run before declaring improvement.
 
-**Goal:** provide a compact, technically oriented Sentinel development interface without changing the backend stack.
+Retain only changes supported by decision-trace evidence.
 
-The existing FastAPI, HTML, CSS, vanilla JavaScript, SSE, and SQLite stack remains in place. No React/Vue migration, npm frontend, second web server, or separate state layer is planned.
+## 4. v0.10.0 — Autonomous Coding Quality
 
-### G01 — project navigation and chat tabs — completed
+**Goal:** Move from successful individual coding demonstrations to dependable everyday coding tasks.
 
-- The left sidebar lists only existing projects and clearly marks the active project.
-- Chats of the selected project appear as tabs in a top tab bar; `+` creates a new chat.
-- Tabs can switch and close without deleting persisted conversations.
-- Project changes show project-scoped tabs. Existing SQLite conversations remain the source of truth.
-- Runs continue through tab or project changes.
-- Existing project, conversation, run, recovery, index, and memory routes remain unchanged; tabs are a vanilla-JavaScript view over persisted conversations.
-- The confirmed dark blue/cyan GUI presentation, transparent Wolf/Kanji logo, compact chat/code/diff styling, and visual integration of the existing activity panel are implemented without backend changes.
+| ID | Task | Expected result |
+| --- | --- | --- |
+| C01 | Multi-file changes | Consistent implementation across related modules |
+| C02 | Change verification | Verify actual behavior rather than accepting model claims |
+| C03 | Failed implementation recovery | Correct errors through the existing tool and checkpoint mechanisms |
+| C04 | Existing changes | Preserve unrelated working-tree modifications |
+| C05 | Coding acceptance | Three representative real coding tasks |
 
-### G02 — live agent activity — completed
+Suggested acceptance tasks:
 
-- The right panel becomes a compact dark developer dashboard.
-- Show real Sentinel phase, explore/plan/implement/verify state, active/completed tools, durations, file changes, errors, correction attempts, verification evidence, and terminal status.
-- Reuse existing SSE and persisted engine events; do not invent activity or progress percentages.
-- With `think: false`, do not reserve permanent empty thinking output.
+1. Correct a small functional bug and demonstrate the fix.
+2. Implement a feature affecting two or three existing modules.
+3. Refactor a small component without changing externally observable behavior.
 
-### G03 — settings entry point — completed
+Each task must use the normal REAPER toolchain and Qwen3.8-Q5, without a special-case prompt designed solely to pass the acceptance. A successful autonomous coding run exists in the v0.8.0 baseline; this milestone is about repeatability, not a new execution mechanism.
 
-- A top-right settings control consolidates existing project creation/editing/removal, workspace, description, project prompt, model selection, existing model parameters, index status/refresh/search, and actual general settings.
-- Reuse current API routes and SQLite records. Offer only settings that work.
+## 5. v0.11.0 — Workflow and Efficiency
 
-### G04 — chat and results — completed
+This optional release exists only if practical use reveals worthwhile improvements.
 
-- Improve reading space and distinguish user messages, Sentinel answers, tool results, changes, diffs, errors, and observed verification.
-- Retain copy controls, cancellation, and recovery.
-- Keep diffs and technical details collapsible instead of permanently crowding the chat.
+- Improve prompt/context efficiency using measured real runs.
+- Consider reusable skills only when repeated tasks justify them.
+- Improve CLI or IDE workflows where the web UI is inconvenient.
+- Resolve the known terminal SSE replay-order inconsistency.
+- Evaluate model changes only with the established D01 and coding-quality tests.
 
-### G05 — visual usability — completed
+No automatic multi-model routing, RAG database, additional agent hierarchy, or elaborate plugin management is planned.
 
-- Keep dark mode, compact developer-dashboard styling, consistent spacing/type/status symbols, and useful responsive layout.
-- Avoid design-system dependencies and decorative animation.
-- Retain a sensible collapsible activity panel where the existing layout supports it.
+## 6. v1.0.0 — Stable Autonomous Coding Agent
 
-### G06 — targeted GUI acceptance — completed
+The version number represents a demonstrated level of reliability, not a collection of features.
 
-1. Select and switch projects.
-2. Create and edit a project from settings.
-3. Open, switch, and close multiple chat tabs without deleting conversations.
-4. Keep an active run alive while changing tabs/projects.
-5. Show actual SSE tool events, changes, verification, errors, cancel, and recovery state.
-6. Reload the browser and restore persisted conversations.
+| Area | Acceptance target |
+| --- | --- |
+| Autonomous planning and execution | Grade ≤ 2 |
+| Technical repository analysis | Grade ≤ 2 |
+| Coding changes and verification | Grade ≤ 2 |
+| Error correction and recovery | Grade ≤ 2 |
+| Local model execution | Stable with the selected reference model |
+| MCP | Existing v0.8.0 functionality preserved |
+| Persistence and project isolation | Existing functionality preserved |
+| Installation | Reproducible Git-based installation |
+| Documentation | Matches the released implementation |
 
-### Definition of done
+The grade targets are evaluation goals, not guarantees that every possible task will succeed.
 
-- The new GUI structure works with the existing backend.
-- Project-scoped chat tabs and settings-based project management work.
-- Live activity presents actual events, changes, and verification evidence.
-- Cancellation and recovery remain usable.
-- README, architecture, and roadmap describe the implemented state.
-- The local installation is checked after implementation.
+## 7. Out of scope
 
-## 8. Open work after v0.9.0
+REAPER remains a lightweight local single-user coding agent. The following are not roadmap objectives without a concrete demonstrated need:
 
-Do not invent feature milestones in advance. Continue with concrete limitations observed during v0.9.0 use, including the small terminal SSE replay ordering inconsistency. Prioritize evidence-backed fixes over new platform layers.
+- Multi-agent platforms and delegation frameworks.
+- Enterprise security, roles, or tenant management.
+- Separate MCP orchestration.
+- Additional databases or services.
+- Custom tool and file-type restrictions.
+- Large regression suites unrelated to observed failures.
+- Cloud dependency or automatic model routing.
+- Replacing the existing frontend stack.
 
-## 9. Deliberately deferred functionality
+## 8. Recommended immediate action
 
-- Multi-agent delegation
-- Automatic multi-model routing
-- Embeddings, vector databases, or RAG without a measured need
-- Cloud services
-- Automated releases or deployments
-- Enterprise roles, tenants, and permission systems
+Start with **S01 — decision-trace analysis**. Before changing `engine.py`, use completed model evaluations to establish which failures arise from context visibility, which from model reasoning, and which from insufficient investigation.
+
+A small read-only analysis should produce:
+
+1. The five most consequential incorrect technical claims or failed decisions.
+2. Their source evidence and relevant decision-trace entries.
+3. A classification of each failure.
+4. At most three proposed corrections, ordered by likely value and implementation effort.
+
+S01–S03 are implemented. The next code change, if justified by a measured failure, is S04 or a targeted correction of the observed verification-output retention issue. This keeps the next milestone focused on making the existing Sentinel more reliable rather than making REAPER more complicated.

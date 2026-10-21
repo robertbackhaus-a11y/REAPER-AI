@@ -31,9 +31,9 @@ class AgentDispatcherTests(unittest.TestCase):
 
         prompt = json.loads(engine._agent_prompt({"task": "Inspect sample.py", "workspace": str(Path.cwd()),
                                                    "agent": agent}))
-        facts = prompt["working_memory"]["confirmed_facts"]
+        facts = prompt["working_memory"]["tool_facts"]
         self.assertTrue(any(item["kind"] == "source_fact" and "lines 10-10" in item["summary"] for item in facts))
-        self.assertTrue(any(item["kind"] == "repeat" and "no new confirmed knowledge" in item["summary"]
+        self.assertTrue(any(item["kind"] == "repeat" and "no new tool evidence" in item["summary"]
                             for item in facts))
         self.assertEqual(prompt["visible_source_coverage"][0]["covered_ranges"], [[10, 10]])
 

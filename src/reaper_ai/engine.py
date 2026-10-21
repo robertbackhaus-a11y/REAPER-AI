@@ -158,21 +158,32 @@ Return exactly one decision:
  "plan":[{"step":"short current or next purpose"}],"open_verifications":["required proof"],
  "verification_for":["proof established by this action"],"phase":"explore|plan|implement|verify",
  "current_task":"short concrete subgoal","decisions":["technical choice"],
- "information_gaps":["unresolved question"]}
+ "information_gaps":[{"question":"unresolved question","evidence_needed":"specific missing evidence"}],
+ "assessments":[{"claim":"technical conclusion","assessment":"supported|refuted|inconclusive",
+                 "evidence":[{"path":"observed path","sha256":"observed hash","start_line":1,"end_line":2}]}],
+ "question_updates":[{"question":"existing open question","resolution":"answered|inconclusive|open",
+                      "evidence_needed":"specific missing proof","evidence":[{"path":"observed path","sha256":"observed hash","start_line":1,"end_line":2}]}]}
 or
 {"kind":"final","outcome":"completed or partial","reason":"short completion or blockage rationale","summary":"concise evidence-based result",
  "verification":"what observed tool results establish","open_verifications":[]}
 `plan`, `open_verifications`, and `verification_for` are optional. `action.tool` must be supported and `action.args`
 must be an object. The work-memory fields are optional and incremental: provide only additions or changes; never repeat
 the whole memory merely to restate it. `decisions` and `information_gaps` are model proposals, not proof of a file
-change or a passed check. Use `reason` only for a short decision rationale, not private reasoning.
+change or a passed check. An `assessment` links a model conclusion to observed tool evidence but remains a model
+interpretation: a successful read supplies the requested source evidence only. It does not automatically support,
+refute, or close a technical question. Every new `information_gaps` question must name its specific
+`evidence_needed`. After evidence relevant to one of your questions is read, provide an `assessment` and a
+`question_updates` entry with cited observed evidence, or leave it `open` and state the remaining evidence needed.
+`question_updates` never changes a question solely because a tool call succeeded. Use `reason` only for a short
+decision rationale, not private reasoning.
 
 Work method for every decision:
 1. Determine the user goal, current subgoal, success criteria, constraints, and project conventions from task, plan,
-   progress, verification, confirmed facts, and observations.
-2. Prefer already known facts. `working_memory.confirmed_facts` are tool-confirmed facts from reads, searches,
-   index queries, changes, and checks; use them before repeating equivalent discovery. `information_gaps` states what
-   tool evidence still does not establish. `code_findings` contain the corresponding source; do not reread an unchanged range unless
+   progress, verification, tool facts, and observations.
+2. Prefer already known facts. `working_memory.tool_facts` are observed tool evidence from reads, searches,
+   index queries, changes, and checks; they establish only what the tool actually returned, not a broader semantic
+   conclusion. `working_memory.model_proposals` are hypotheses and planned choices, never tool evidence.
+   `information_gaps` states what tool evidence still does not establish. `code_findings` contain the corresponding source; do not reread an unchanged range unless
    new evidence makes it necessary. Inspect only information needed for the next useful action. Stop analysis once it
    is sufficient to implement or verify the current subgoal.
 3. Choose the action with the clearest contribution to the remaining work. For a development request, move from focused
@@ -360,12 +371,107 @@ def _memory_text_items(value: Any, *, field: str, source_hashes: set[tuple[str, 
     return items
 
 
+def _observed_evidence_references(value: Any, sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep only source references whose complete range was actually observed."""
+    source_ranges = [
+        (item.get("path"), item.get("sha256"), item.get("start_line"), item.get("end_line"))
+        for item in sources if isinstance(item, dict)
+    ]
+    references: list[dict[str, Any]] = []
+    if not isinstance(value, list):
+        return references
+    for candidate in value:
+        if not isinstance(candidate, dict):
+            continue
+        path, digest = candidate.get("path"), candidate.get("sha256")
+        start, end = candidate.get("start_line"), candidate.get("end_line")
+        if not all((isinstance(path, str), isinstance(digest, str), isinstance(start, int), isinstance(end, int))):
+            continue
+        if not any(path == source_path and digest == source_digest and
+                   isinstance(source_start, int) and isinstance(source_end, int) and
+                   source_start <= start <= end <= source_end
+                   for source_path, source_digest, source_start, source_end in source_ranges):
+            continue
+        references.append({"path": path, "sha256": digest, "start_line": start, "end_line": end})
+    return references
+
+
+def _memory_assessment_items(value: Any, sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Retain model assessments with references to observed source, never as facts."""
+    raw_items = value if isinstance(value, list) else []
+    items: list[dict[str, Any]] = []
+    for raw in raw_items:
+        if not isinstance(raw, dict):
+            continue
+        claim = raw.get("claim", raw.get("summary", ""))
+        assessment = raw.get("assessment")
+        if not isinstance(claim, str) or not claim.strip() or assessment not in {"supported", "refuted", "inconclusive"}:
+            continue
+        evidence = _observed_evidence_references(raw.get("evidence"), sources)
+        item: dict[str, Any] = {
+            "status": "proposed", "kind": "assessment", "summary": _short_text(claim.strip(), 600),
+            "assessment": assessment,
+        }
+        if evidence:
+            item["evidence"] = evidence
+        items.append(item)
+    return items
+
+
+def _memory_question_items(value: Any, sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep explicit model questions and their evidence need separate from tool facts."""
+    raw_items = value if isinstance(value, list) else [value] if isinstance(value, str) else []
+    items: list[dict[str, Any]] = []
+    for raw in raw_items:
+        question, evidence_needed, resolution, evidence = raw, "", "open", []
+        if isinstance(raw, dict):
+            question = raw.get("question", raw.get("summary", raw.get("text", "")))
+            evidence_needed = raw.get("evidence_needed", "")
+            resolution = raw.get("resolution", "open")
+            evidence = _observed_evidence_references(raw.get("evidence"), sources)
+        if not isinstance(question, str) or not question.strip():
+            continue
+        if resolution not in {"open", "answered", "inconclusive"}:
+            resolution = "open"
+        # A model may update its own question only with an actual observed
+        # source reference; a successful tool call does not perform this update.
+        if resolution != "open" and not evidence:
+            resolution = "open"
+        item: dict[str, Any] = {
+            "status": "proposed", "kind": "question", "summary": _short_text(question.strip(), 600),
+            "resolution": resolution,
+        }
+        if isinstance(evidence_needed, str) and evidence_needed.strip():
+            item["evidence_needed"] = _short_text(evidence_needed.strip(), 600)
+        if evidence:
+            item["evidence"] = evidence
+        items.append(item)
+    return items
+
+
+def _apply_question_updates(agent: dict[str, Any], updates: list[dict[str, Any]]) -> None:
+    """Record a model's evidence-linked question assessment without tool-side closure."""
+    gaps = [item for item in agent.get("information_gaps", []) if isinstance(item, dict)]
+    for update in updates:
+        for index, gap in enumerate(gaps):
+            if gap.get("kind") == "question" and gap.get("summary") == update.get("summary"):
+                gaps[index] = {**gap, **update}
+                break
+        else:
+            gaps.append(update)
+    agent["information_gaps"] = gaps
+
+
 def _append_unique(items: list[dict[str, Any]], additions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Keep accumulated notes stable across decisions while avoiding exact repeats."""
-    seen = {(item.get("status"), item.get("summary"), str(item.get("source"))) for item in items if isinstance(item, dict)}
+    seen = {(item.get("status"), item.get("summary"), str(item.get("source")),
+             item.get("assessment"), item.get("resolution"), item.get("evidence_needed"),
+             str(item.get("evidence"))) for item in items if isinstance(item, dict)}
     result = [item for item in items if isinstance(item, dict)]
     for item in additions:
-        marker = (item.get("status"), item.get("summary"), str(item.get("source")))
+        marker = (item.get("status"), item.get("summary"), str(item.get("source")),
+                  item.get("assessment"), item.get("resolution"), item.get("evidence_needed"),
+                  str(item.get("evidence")))
         if marker not in seen:
             result.append(item)
             seen.add(marker)
@@ -374,7 +480,8 @@ def _append_unique(items: list[dict[str, Any]], additions: list[dict[str, Any]])
 
 def _compact_memory_item(item: dict[str, Any]) -> dict[str, Any]:
     """Serialize evidence for a decision without replaying a tool's full payload."""
-    compact = {key: item.get(key) for key in ("status", "kind", "tool", "query", "path", "source")
+    compact = {key: item.get(key) for key in ("status", "kind", "tool", "query", "path", "source", "assessment",
+                                               "resolution", "evidence_needed")
                if key in item}
     compact["summary"] = _short_text(item.get("summary", ""), 500)
     locations = item.get("locations")
@@ -401,17 +508,32 @@ def _work_memory_snapshot(agent: dict[str, Any]) -> dict[str, Any]:
     """Present current, compact evidence before historical notes and observations."""
     _ensure_work_memory(agent)
     facts = [item for item in agent["facts"] if isinstance(item, dict)]
+    gaps = [item for item in agent["information_gaps"] if isinstance(item, dict)]
+    open_questions = [
+        item for item in gaps
+        if item.get("kind") == "question" and item.get("resolution", "open") == "open"
+    ]
+    other_gaps = [
+        item for item in gaps
+        if not (item.get("kind") == "question" and item.get("resolution", "open") == "open")
+    ]
     return {
         "current_task": _short_text(agent["current_task"], 600),
         "phase": agent["phase"],
-        "confirmed_facts": [_compact_memory_item(item) for item in facts[-10:]],
-        "decisions": [_compact_memory_item(item) for item in agent["decisions"][-8:]],
-        "information_gaps": [_compact_memory_item(item) for item in agent["information_gaps"][-8:]],
+        # Open questions define the evidence required for the next action and
+        # must not be displaced by older source or tool-history gaps.
+        "open_questions": [_compact_memory_item(item) for item in open_questions[-8:]],
+        # These two categories intentionally remain separate: only tool
+        # outcomes enter facts; model-supplied notes stay proposed until a
+        # later tool result establishes the relevant claim.
+        "tool_facts": [_compact_memory_item(item) for item in facts[-10:]],
+        "model_proposals": [_compact_memory_item(item) for item in agent["decisions"][-8:]],
+        "information_gaps": [_compact_memory_item(item) for item in other_gaps[-6:]],
     }
 
 
-def _update_work_memory_from_decision(agent: dict[str, Any], decision: dict[str, Any]) -> None:
-    """Apply only incremental model notes; factual state remains tool-derived."""
+def _update_work_memory_from_decision(agent: dict[str, Any], decision: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    """Apply incremental model notes and return accepted interpretations for tracing."""
     _ensure_work_memory(agent)
     current_task = decision.get("current_task")
     if isinstance(current_task, str) and current_task.strip():
@@ -420,14 +542,20 @@ def _update_work_memory_from_decision(agent: dict[str, Any], decision: dict[str,
         (item.get("path"), item.get("sha256")) for item in agent.get("progress", {}).get("sources", [])
         if isinstance(item, dict) and isinstance(item.get("path"), str) and isinstance(item.get("sha256"), str)
     }
+    sources = [item for item in agent.get("progress", {}).get("sources", []) if isinstance(item, dict)]
     for key in ("decisions", "findings", "completed_tasks"):
         agent["decisions"] = _append_unique(
             agent["decisions"], _memory_text_items(decision.get(key), field=key, source_hashes=source_hashes)
         )
+    assessments = _memory_assessment_items(decision.get("assessments"), sources)
+    agent["decisions"] = _append_unique(agent["decisions"], assessments)
     for key in ("information_gaps", "open_questions"):
         agent["information_gaps"] = _append_unique(
-            agent["information_gaps"], _memory_text_items(decision.get(key), field=key, source_hashes=source_hashes)
+            agent["information_gaps"], _memory_question_items(decision.get(key), sources)
         )
+    question_updates = _memory_question_items(decision.get("question_updates"), sources)
+    _apply_question_updates(agent, question_updates)
+    return {"assessments": assessments, "question_updates": question_updates}
 
 
 def _captured_end(finding: dict[str, Any]) -> int | None:
@@ -583,6 +711,12 @@ def _context_range_scores(agent: dict[str, Any], findings: list[dict[str, Any]])
     """Rank individual source ranges for the next action, not their whole file."""
     notes = [agent.get("current_task", "")]
     notes.extend(item.get("summary", "") for item in agent.get("decisions", []) if isinstance(item, dict))
+    open_questions = [
+        item for item in agent.get("information_gaps", [])
+        if isinstance(item, dict) and item.get("kind") == "question" and item.get("resolution", "open") == "open"
+    ]
+    for question in open_questions:
+        notes.extend((question.get("summary", ""), question.get("evidence_needed", "")))
     terms = {term.casefold() for note in notes if isinstance(note, str)
              for term in re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", note)}
     recent_reads = [
@@ -623,6 +757,16 @@ def _context_range_scores(agent: dict[str, Any], findings: list[dict[str, Any]])
             line = location.get("line")
             if location.get("path") == path and isinstance(line, int) and start <= line <= end:
                 score += 500
+        for question in open_questions:
+            evidence_items = question.get("evidence", [])
+            for evidence in evidence_items if isinstance(evidence_items, list) else []:
+                if not isinstance(evidence, dict) or evidence.get("path") != path:
+                    continue
+                if evidence.get("sha256") not in (None, finding.get("sha256")):
+                    continue
+                evidence_start, evidence_end = evidence.get("start_line"), evidence.get("end_line")
+                if isinstance(evidence_start, int) and isinstance(evidence_end, int) and start <= evidence_end and end >= evidence_start:
+                    score += 400
         scores.append(score + index)
     return scores
 
@@ -721,7 +865,7 @@ def _source_fact_finding(finding: dict[str, Any]) -> dict[str, Any] | None:
         "kind": "source_fact",
         # A targeted excerpt frequently starts or ends inside a scope and
         # therefore cannot be parsed as a standalone Python module.  The read
-        # is still a confirmed fact: without this record, an identical read
+        # is still observed tool evidence: without this record, an identical read
         # produces no memory update and the following decision cannot tell
         # that it gained no new information.
         "summary": _short_text(range_summary + (f": {detail}" if detail else "."), 1_200),
@@ -834,7 +978,7 @@ def _record_observed_knowledge(agent: dict[str, Any], facts: list[dict[str, Any]
         tool = facts[0].get("tool", "tool")
         agent["facts"] = _append_unique(agent["facts"], [{
             "status": "observed", "kind": "repeat",
-            "summary": f"The latest successful {tool} action added no new confirmed knowledge; use the retained facts or address an explicit information gap.",
+            "summary": f"The latest successful {tool} action added no new tool evidence; use the retained facts or address an explicit information gap.",
             "tool": tool,
         }])
     agent["information_gaps"] = _append_unique(agent["information_gaps"], gaps)[-32:]
@@ -874,6 +1018,9 @@ def _knowledge_mentions_path(item: dict[str, Any], path: str) -> bool:
             for value in values:
                 if value == path or (isinstance(value, dict) and value.get("path") == path):
                     return True
+    evidence = item.get("evidence")
+    if isinstance(evidence, list):
+        return any(isinstance(entry, dict) and entry.get("path") == path for entry in evidence)
     return False
 
 
@@ -1004,8 +1151,8 @@ def _agent_prompt(state: AgentRunState) -> str:
               "workspace": state["workspace"],
               "path_rule": "Paths may be workspace-relative or absolute.",
               "shell_environment": "Windows PowerShell (powershell -Command); use PowerShell syntax, never Bash/CMD `||` or `2>nul`.",
-              "code_findings": [], "visible_source_coverage": [],
               "working_memory": _work_memory_snapshot(agent), "progress": progress, "verification": agent["verification"],
+              "code_findings": [], "visible_source_coverage": [],
               "source_coverage": [], "repository_map": _repository_map_snapshot(agent.get("repository_map")),
               "mcp_tools": _mcp_tools_snapshot(agent), "mcp_discovery_errors": agent.get("mcp_errors", []),
               "plan": plan, "current_step": agent["current_step"], "previous_observations": []}
@@ -1110,7 +1257,7 @@ def _agent_prompt(state: AgentRunState) -> str:
 
 
 def _fact_markers(agent: dict[str, Any]) -> set[str]:
-    """Identify the confirmed facts available before or after one tool action."""
+    """Identify the observed tool facts available before or after one action."""
     return {
         json.dumps(_compact_memory_item(item), ensure_ascii=False, sort_keys=True)
         for item in agent.get("facts", [])
@@ -1150,8 +1297,9 @@ def _trace_context(prompt: str, system: str) -> dict[str, Any]:
         "task": payload.get("task"),
         "current_task": payload.get("current_task"),
         "phase": payload.get("phase"),
-        "confirmed_facts": memory.get("confirmed_facts", []),
-        "model_decisions": memory.get("decisions", []),
+        "open_questions": memory.get("open_questions", []),
+        "tool_facts": memory.get("tool_facts", []),
+        "model_proposals": memory.get("model_proposals", []),
         "information_gaps": memory.get("information_gaps", []),
         "mcp_tools": payload.get("mcp_tools", []),
         "mcp_discovery_errors": payload.get("mcp_discovery_errors", []),
@@ -1268,7 +1416,7 @@ def agent_decide(state: AgentRunState) -> dict[str, Any]:
     if isinstance(plan, list) and plan and all(isinstance(item, dict) for item in plan):
         existing_steps = {str(item.get("step")) for item in agent["plan"] if isinstance(item, dict)}
         agent["plan"] = [*agent["plan"], *[item for item in plan if str(item.get("step")) not in existing_steps]]
-    _update_work_memory_from_decision(agent, decision)
+    memory_updates = _update_work_memory_from_decision(agent, decision)
     reason = _short_text(decision.get("reason", ""))
     agent["progress"]["last_reason"] = reason
     kind = decision.get("kind")
@@ -1281,9 +1429,16 @@ def agent_decide(state: AgentRunState) -> dict[str, Any]:
         final_open_points = _string_list(decision.get("open_verifications"))
         if final_open_points is not None:
             agent["progress"]["open_verifications"] = final_open_points
+        unresolved_questions = [
+            _compact_memory_item(item) for item in agent.get("information_gaps", [])
+            if isinstance(item, dict) and item.get("kind") == "question" and item.get("resolution", "open") == "open"
+        ]
         _emit_event("decision_trace", trace_state="decision", trace_id=trace_id, run_id=run_id, step=step,
                     model=MODEL, context=trace["context"], phase_before=trace["phase_before"],
-                    decision_kind="final", reason=reason, action=None)
+                    decision_kind="final", reason=reason, action=None,
+                    model_assessments=memory_updates["assessments"],
+                    question_updates=memory_updates["question_updates"],
+                    unresolved_questions=unresolved_questions)
         successful = any(observation.get("result", {}).get("ok") for observation in agent["observations"])
         if not successful:
             return _decision_error(agent, "Agent attempted final report without successful tool evidence")
@@ -1296,6 +1451,8 @@ def agent_decide(state: AgentRunState) -> dict[str, Any]:
         verification.update({"status": "ready", "summary": str(decision.get("summary", ""))[:4_000],
                              "model_assessment": str(decision.get("verification", ""))[:4_000],
                              "observed_tools": len(agent["observations"]), "outcome": outcome})
+        if unresolved_questions:
+            verification["unresolved_questions"] = unresolved_questions
         agent["verification"] = verification
         agent["next_action"] = None
         _emit_event("agent_decision", decision_kind="final", tool="final", reason=reason,
@@ -1327,7 +1484,9 @@ def agent_decide(state: AgentRunState) -> dict[str, Any]:
     agent["pending_decision_trace"] = trace
     _emit_event("decision_trace", trace_state="decision", trace_id=trace_id, run_id=run_id, step=step,
                 model=MODEL, context=trace["context"], phase_before=trace["phase_before"],
-                decision_kind="action", reason=reason, action=trace["action"])
+                decision_kind="action", reason=reason, action=trace["action"],
+                model_assessments=memory_updates["assessments"],
+                question_updates=memory_updates["question_updates"])
     agent["next_action"] = action
     _emit_event("agent_decision", decision_kind="action", tool=action["tool"], step=agent["current_step"] + 1,
                 reason=reason, progress=_progress_snapshot(agent),
@@ -1385,8 +1544,8 @@ def agent_observe(state: AgentRunState) -> dict[str, Any]:
             "decision_trace", trace_state="result", trace_id=trace.get("trace_id"),
             run_id=trace.get("run_id"), step=observation["step"], model=trace.get("model", MODEL),
             tool_result=_trace_result(result), information_gain={
-                "new_confirmed_facts": new_facts,
-                "new_fact_count": len(new_facts),
+                "new_tool_facts": new_facts,
+                "new_tool_fact_count": len(new_facts),
                 "repeated_action": bool(signature and signature == previous_signature),
             }, phase_before=trace.get("phase_before"), phase_after=agent.get("phase"),
             strategy_changed=bool(signature and previous_signature and signature != previous_signature),
@@ -1546,6 +1705,12 @@ def run(task: str, workspace: str) -> dict[str, Any]:
         verification = outcome.get("agent", {}).get("verification", {})
         result["progress"] = _progress_snapshot(outcome.get("agent", {}))
         result["summary"] = verification.get("summary", "")
+        unresolved_questions = verification.get("unresolved_questions")
+        if isinstance(unresolved_questions, list) and unresolved_questions:
+            result["unresolved_questions"] = [
+                {**question, "terminal_status": "inconclusive"}
+                for question in unresolved_questions if isinstance(question, dict)
+            ]
         result["tool_calls"] = outcome.get("agent", {}).get("budgets", {}).get("tool_calls", 0)
         return _complete(result, run_id)
     except (RunBudgetExceeded, httpx.TimeoutException) as exc:
