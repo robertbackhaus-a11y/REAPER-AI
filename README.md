@@ -14,22 +14,43 @@ v0.9.1 retains the v0.6.0 interface modernization and the D01 completion work: c
 
 ## Requirements and installation
 
-Windows 11, Python 3.12+, and Ollama with at least one installed model are required. Git is optional.
+Requirements:
+
+- Python 3.12 or newer.
+- [Ollama](https://ollama.com/) with an installed compatible model. The documented reference model is `qwen3.8-q5:latest`.
+- Git only when cloning the repository; an extracted source archive does not require Git.
+
+### Windows (PowerShell)
 
 ```powershell
 git clone https://github.com/robertbackhaus-a11y/REAPER-AI.git
 cd REAPER-AI
 py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install .
-ollama pull qwen3.6:35b
+ollama pull qwen3.8-q5:latest
+$env:REAPER_MODEL = "qwen3.8-q5:latest"
 .\.venv\Scripts\python.exe -m uvicorn reaper_ai.api:app --host 127.0.0.1 --port 8000
 ```
 
-Open <http://127.0.0.1:8000/>. For development, install with `pip install -e .` instead.
+### Linux and macOS (POSIX shell)
+
+```sh
+git clone https://github.com/robertbackhaus-a11y/REAPER-AI.git
+cd REAPER-AI
+python3.12 -m venv .venv
+. .venv/bin/activate
+python -m pip install .
+ollama pull qwen3.8-q5:latest
+REAPER_MODEL=qwen3.8-q5:latest python -m uvicorn reaper_ai.api:app --host 127.0.0.1 --port 8000
+```
+
+Open <http://127.0.0.1:8000/>. For development, replace `python -m pip install .` with `python -m pip install -e .` after activating the virtual environment.
+
+The application has been accepted on Windows. The POSIX commands use standard Python virtual-environment and Uvicorn invocation, but Linux and macOS have not yet been acceptance-tested. In particular, starting, resuming, and cancelling autonomous runs is currently Windows-only because the process-tree supervisor uses Windows Job Objects. The API can start on POSIX, but those run endpoints return `501` until a POSIX supervisor is implemented.
 
 ## Ollama configuration
 
-REAPER-AI uses the local Ollama API at `http://127.0.0.1:11434`. Start Ollama before opening the application and install a model with `ollama pull <model>`. The browser lists installed models and starts each run with the selected model. Direct engine runs use `REAPER_MODEL` when set, otherwise the built-in default `qwen3.6:35b`. Sentinel requests JSON decisions with `think: false`, `format: "json"`, `stream: false`, `temperature: 0.0`, `top_p: 0.9`, `top_k: 40`, and `num_ctx: 16384`; the tested Qwen setup returned more reliable structured decisions that way.
+REAPER-AI uses the local Ollama API at `http://127.0.0.1:11434`. Start Ollama before opening the application and install a model with `ollama pull <model>`. The browser lists installed models and starts each run with the selected model. Set `REAPER_MODEL=qwen3.8-q5:latest` for documented direct-engine use; if it is unset, the current engine fallback remains `qwen3.6:35b`. Sentinel requests JSON decisions with `think: false`, `format: "json"`, `stream: false`, `temperature: 0.0`, `top_p: 0.9`, `top_k: 40`, and `num_ctx: 16384`; the tested Qwen setup returned more reliable structured decisions that way.
 
 Choose any existing absolute project directory, an installed Ollama model, and a bounded timeout in the browser. Git is an optional inspection tool, not a run precondition. The workspace supplies initial project context; tool paths may also be absolute and are subject to the started user's operating-system permissions. REAPER-AI never elevates permissions. It does not automatically commit, push, tag, publish, or release.
 
