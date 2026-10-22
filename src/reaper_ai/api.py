@@ -13,13 +13,14 @@ import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Literal
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
-from reaper_ai import tools
+from reaper_ai import mcp_client, tools
 from reaper_ai.persistence import StorageError, Store
 from reaper_ai.repository_index import RepositoryIndexError, refresh_project_index
 
@@ -175,7 +176,7 @@ def _watch(run_id: str, proc: subprocess.Popen) -> None:
     if project_id:
         try:
             project = _store.get_project(project_id)
-            if project is not None:
+            if _is_coding(project):
                 refresh_project_index(_store, project)
         except (RepositoryIndexError, StorageError) as exc:
             entry["index_error"] = str(exc)
@@ -216,7 +217,9 @@ class ProjectRequest(BaseModel):
 
 class ProjectCreateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=200)
-    workspace: str = Field(min_length=1, max_length=10_000)
+    # "coding" requires a workspace; "chat" is a general conversation project without one.
+    kind: Literal["coding", "chat"] = "coding"
+    workspace: str | None = Field(default=None, min_length=1, max_length=10_000)
     description: str | None = Field(default=None, max_length=4_000)
     system_prompt: str = Field(default="", max_length=12_000)
     model: str = Field(default="qwen3.8-q5:latest", min_length=1, max_length=200)
@@ -224,6 +227,7 @@ class ProjectCreateRequest(BaseModel):
     top_p: float = Field(default=0.9, gt=0.0, le=1.0)
     top_k: int = Field(default=40, ge=1, le=500)
     num_ctx: int = Field(default=16_384, ge=1_024, le=131_072)
+    mcp_servers: list[str] = Field(default_factory=list, max_length=200)
 
 
 class ProjectUpdateRequest(BaseModel):
@@ -236,6 +240,7 @@ class ProjectUpdateRequest(BaseModel):
     top_p: float | None = Field(default=None, gt=0.0, le=1.0)
     top_k: int | None = Field(default=None, ge=1, le=500)
     num_ctx: int | None = Field(default=None, ge=1_024, le=131_072)
+    mcp_servers: list[str] | None = Field(default=None, max_length=200)
 
 
 class EditorFileRequest(BaseModel):
@@ -256,6 +261,48 @@ def _validate_workspace(workspace: str) -> Path:
     return root
 
 
+def _chat_workspace() -> Path:
+    """Scratch directory for general chats, which have no project workspace.
+
+    The unchanged engine still needs a working directory; general chats use one
+    in the application data directory, never a user project.
+    """
+    root = _store.path.parent / "chat-workspace"
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise HTTPException(status_code=503, detail=f"Chat workspace unavailable: {exc}") from exc
+    return root.resolve()
+
+
+def _is_coding(project: dict | None) -> bool:
+    return project is not None and project.get("kind", "coding") == "coding"
+
+
+def _mcp_failure(exc: mcp_client.MCPClientError) -> HTTPException:
+    return HTTPException(status_code=422, detail=str(exc))
+
+
+def _validate_mcp_selection(server_ids: list[str]) -> list[str]:
+    """A project stores only IDs of servers that exist in the global mcp.json."""
+    try:
+        _, servers = mcp_client._configuration()
+    except mcp_client.MCPClientError as exc:
+        raise _mcp_failure(exc) from exc
+    unknown = [item for item in server_ids if item not in servers]
+    if unknown:
+        raise HTTPException(status_code=422, detail=f"Unknown MCP server(s): {', '.join(unknown)}")
+    return list(dict.fromkeys(server_ids))
+
+
+def _mcp_environment(env: dict[str, str], project: dict | None) -> None:
+    # Project runs see only their selected servers; legacy runs keep all enabled servers.
+    if project is not None:
+        env[mcp_client.SELECTION_ENV] = json.dumps(project.get("mcp_servers") or [])
+    else:
+        env.pop(mcp_client.SELECTION_ENV, None)
+
+
 @app.post("/projects/validate")
 def validate_project(request: ProjectRequest):
     root = _validate_workspace(request.workspace)
@@ -272,6 +319,14 @@ def _project_or_404(project_id: str) -> dict:
     return project
 
 
+def _coding_project_or_409(project_id: str) -> dict:
+    """Workspace features (index, files, Git changes) exist only for coding projects."""
+    project = _project_or_404(project_id)
+    if not _is_coding(project):
+        raise HTTPException(status_code=409, detail="General chat projects have no workspace")
+    return project
+
+
 @app.get("/projects")
 def list_projects():
     try:
@@ -282,9 +337,15 @@ def list_projects():
 
 @app.post("/projects", status_code=201)
 def create_project(request: ProjectCreateRequest):
-    root = _validate_workspace(request.workspace)
+    if request.kind == "coding":
+        if not request.workspace:
+            raise HTTPException(status_code=422, detail="A coding project requires a workspace")
+        workspace = str(_validate_workspace(request.workspace))
+    else:
+        workspace = ""
+    servers = _validate_mcp_selection(request.mcp_servers)
     try:
-        return _store.create_project(**{**request.model_dump(), "workspace": str(root)})
+        return _store.create_project(**{**request.model_dump(), "workspace": workspace, "mcp_servers": servers})
     except StorageError as exc:
         raise _storage_failure(exc) from exc
 
@@ -296,10 +357,16 @@ def get_project(project_id: str):
 
 @app.patch("/projects/{project_id}")
 def update_project(project_id: str, request: ProjectUpdateRequest):
-    _project_or_404(project_id)
+    existing = _project_or_404(project_id)
     changes = request.model_dump(exclude_unset=True)
+    if not _is_coding(existing):
+        if changes.get("workspace"):
+            raise HTTPException(status_code=422, detail="General chat projects have no workspace")
+        changes.pop("workspace", None)
     if "workspace" in changes:
         changes["workspace"] = str(_validate_workspace(changes["workspace"]))
+    if changes.get("mcp_servers") is not None:
+        changes["mcp_servers"] = _validate_mcp_selection(changes["mcp_servers"])
     try:
         project = _store.update_project(project_id, **changes)
     except StorageError as exc:
@@ -326,12 +393,12 @@ def delete_project(project_id: str):
 
 @app.post("/projects/{project_id}/index")
 def refresh_index(project_id: str):
-    return _refresh_index(_project_or_404(project_id))
+    return _refresh_index(_coding_project_or_409(project_id))
 
 
 @app.get("/projects/{project_id}/index")
 def get_index_status(project_id: str):
-    project = _project_or_404(project_id)
+    project = _coding_project_or_409(project_id)
     _refresh_index(project)
     try:
         return _store.index_status(project_id)
@@ -342,7 +409,7 @@ def get_index_status(project_id: str):
 @app.get("/projects/{project_id}/index/files")
 def get_index_files(project_id: str, query: str | None = None, language: str | None = None,
                     limit: int = 500):
-    _refresh_index(_project_or_404(project_id))
+    _refresh_index(_coding_project_or_409(project_id))
     try:
         return {"files": _store.list_index_files(project_id, query=query, language=language,
                                                    limit=max(1, min(limit, 2_000)))}
@@ -352,7 +419,7 @@ def get_index_files(project_id: str, query: str | None = None, language: str | N
 
 @app.get("/projects/{project_id}/index/symbols")
 def get_index_symbols(project_id: str, name: str = "", path: str | None = None, limit: int = 100):
-    _refresh_index(_project_or_404(project_id))
+    _refresh_index(_coding_project_or_409(project_id))
     try:
         if path and not name:
             return {"symbols": _store.index_symbols_for_file(project_id, path)}
@@ -364,7 +431,7 @@ def get_index_symbols(project_id: str, name: str = "", path: str | None = None, 
 
 @app.get("/projects/{project_id}/index/imports")
 def get_index_imports(project_id: str, path: str | None = None):
-    _refresh_index(_project_or_404(project_id))
+    _refresh_index(_coding_project_or_409(project_id))
     try:
         return {"imports": _store.index_imports(project_id, path)}
     except StorageError as exc:
@@ -373,7 +440,7 @@ def get_index_imports(project_id: str, path: str | None = None):
 
 @app.get("/projects/{project_id}/index/top-python-files")
 def get_top_python_files(project_id: str):
-    _refresh_index(_project_or_404(project_id))
+    _refresh_index(_coding_project_or_409(project_id))
     try:
         return {"files": _store.top_python_files_by_symbols(project_id, limit=5)}
     except StorageError as exc:
@@ -383,7 +450,7 @@ def get_top_python_files(project_id: str):
 @app.get("/projects/{project_id}/files/content")
 def get_project_file(project_id: str, path: str):
     """Read a project text file for the browser editor with its source hash."""
-    project = _project_or_404(project_id)
+    project = _coding_project_or_409(project_id)
     result = tools.read_file(project["workspace"], path, max_chars=500_000)
     if not result.get("ok"):
         raise HTTPException(status_code=400, detail=result.get("error", "File cannot be read as UTF-8 text"))
@@ -393,7 +460,7 @@ def get_project_file(project_id: str, path: str):
 @app.put("/projects/{project_id}/files/content")
 def save_project_file(project_id: str, request: EditorFileRequest):
     """Save one editor file only when it still matches the displayed hash."""
-    project = _project_or_404(project_id)
+    project = _coding_project_or_409(project_id)
     result = tools.write_file(project["workspace"], request.path, request.content,
                               expected_hash=request.expected_hash)
     if not result.get("ok"):
@@ -403,6 +470,131 @@ def save_project_file(project_id: str, request: EditorFileRequest):
     if result.get("changed"):
         _refresh_index(project)
     return result
+
+
+@app.get("/projects/{project_id}/changes/refs")
+def get_project_change_refs(project_id: str):
+    """List local commits and tags available for historical comparisons (read-only)."""
+    project = _coding_project_or_409(project_id)
+    result = tools.git_refs(project["workspace"])
+    if not result.get("ok"):
+        raise HTTPException(status_code=500, detail=f"Git refs failed: {result.get('error', '')}")
+    return result
+
+
+def _change_mode(mode: str, ref: str | None) -> None:
+    if mode not in {"worktree", "commit", "release"}:
+        raise HTTPException(status_code=422, detail="mode must be worktree, commit, or release")
+    if mode != "worktree" and not ref:
+        raise HTTPException(status_code=422, detail="ref is required for commit and release comparisons")
+
+
+@app.get("/projects/{project_id}/changes")
+def get_project_changes(project_id: str, mode: str = "worktree", ref: str | None = None,
+                        untracked: bool = True, worktree: bool = False):
+    """List changed files of a read-only Git comparison (working tree, commit, or tag)."""
+    project = _coding_project_or_409(project_id)
+    _change_mode(mode, ref)
+    result = tools.git_changes(project["workspace"], mode, ref, untracked=untracked,
+                               include_worktree=worktree)
+    if not result.get("ok"):
+        error = result.get("error", "")
+        raise HTTPException(status_code=404 if error.startswith("Unknown") else 500,
+                            detail=error if error.startswith("Unknown") else f"Git comparison failed: {error}")
+    return {**result, "mode": mode, "ref": ref}
+
+
+@app.get("/projects/{project_id}/changes/diff")
+def get_project_change_diff(project_id: str, path: str, mode: str = "worktree", ref: str | None = None,
+                            worktree: bool = False):
+    """Return one file's unified diff from the same read-only comparison."""
+    project = _coding_project_or_409(project_id)
+    _change_mode(mode, ref)
+    result = tools.git_file_diff(project["workspace"], path, mode, ref, include_worktree=worktree)
+    if not result.get("ok"):
+        error = result.get("error", "Git diff failed")
+        raise HTTPException(status_code=404 if error.startswith(("Unknown", "File has no")) else 400,
+                            detail=error)
+    return result
+
+
+# P05: global MCP server management. Every change is written straight to the
+# central mcp.json; the next run reads it, while a running run keeps the
+# definitions it captured at start.
+class MCPServerRequest(BaseModel):
+    config: dict
+    previous_id: str | None = Field(default=None, min_length=1, max_length=200)
+
+
+class MCPServerStateRequest(BaseModel):
+    enabled: bool
+
+
+def _replace_project_mcp_id(old_id: str, new_id: str | None) -> None:
+    """Keep project selections consistent when a global server is renamed or removed."""
+    try:
+        for project in _store.list_projects():
+            selected = project.get("mcp_servers") or []
+            if old_id in selected:
+                updated = [new_id if item == old_id else item for item in selected if new_id or item != old_id]
+                _store.update_project(project["project_id"], mcp_servers=list(dict.fromkeys(updated)))
+    except StorageError as exc:
+        raise _storage_failure(exc) from exc
+
+
+@app.get("/mcp/servers")
+def list_mcp_servers():
+    try:
+        return mcp_client.list_servers()
+    except mcp_client.MCPClientError as exc:
+        raise _mcp_failure(exc) from exc
+
+
+@app.put("/mcp/servers/{server_id}")
+def save_mcp_server(server_id: str, request: MCPServerRequest):
+    try:
+        server = mcp_client.save_server(server_id, request.config, previous_id=request.previous_id)
+    except mcp_client.MCPClientError as exc:
+        raise _mcp_failure(exc) from exc
+    if request.previous_id and request.previous_id != server_id:
+        _replace_project_mcp_id(request.previous_id, server_id)
+    return {"id": server_id, "transport": mcp_client.transport(server), "enabled": not server.get("disabled"),
+            "config": server}
+
+
+@app.patch("/mcp/servers/{server_id}")
+def set_mcp_server_state(server_id: str, request: MCPServerStateRequest):
+    try:
+        _, servers = mcp_client._configuration()
+        if server_id not in servers:
+            raise HTTPException(status_code=404, detail="Unknown MCP server")
+        server = dict(servers[server_id])
+        server.pop("disabled", None)
+        if not request.enabled:
+            server["disabled"] = True
+        mcp_client.save_server(server_id, server)
+    except mcp_client.MCPClientError as exc:
+        raise _mcp_failure(exc) from exc
+    return {"id": server_id, "enabled": request.enabled}
+
+
+@app.delete("/mcp/servers/{server_id}", status_code=204)
+def delete_mcp_server(server_id: str):
+    try:
+        if not mcp_client.delete_server(server_id):
+            raise HTTPException(status_code=404, detail="Unknown MCP server")
+    except mcp_client.MCPClientError as exc:
+        raise _mcp_failure(exc) from exc
+    _replace_project_mcp_id(server_id, None)
+    return Response(status_code=204)
+
+
+@app.post("/mcp/servers/{server_id}/test")
+def test_mcp_server(server_id: str):
+    try:
+        return mcp_client.check_server(server_id)
+    except mcp_client.MCPClientError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 class ConversationRequest(BaseModel):
@@ -419,11 +611,14 @@ class MemoryRequest(BaseModel):
 
 
 @app.get("/conversations")
-def list_conversations(project_id: str | None = None):
+def list_conversations(project_id: str | None = None, legacy: bool = False):
+    # legacy=true lists only chats without a project (the "Legacy-Chats" view);
+    # without it, all conversations are listed as before.
     try:
         if project_id is not None:
             _project_or_404(project_id)
-        return {"conversations": _store.list_conversations(project_id=project_id)}
+        return {"conversations": _store.list_conversations(project_id=project_id,
+                                                           legacy_only=legacy and project_id is None)}
     except StorageError as exc:
         raise _storage_failure(exc) from exc
 
@@ -433,10 +628,15 @@ def create_conversation(request: ConversationRequest):
     workspace, model = request.workspace, request.model
     if request.project_id:
         project = _project_or_404(request.project_id)
-        root = _validate_workspace(project["workspace"])
-        if workspace and _validate_workspace(workspace) != root:
-            raise HTTPException(status_code=422, detail="Conversation workspace must match its project workspace")
-        workspace, model = str(root), project["model"]
+        if _is_coding(project):
+            root = _validate_workspace(project["workspace"])
+            if workspace and _validate_workspace(workspace) != root:
+                raise HTTPException(status_code=422, detail="Conversation workspace must match its project workspace")
+            workspace, model = str(root), project["model"]
+        else:
+            if workspace:
+                raise HTTPException(status_code=422, detail="General chat projects have no workspace")
+            model = project["model"]
     try:
         return _store.create_conversation(workspace=workspace, model=model, title=request.title, project_id=request.project_id)
     except StorageError as exc:
@@ -506,7 +706,7 @@ def add_memory(request: MemoryRequest):
     workspace = str(_validate_workspace(request.workspace)) if request.workspace else None
     if request.project_id:
         project = _project_or_404(request.project_id)
-        project_workspace = str(_validate_workspace(project["workspace"]))
+        project_workspace = str(_validate_workspace(project["workspace"])) if _is_coding(project) else None
         if workspace and workspace != project_workspace:
             raise HTTPException(status_code=422, detail="Project knowledge workspace must match its project workspace")
         workspace = project_workspace
@@ -542,12 +742,16 @@ def start_run(request: StartRequest):
     project: dict | None = None
     if request.project_id:
         project = _project_or_404(request.project_id)
-        root = _validate_workspace(project["workspace"])
+        if not _is_coding(project) and request.workspace:
+            raise HTTPException(status_code=422, detail="General chat projects have no workspace")
+        root = _validate_workspace(project["workspace"]) if _is_coding(project) else _chat_workspace()
     elif request.workspace:
         root = _validate_workspace(request.workspace)
     else:
-        raise HTTPException(status_code=422, detail="Workspace is required for a legacy run without a project")
-    if project is not None and root.is_dir():
+        # A legacy chat without a workspace is a general conversation.
+        root = _chat_workspace()
+    general_chat = not _is_coding(project) and not (project is None and request.workspace)
+    if _is_coding(project) and root.is_dir():
         _refresh_index(project)
     # Resolve the model at the start of each run. Never silently use another
     # model if the requested one is missing.
@@ -571,7 +775,8 @@ def start_run(request: StartRequest):
                     raise HTTPException(status_code=404, detail="Unknown conversation")
             else:
                 conversation = _store.create_conversation(
-                    workspace=str(root), model=model, title=request.task[:120], project_id=request.project_id
+                    workspace=None if general_chat else str(root), model=model, title=request.task[:120],
+                    project_id=request.project_id,
                 )
             if request.project_id and conversation.get("project_id") != request.project_id:
                 raise HTTPException(status_code=409, detail="Conversation belongs to a different or legacy project")
@@ -607,8 +812,10 @@ def start_run(request: StartRequest):
                 env["REAPER_MODEL_OPTIONS"] = json.dumps(model_options, separators=(",", ":"))
                 env["REAPER_PROJECT_SYSTEM_PROMPT"] = project_system_prompt
                 env["REAPER_API_RUN_ID"] = run_id
-                if request.project_id:
+                if _is_coding(project):
+                    # The repository index exists only for coding projects.
                     env["REAPER_PROJECT_ID"] = request.project_id
+                _mcp_environment(env, project)
                 env["PYTHONUNBUFFERED"] = "1"
                 env["PYTHONUTF8"] = "1"
                 env["PYTHONIOENCODING"] = "utf-8:backslashreplace"
@@ -690,6 +897,10 @@ def resume_run(run_id: str):
     root = _validate_workspace(entry["workspace"])
     if entry["model"] not in _installed_models():
         raise HTTPException(status_code=422, detail=f"Model not installed: {entry['model']}")
+    try:
+        project = _store.get_project(entry["project_id"]) if entry.get("project_id") else None
+    except StorageError as exc:
+        raise _storage_failure(exc) from exc
     log_path = Path(tempfile.gettempdir()) / f"reaper-api-{run_id}-recovery.log"
     cmd = [sys.executable, "-u", "-m", "reaper_ai.supervisor", "--workspace", str(root),
            "--task", entry["task"], "--timeout", str(entry["timeout"])]
@@ -707,7 +918,12 @@ def resume_run(run_id: str):
                 env["REAPER_PROJECT_SYSTEM_PROMPT"] = entry.get("project_system_prompt") or ""
                 env["REAPER_API_RUN_ID"] = run_id
                 if entry.get("project_id"):
-                    env["REAPER_PROJECT_ID"] = entry["project_id"]
+                    if project is None or _is_coding(project):
+                        env["REAPER_PROJECT_ID"] = entry["project_id"]
+                    # A deleted project keeps no MCP selection, so it gets no MCP servers.
+                    _mcp_environment(env, project or {"mcp_servers": []})
+                else:
+                    _mcp_environment(env, None)
                 env["REAPER_RESUME"] = "1"
                 env["PYTHONUNBUFFERED"] = "1"
                 env["PYTHONUTF8"] = "1"

@@ -25,6 +25,9 @@ _PROJECT_MIGRATION_KEY = "project_core_v1"
 _REPOSITORY_INDEX_MIGRATION_KEY = "repository_index_v1"
 _DEFAULT_MODEL = "qwen3.8-q5:latest"
 _DEFAULT_MODEL_OPTIONS = {"temperature": 0.0, "top_p": 0.9, "top_k": 40, "num_ctx": 16_384}
+# "coding" projects own a workspace; "chat" projects are general conversations
+# without one. Existing projects all had a workspace and therefore stay "coding".
+PROJECT_KINDS = ("coding", "chat")
 
 
 def utc_now() -> str:
@@ -221,6 +224,9 @@ class Store:
         Store._add_column(connection, "runs", "model_options_json", "TEXT")
         Store._add_column(connection, "runs", "project_system_prompt", "TEXT")
         Store._add_column(connection, "durable_memory", "project_id", "TEXT")
+        # Selected global MCP server IDs only; definitions stay in mcp.json.
+        Store._add_column(connection, "projects", "mcp_servers_json", "TEXT NOT NULL DEFAULT '[]'")
+        Store._add_column(connection, "projects", "kind", "TEXT NOT NULL DEFAULT 'coding'")
         connection.execute("CREATE INDEX IF NOT EXISTS conversations_project_updated ON conversations(project_id, updated_at DESC)")
         connection.execute("CREATE INDEX IF NOT EXISTS runs_project_started ON runs(project_id, started_at DESC)")
         connection.execute("CREATE INDEX IF NOT EXISTS durable_memory_project_created ON durable_memory(project_id, created_at DESC)")
@@ -290,26 +296,49 @@ class Store:
         except json.JSONDecodeError:
             return {"unavailable": "Stored JSON could not be decoded"}
 
+    @classmethod
+    def _project(cls, row: sqlite3.Row | None) -> dict | None:
+        if row is None:
+            return None
+        project = dict(row)
+        servers = cls._decoded(project.pop("mcp_servers_json", None))
+        project["mcp_servers"] = [item for item in servers if isinstance(item, str)] if isinstance(servers, list) else []
+        project["kind"] = project.get("kind") if project.get("kind") in PROJECT_KINDS else "coding"
+        if project["kind"] == "chat":
+            # The column is NOT NULL; a general chat project stores "" and exposes None.
+            project["workspace"] = None
+        return project
+
     def create_project(self, *, name: str, workspace: str, description: str | None = None,
                        system_prompt: str = "", model: str = _DEFAULT_MODEL,
                        temperature: float = _DEFAULT_MODEL_OPTIONS["temperature"],
                        top_p: float = _DEFAULT_MODEL_OPTIONS["top_p"],
                        top_k: int = _DEFAULT_MODEL_OPTIONS["top_k"],
-                       num_ctx: int = _DEFAULT_MODEL_OPTIONS["num_ctx"]) -> dict:
+                       num_ctx: int = _DEFAULT_MODEL_OPTIONS["num_ctx"],
+                       mcp_servers: list[str] | None = None, kind: str = "coding") -> dict:
+        if kind not in PROJECT_KINDS:
+            raise StorageError(f"Unsupported project kind: {kind}")
+        if kind == "coding" and not workspace:
+            raise StorageError("A coding project requires a workspace")
         now = utc_now()
         project = {"project_id": uuid.uuid4().hex, "name": name.strip()[:200] or "Unnamed project",
-                   "workspace": workspace, "description": description, "system_prompt": system_prompt,
+                   "workspace": workspace if kind == "coding" else "", "kind": kind, "description": description, "system_prompt": system_prompt,
                    "model": model, "temperature": temperature, "top_p": top_p, "top_k": top_k,
-                   "num_ctx": num_ctx, "created_at": now, "updated_at": now}
+                   "num_ctx": num_ctx, "mcp_servers_json": self._json(list(mcp_servers or [])),
+                   "created_at": now, "updated_at": now}
         try:
             with self._connect() as connection:
                 connection.execute(
-                    "INSERT INTO projects(project_id, name, workspace, description, system_prompt, model, temperature, top_p, top_k, num_ctx, created_at, updated_at) "
-                    "VALUES(:project_id, :name, :workspace, :description, :system_prompt, :model, :temperature, :top_p, :top_k, :num_ctx, :created_at, :updated_at)",
+                    "INSERT INTO projects(project_id, name, workspace, kind, description, system_prompt, model, temperature, top_p, top_k, num_ctx, mcp_servers_json, created_at, updated_at) "
+                    "VALUES(:project_id, :name, :workspace, :kind, :description, :system_prompt, :model, :temperature, :top_p, :top_k, :num_ctx, :mcp_servers_json, :created_at, :updated_at)",
                     project,
                 )
         except sqlite3.Error as exc:
             raise StorageError(f"Could not save project: {exc}") from exc
+        project.pop("mcp_servers_json")
+        project["mcp_servers"] = list(mcp_servers or [])
+        if kind == "chat":
+            project["workspace"] = None
         return project
 
     def get_project(self, project_id: str) -> dict | None:
@@ -318,7 +347,7 @@ class Store:
                 row = connection.execute("SELECT * FROM projects WHERE project_id = ?", (project_id,)).fetchone()
         except sqlite3.Error as exc:
             raise StorageError(f"Could not load project: {exc}") from exc
-        return dict(row) if row else None
+        return self._project(row)
 
     def list_projects(self) -> list[dict]:
         try:
@@ -330,12 +359,14 @@ class Store:
                 ).fetchall()
         except sqlite3.Error as exc:
             raise StorageError(f"Could not list projects: {exc}") from exc
-        return [dict(row) for row in rows]
+        return [self._project(row) for row in rows]
 
     def update_project(self, project_id: str, **changes: Any) -> dict | None:
         fields = {key: value for key, value in changes.items() if key in {
             "name", "workspace", "description", "system_prompt", "model", "temperature", "top_p", "top_k", "num_ctx"
         } and value is not None}
+        if changes.get("mcp_servers") is not None:
+            fields["mcp_servers_json"] = self._json(list(changes["mcp_servers"]))
         if not fields:
             return self.get_project(project_id)
         fields["updated_at"] = utc_now()
@@ -349,7 +380,7 @@ class Store:
                 row = connection.execute("SELECT * FROM projects WHERE project_id = ?", (project_id,)).fetchone()
         except sqlite3.Error as exc:
             raise StorageError(f"Could not update project: {exc}") from exc
-        return dict(row)
+        return self._project(row)
 
     def delete_project(self, project_id: str) -> bool:
         """Delete one project and its project-scoped history in one transaction."""
@@ -596,7 +627,8 @@ class Store:
             raise StorageError(f"Could not load conversation: {exc}") from exc
         return dict(row) if row else None
 
-    def list_conversations(self, limit: int = 100, project_id: str | None = None) -> list[dict]:
+    def list_conversations(self, limit: int = 100, project_id: str | None = None,
+                           legacy_only: bool = False) -> list[dict]:
         try:
             with self._connect() as connection:
                 query = (
@@ -610,6 +642,8 @@ class Store:
                     query += "WHERE c.project_id = ? "
                     parameters = (project_id, limit)
                     query += "ORDER BY c.updated_at DESC LIMIT ?"
+                elif legacy_only:
+                    query += "WHERE c.project_id IS NULL ORDER BY c.updated_at DESC LIMIT ?"
                 else:
                     query += "ORDER BY c.updated_at DESC LIMIT ?"
                 rows = connection.execute(query, parameters).fetchall()
