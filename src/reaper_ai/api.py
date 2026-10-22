@@ -5,6 +5,7 @@
 import json
 import asyncio
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -39,6 +40,10 @@ except StorageError as _startup_error:
 
 def _utc() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _is_windows() -> bool:
+    return os.name == "nt"
 
 
 class StartRequest(BaseModel):
@@ -534,8 +539,6 @@ def add_project_memory(project_id: str, request: MemoryRequest):
 @app.post("/runs", status_code=202)
 def start_run(request: StartRequest):
     global _active
-    if os.name != "nt":
-        raise HTTPException(status_code=501, detail="Windows supervisor required")
     project: dict | None = None
     if request.project_id:
         project = _project_or_404(request.project_id)
@@ -681,8 +684,6 @@ def get_recovery(run_id: str):
 @app.post("/runs/{run_id}/resume", status_code=202)
 def resume_run(run_id: str):
     global _active
-    if os.name != "nt":
-        raise HTTPException(status_code=501, detail="Windows supervisor required")
     entry, checkpoint, can_resume, reason = _recovery_record(run_id)
     if not can_resume:
         raise HTTPException(status_code=409, detail=f"Recovery is unavailable: {reason}")
@@ -769,10 +770,15 @@ def cancel_run(run_id: str):
             _store.update_run_status(run_id, "cancelling")
         except StorageError as exc:
             entry["storage_error"] = str(exc)
-    # Killing the supervisor closes its Windows Job Object, killing its child tree.
     try:
-        subprocess.run(["taskkill", "/PID", str(proc.pid), "/F", "/T"],
-                       capture_output=True, timeout=15, check=False)
+        if _is_windows():
+            # Closing the supervisor's Job Object terminates its child tree.
+            subprocess.run(["taskkill", "/PID", str(proc.pid), "/F", "/T"],
+                           capture_output=True, timeout=15, check=False)
+        else:
+            # The POSIX supervisor handles SIGTERM, then terminates the engine
+            # session and every process in that session before it exits.
+            os.kill(proc.pid, signal.SIGTERM)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise HTTPException(status_code=500, detail=f"Cancellation failed: {exc}") from exc
     return {"run_id": run_id, "status": "cancelling"}

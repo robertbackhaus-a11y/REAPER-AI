@@ -33,7 +33,7 @@ The following work is implemented and released. Completion means that the descri
 - `completed` alone does not demonstrate functional task fulfillment; observed changes and independent verification remain authoritative.
 - Repeated tool calls and verification loops can still occur in untested model/task combinations. C02 removes one demonstrated cause by preserving shell exit code, stdout, and stderr in the next decision context.
 - Terminal usage totals for a recovered run currently cover its resumed process; retained decision traces and event logs provide the complete cross-process measurement.
-- The autonomous process supervisor is currently Windows-specific. Linux and macOS installation/API-start commands are documented, but autonomous run start, recovery, and cancellation require a POSIX supervisor before they can be supported.
+- The POSIX supervisor implementation has not yet received practical Linux/macOS acceptance testing. P02 must verify installation, run control, timeout cleanup, and recovery before either platform is declared supported.
 - Terminal SSE replay can expose a minor status/event ordering inconsistency after a run ends; persisted terminal status and results remain authoritative.
 
 **D01** remains a diagnostic benchmark and model-comparison exercise, not the primary product target. Its accepted Qwen 3.8 run demonstrated a viable read-only workflow, while the externally reviewed report also showed that a completed technical analysis can contain factual errors.
@@ -99,6 +99,8 @@ Each task requires an independent functional check. Assess autonomy, code qualit
 - Support run start, timeout, cancellation, and process-tree termination.
 - Preserve checkpoint and recovery behavior.
 - Do not add a separate supervisor platform or elaborate abstraction layer.
+
+**Implemented; pending P02 acceptance.** Windows retains its Job Object implementation. On POSIX, the existing supervisor starts the engine in a dedicated session and terminates that process group on timeout or API cancellation. The existing start and recovery API contracts are shared across both paths. A Windows regression suite and an actual Job Object timeout probe cover the retained path; the POSIX normal-exit, cancellation, and timeout branches have focused tests. Linux and macOS have not yet been practically exercised.
 
 ### P02 — Cross-platform acceptance
 

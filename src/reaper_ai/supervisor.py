@@ -1,13 +1,16 @@
 # Copyright (c) 2026 Robert Backhaus
 
-"""Windows process-tree supervisor for REAPER-AI.
+"""Local process-tree supervisor for REAPER-AI.
 
-Runs the LangGraph engine in a Windows Job Object. Closing the job kills any
-remaining descendants. No service or third-party dependencies.
+Windows uses a Job Object. Linux and macOS run the engine in a dedicated POSIX
+session, so timeout and cancellation can terminate that process group. No
+service or third-party dependency is required.
 """
 
 import argparse
 import ctypes
+import os
+import signal
 import subprocess
 import sys
 from ctypes import wintypes
@@ -122,11 +125,11 @@ def _resume_process_threads(pid: int) -> None:
         raise RuntimeError("Could not resume suspended engine process")
 
 
-def supervise(workspace: str, task: str, timeout: int) -> int:
-    if sys.platform != "win32":
-        raise RuntimeError("R04 supervisor requires Windows")
-    if timeout <= 0:
-        raise ValueError("Timeout must be positive")
+def _engine_command(workspace: str, task: str) -> list[str]:
+    return [sys.executable, "-m", "reaper_ai.engine", "--workspace", workspace, "--task", task]
+
+
+def _supervise_windows(workspace: str, task: str, timeout: int) -> int:
     job = _check(kernel.CreateJobObjectW(None, None), "CreateJobObject")
     proc = None
     try:
@@ -136,7 +139,7 @@ def supervise(workspace: str, task: str, timeout: int) -> int:
             job, JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
             ctypes.byref(limits), ctypes.sizeof(limits)), "SetInformationJobObject")
         proc = subprocess.Popen(
-            [sys.executable, "-m", "reaper_ai.engine", "--workspace", workspace, "--task", task],
+            _engine_command(workspace, task),
             cwd=str(Path.cwd()), creationflags=0x00000004,
         )
         # Assign before the process executes a single instruction, avoiding
@@ -166,8 +169,67 @@ def supervise(workspace: str, task: str, timeout: int) -> int:
                 proc.wait()
 
 
+def _terminate_posix_group(proc: subprocess.Popen) -> None:
+    """Terminate an engine session, escalating only when its group survives."""
+    engine_running = proc.poll() is None
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    if not engine_running:
+        return
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        proc.wait()
+
+
+def _supervise_posix(workspace: str, task: str, timeout: int) -> int:
+    proc = None
+    previous_handlers: dict[int, object] = {}
+
+    def _cancel_signal(_signum, _frame) -> None:
+        raise KeyboardInterrupt
+
+    try:
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            previous_handlers[signum] = signal.signal(signum, _cancel_signal)
+        proc = subprocess.Popen(_engine_command(workspace, task), cwd=str(Path.cwd()), start_new_session=True)
+        try:
+            rc = proc.wait(timeout=timeout)
+            print(f"ENGINE_EXIT: {rc}", flush=True)
+            return rc
+        except subprocess.TimeoutExpired:
+            print(f"ENGINE_TIMEOUT: {timeout}s; terminating process group", flush=True)
+            _terminate_posix_group(proc)
+            proc = None
+            return 2
+        except KeyboardInterrupt:
+            print("ENGINE_CANCELLED: terminating process group", flush=True)
+            _terminate_posix_group(proc)
+            proc = None
+            return 130
+    finally:
+        if proc is not None:
+            _terminate_posix_group(proc)
+        for signum, handler in previous_handlers.items():
+            signal.signal(signum, handler)
+
+
+def supervise(workspace: str, task: str, timeout: int) -> int:
+    if timeout <= 0:
+        raise ValueError("Timeout must be positive")
+    if sys.platform == "win32":
+        return _supervise_windows(workspace, task, timeout)
+    return _supervise_posix(workspace, task, timeout)
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="REAPER Windows engine supervisor")
+    parser = argparse.ArgumentParser(description="REAPER engine supervisor")
     parser.add_argument("--workspace", required=True)
     parser.add_argument("--task", required=True)
     parser.add_argument("--timeout", type=int, default=660)

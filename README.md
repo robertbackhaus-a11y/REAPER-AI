@@ -46,7 +46,7 @@ REAPER_MODEL=qwen3.8-q5:latest python -m uvicorn reaper_ai.api:app --host 127.0.
 
 Open <http://127.0.0.1:8000/>. For development, replace `python -m pip install .` with `python -m pip install -e .` after activating the virtual environment.
 
-The application has been accepted on Windows. The POSIX commands use standard Python virtual-environment and Uvicorn invocation, but Linux and macOS have not yet been acceptance-tested. In particular, starting, resuming, and cancelling autonomous runs is currently Windows-only because the process-tree supervisor uses Windows Job Objects. The API can start on POSIX, but those run endpoints return `501` until a POSIX supervisor is implemented.
+The application has been accepted on Windows. The supervisor retains its Windows Job Object path and now starts the engine in a dedicated POSIX session on Linux and macOS; timeout and cancellation signal that engine process group. The same API start, recovery, and cancellation contracts are therefore available on POSIX. Linux and macOS have not yet undergone practical acceptance testing; P02 is required before either platform is declared supported.
 
 ## Ollama configuration
 

@@ -241,7 +241,7 @@ Tools must validate their working directory and report failures explicitly. An o
 - Treat the workspace as normal project context, not a filesystem sandbox. Absolute file paths are permitted and remain subject to the started user's operating-system permissions.
 - A dirty Git state is not a run precondition. Existing-file writes use their just-read hash, and their before/after hashes make the individual agent change attributable.
 - Default to no Git commit, push, tag, release, deployment, package installation, or destructive deletion.
-- Make cancellation terminate the entire process tree, including shell children; use suitable Windows process containment where required.
+- Make cancellation terminate the entire process tree, including shell children. The supervisor uses a Windows Job Object on Windows and a dedicated engine process group on POSIX.
 - A dedicated project working directory is distinct from persistent application data.
 
 ## 8. Verification and truthful completion
@@ -360,6 +360,12 @@ P02 extends the same SQLite store with one versioned, digest-protected checkpoin
 
 Recovery accepts only `interrupted`, `cancelled`, or `timed_out` runs with a valid checkpoint. It validates format, integrity digest, workspace identity, and the saved source/write preconditions before invoking the saved next stage. A missing, corrupt, incompatible, or inconsistent checkpoint is surfaced as non-recoverable, never silently substituted or replayed. P02 is intentionally not general checkpointing infrastructure or automatic process restoration. P03 durable memory remains separate from checkpoint data and never uses it as knowledge.
 
+### P01 cross-platform process supervision
+
+`reaper_ai.supervisor` keeps the established Windows Job Object implementation, including `KILL_ON_JOB_CLOSE`. On Linux and macOS it starts the engine with `start_new_session=True`; the engine is consequently the leader of a separate process group. A supervisor timeout or a `SIGTERM`/`SIGINT` delivered to the supervisor terminates that group with `SIGTERM` and escalates to `SIGKILL` only if it remains alive. The FastAPI API continues to launch the same supervisor command for new and recovered runs. On POSIX, API cancellation signals the supervisor, which performs the engine-group cleanup before it exits. This is implemented with the Python standard library and does not change checkpoint data, the frontend, or run API payloads.
+
+The Windows path is covered by the Windows regression suite and an actual Job Object timeout probe on the development host. The POSIX normal-exit, cancellation, and timeout branches have focused process-group coverage, but Linux/macOS end-to-end acceptance remains P02 work; neither platform is yet declared supported.
+
 ## 12. Operational boundaries
 
 - Windows 11 is the primary target.
@@ -382,7 +388,7 @@ Potential future capabilities are evaluated only after the core can complete rep
 The following items are intentionally **not settled** by this document:
 
 1. **Inference adapter:** direct Ollama client or LangChain-compatible adapter, based on reliable tool-call behavior with the selected models.
-2. **Execution isolation:** CLI engine runs under a managed Windows child-process supervisor; synthetic timeout and full process-tree termination have been verified. API-driven cancellation and abnormal-exit paths remain to be integrated and checked in M3.
+2. **Execution isolation:** CLI engine runs under a managed Windows Job Object or a dedicated POSIX engine process group. The Windows timeout path and the POSIX cleanup branch have focused coverage; practical Linux/macOS acceptance remains P02.
 4. **File editing implementation:** patch-based edit tool and precondition strategy to prevent accidental overwrites.
 5. **Verification policy:** task-specific minimum checks and success criteria, without a heavyweight universal test pipeline.
 6. **Memory (resolved for initial release):** Basic Memory is deferred. Scoped SQLite memory is sufficient for explicit user decisions and observed completed-run evidence; reconsider only with a measured need for richer retrieval.

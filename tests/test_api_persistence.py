@@ -3,6 +3,7 @@
 import unittest
 import uuid
 import json
+import signal
 from pathlib import Path
 from unittest.mock import patch
 
@@ -136,3 +137,34 @@ class ApiPersistenceTests(unittest.TestCase):
                          {"temperature": 0.3, "top_p": 0.7, "top_k": 12, "num_ctx": 24576})
         self.assertEqual(captured["env"]["REAPER_PROJECT_SYSTEM_PROMPT"], "Use this project's conventions.")
         self.assertEqual(captured["env"]["REAPER_PROJECT_ID"], project["project_id"])
+
+    def test_posix_start_run_uses_the_existing_supervisor_contract(self):
+        captured = {}
+
+        class Process:
+            pid = 6789
+
+        def fake_popen(*args, **kwargs):
+            captured["command"] = args[0]
+            return Process()
+
+        with patch.object(api, "_is_windows", return_value=False), patch.object(api, "_validate_workspace", return_value=Path("C:/project")), \
+             patch.object(api, "_installed_models", return_value=["model"]), \
+             patch.object(api.subprocess, "Popen", side_effect=fake_popen), patch.object(api.threading, "Thread"):
+            response = api.start_run(api.StartRequest(workspace="/project", task="Inspect", model="model"))
+        self.assertEqual(response["status"], "running")
+        self.assertIn("reaper_ai.supervisor", captured["command"])
+
+    def test_posix_cancel_signals_the_supervisor(self):
+        class Process:
+            pid = 6789
+
+            def poll(self):
+                return None
+
+        api._runs["posix-cancel"] = {"run_id": "posix-cancel", "status": "running"}
+        api._procs["posix-cancel"] = Process()
+        with patch.object(api, "_is_windows", return_value=False), patch.object(api.os, "kill") as kill:
+            response = api.cancel_run("posix-cancel")
+        self.assertEqual(response["status"], "cancelling")
+        kill.assert_called_once_with(6789, signal.SIGTERM)
