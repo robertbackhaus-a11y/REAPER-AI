@@ -1,6 +1,6 @@
 # REAPER-AI — Development Roadmap
 
-**Baseline:** v0.9.1 · 21 October 2026 · Development direction through v1.0.0
+**Baseline:** v0.10.0 · 22 October 2026 · Development direction through v1.0.0
 
 REAPER-AI is a local single-user coding agent built on FastAPI, LangGraph, Ollama, SQLite, the existing tool dispatcher, and a vanilla HTML/CSS/JavaScript web interface. This roadmap distinguishes released, evidence-backed capability from planned work. Release targets are planning states, not delivery commitments.
 
@@ -11,11 +11,11 @@ REAPER-AI is a local single-user coding agent built on FastAPI, LangGraph, Ollam
 | v0.8.0 | Native MCP integration | Released |
 | v0.9.0 | Web editor and file navigation | Released |
 | v0.9.1 | Sentinel evidence and context | Released |
-| v0.10.0 | Autonomous coding quality | In progress — C01/C02/C03 complete |
+| v0.10.0 | Autonomous coding quality | Released |
 | v0.11.0 | Cross-platform and workflow UI | Planned |
 | v1.0.0 | Stable autonomous coding agent | Target |
 
-## 2. v0.9.1 — Completed development state
+## 2. v0.10.0 — Completed development state
 
 The following work is implemented and released. Completion means that the described code path and its focused evidence were recorded; it does not imply universal reliability for every model or task.
 
@@ -38,7 +38,7 @@ The following work is implemented and released. Completion means that the descri
 
 **D01** remains a diagnostic benchmark and model-comparison exercise, not the primary product target. Its accepted Qwen 3.8 run demonstrated a viable read-only workflow, while the externally reviewed report also showed that a completed technical analysis can contain factual errors.
 
-## 3. v0.10.0 — Autonomous Coding Quality
+## 3. v0.10.0 — Autonomous Coding Quality Acceptance
 
 **Goal:** Achieve repeatably reliable autonomous coding tasks with Qwen 3.8 Q5 using the existing Sentinel architecture.
 
@@ -74,6 +74,8 @@ The following work is implemented and released. Completion means that the descri
 - Preserve unrelated user changes.
 - Make changes traceable and task-scoped.
 
+**Completed.** In `7211e4ac8a5a`, Qwen 3.8 Q5 added a JSON-output option to a small CLI while working in a deliberately dirty Git fixture. It retained a user edit in the jointly modified CLI file, left an unrelated user edit and an untracked user note SHA-256-identical, preserved the existing text output, added a JSON test, and updated the fixture README. Independent checks passed all 3 tests and both output modes. The run completed with 16 model calls, 15 tool calls, 102,787 input tokens, 6,031 output tokens, and 148.6 seconds, with no identical unproductive tool repetition. **C04: passed, grade 2.** Some already evidenced questions remained terminally `inconclusive` in the diagnostic output; this did not affect the observed task outcome. One successful dirty-tree run does not establish universal preservation reliability.
+
 ### C05 — Coding acceptance
 
 Evaluate three representative coding tasks:
@@ -83,6 +85,8 @@ Evaluate three representative coding tasks:
 3. Demonstrate correction and recovery after an interrupted run.
 
 Each task requires an independent functional check. Assess autonomy, code quality, correctness, error handling, and efficiency separately. The target is grade 2 or better. Do not add REAPER-specific rules constructed solely to pass these tasks.
+
+**Completed.** C05 consolidates the independently checked C01–C04 evidence rather than adding a new benchmark. `183ee8ae8303` demonstrated multi-file feature work and clean completion; C02 retained successful shell exit code, stdout, and stderr in the following decision context; `8f7670dc9ebf` demonstrated post-patch checkpoint recovery; and `7211e4ac8a5a` demonstrated task-scoped changes while preserving dirty working-tree content. Every recorded acceptance run completed with exit code 0 and each C01, C03, and C04 functional acceptance received grade 2; C02 was practically confirmed in C01.2. **C05: passed, overall grade 2.** The v0.10.0 autonomous-coding scope is therefore complete. These are finite, independently checked examples, not a claim of universal model or task reliability.
 
 ## 4. v0.11.0 — Cross-platform and workflow UI
 

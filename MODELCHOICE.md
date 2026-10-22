@@ -326,3 +326,44 @@ This is not an unconditional endorsement:
 Future comparisons should retain this discipline: identical fixtures, an
 independent acceptance check, separate reporting of S03 diagnostics, and no
 claim of success based solely on model prose or a terminal `completed` state.
+
+## 11. C04 Dirty Working Tree Acceptance
+
+The C04 acceptance used Qwen3.8-Q5 in a deliberately dirty Git fixture. Before
+the run, the fixture contained a user edit in the CLI file Sentinel needed to
+change, an unrelated user edit in another source file, and an untracked user
+note. Sentinel received a feature request for JSON output while preserving the
+existing text interface and all user changes.
+
+Run `7211e4ac8a5a` completed with exit code 0 after 16 model calls and 15 tool
+calls, consuming 102,787 input and 6,031 output tokens in 148.6 seconds. It
+added the JSON option, a focused test, and fixture documentation. Independent
+acceptance checks passed all 3 tests, confirmed the exact prior text output,
+and confirmed that the unrelated source edit and untracked user file retained
+their pre-run SHA-256 values. The shared-file user edit also remained present.
+No identical unproductive action repeated.
+
+**Assessment:** C04 passed with an overall grade of 2 for this Qwen3.8-Q5 run.
+It strengthens the evidence that the reference model can combine a task-scoped
+hash-bound edit with existing working-tree changes. It is not a model
+comparison and does not prove that every dirty-tree conflict will be resolved
+correctly. The terminal diagnostics still marked several already evidenced
+questions as `inconclusive`; this is a reporting limitation, not a demonstrated
+failure of the independently verified implementation.
+
+## 12. C05 v0.10.0 Autonomous Coding Acceptance
+
+C05 is an aggregate assessment of the Qwen3.8-Q5 acceptance evidence, not a
+fourth model comparison or an additional model run. C01 established multi-file
+implementation and completion; C02 established that successful shell evidence
+reaches the next decision; C03 established recovery from a post-patch
+interruption; and C04 established preservation of dirty working-tree content.
+Each underlying coding acceptance was independently checked, and C01, C03, and
+C04 were graded 2.
+
+**Assessment:** C05 passed with an overall grade of 2. Qwen3.8-Q5 remains the
+reference model for this REAPER-AI configuration because it is the only tested
+model with this chain of observed coding, verification, recovery, and
+dirty-tree-preservation evidence. The conclusion remains bounded: it does not
+erase the documented recovery-metric caveat or terminal `inconclusive`
+diagnostics, and it does not prove general behavior for arbitrary tasks.
