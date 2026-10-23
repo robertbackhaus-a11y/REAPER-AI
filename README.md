@@ -68,6 +68,8 @@ Dispatchable actions are file listing/searching, UTF-8 file and line-range reads
 
 REAPER-AI can also discover tools from configured Model Context Protocol (MCP) servers through the official Python MCP SDK. Put an optional `mcp.json` beside the application database (normally `%LOCALAPPDATA%\REAPER-AI\mcp.json`), or set `REAPER_MCP_CONFIG` to a different JSON file. A run discovers the servers it may use (see project activation below) once during preparation; unavailable MCP servers are reported in its decision context but do not block local tools. Discovered tools are qualified as `mcp:<server>:<tool>`, with their description and input schema available to Sentinel. Each selected MCP action reconnects through the SDK, calls the tool, and becomes an ordinary observed result with no automatic semantic verification.
 
+**Optional local SearXNG bridge.** `python -m reaper_ai.searxng_mcp` exposes one stdio MCP tool, `web_search(query, limit=5)`, against `http://127.0.0.1/searxng` by default. Set `SEARXNG_URL` for another operator-provided JSON endpoint. It returns only SearXNG result titles, URLs, and descriptions; it does not fetch result pages. Register it as a normal global stdio MCP server and select it for the project that should use it.
+
 ```json
 {
   "mcpServers": {
