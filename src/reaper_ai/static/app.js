@@ -552,3 +552,67 @@ $('mcp-transport').addEventListener('change', showMcpTransport);
 $('mcp-save').addEventListener('click', saveMcpServer);
 $('mcp-cancel').addEventListener('click', () => { editingMcp = null; $('mcp-form').hidden = true; info('mcp-status', 'Bearbeitung abgebrochen', 'muted'); });
 loadMcpServers();
+
+// Sequential task list of the selected coding project. The API starts the next open
+// task when a task's run ends; this view polls the list and follows the live run.
+let taskQueue = null, taskQueueKey = '', editingTask = '';
+const taskLabels = { open: 'offen', running: 'läuft', completed: 'abgeschlossen', failed: 'fehlgeschlagen' };
+function tasksUrl(suffix = '') { return `/projects/${encodeURIComponent(activeProject)}/tasks${suffix}`; }
+async function loadTasks() {
+  const box = $('task-queue'); box.hidden = !isCodingContext();
+  if (box.hidden) { taskQueue = null; taskQueueKey = ''; return; }
+  try { applyTaskQueue(await request(tasksUrl())); } catch (error) { info('task-progress', error.message, 'err'); }
+}
+function applyTaskQueue(data) {
+  if (data.project_id !== activeProject) return;
+  const previous = taskQueue; taskQueue = data;
+  const key = JSON.stringify(data); if (key !== taskQueueKey) { taskQueueKey = key; renderTasks(); }
+  const active = data.tasks.find(task => task.status === 'running');
+  if (!active) return;
+  // Follow the next task's chat while the previous task's chat (or no chat) is shown.
+  const before = previous?.tasks.find(task => task.task_id === previous.active_task_id) || previous?.tasks.filter(task => task.status === 'completed').at(-1);
+  if (active.conversation_id !== conversationId && (!conversationId || before?.conversation_id === conversationId)) conversations(active.conversation_id);
+  if (!current) restoreActive();
+}
+function renderTasks() {
+  const { tasks, state, completed, total } = taskQueue;
+  const running = tasks.findIndex(task => task.status === 'running'), failed = tasks.some(task => task.status === 'failed');
+  info('task-progress', running >= 0 ? `Aufgabe ${running + 1}/${total} läuft · ${completed} erledigt` : total ? `${completed}/${total} abgeschlossen${failed ? ' · angehalten' : ''}` : 'Keine Aufgaben', running >= 0 ? 'ok' : failed ? 'err' : 'muted');
+  const next = tasks.find(task => task.status !== 'completed');
+  $('tasks-start').disabled = state === 'running' || running >= 0 || next?.status !== 'open';
+  $('tasks-pause').disabled = state !== 'running';
+  $('tasks-resume').disabled = state === 'running' || running >= 0 || next?.status !== 'failed';
+  const list = $('task-list'); list.replaceChildren();
+  tasks.forEach((task, index) => {
+    const item = document.createElement('li'); item.className = `task-item ${task.status}`; item.title = task.error ? `${task.prompt}\n\n${task.error}` : task.prompt;
+    const badge = document.createElement('span'); badge.className = 'task-badge'; badge.textContent = taskLabels[task.status] || task.status;
+    const title = document.createElement('button'); title.type = 'button'; title.className = 'task-title'; title.textContent = task.title; title.disabled = !task.conversation_id;
+    title.title = task.conversation_id ? 'Chat und Run-Verlauf der Aufgabe öffnen' : 'Noch nicht gestartet';
+    title.addEventListener('click', () => conversations(task.conversation_id));
+    const actions = document.createElement('span'); actions.className = 'task-actions';
+    const action = (label, text, handler, disabled = false) => { const button = document.createElement('button'); button.type = 'button'; button.className = 'secondary icon-button'; button.textContent = text; button.title = label; button.setAttribute('aria-label', label); button.disabled = disabled; button.addEventListener('click', handler); actions.appendChild(button); };
+    const locked = task.status === 'running';
+    action('Nach oben', '↑', () => moveTask(index, -1), index === 0);
+    action('Nach unten', '↓', () => moveTask(index, 1), index === tasks.length - 1);
+    action('Bearbeiten', '✎', () => editTask(task), locked || task.status === 'completed');
+    action('Löschen', '×', () => deleteTask(task), locked);
+    item.append(badge, title, actions); list.appendChild(item);
+  });
+}
+function resetTaskForm() { editingTask = ''; $('task-new').value = ''; $('task-add').textContent = 'Hinzufügen'; $('task-edit-cancel').hidden = true; }
+function editTask(task) { editingTask = task.task_id; $('task-new').value = task.prompt; $('task-add').textContent = 'Speichern'; $('task-edit-cancel').hidden = false; $('task-new').focus(); }
+async function saveTask() {
+  const prompt = $('task-new').value.trim(); if (!prompt) { info('task-progress', 'Aufgabe eingeben', 'err'); return; }
+  const title = prompt.split('\n')[0].slice(0, 120), timeout = Number($('timeout').value) || 660;
+  try { if (editingTask) await request(tasksUrl(`/${encodeURIComponent(editingTask)}`), { method: 'PATCH', body: JSON.stringify({ title, prompt, timeout }) }); else await request(tasksUrl(), { method: 'POST', body: JSON.stringify({ title, prompt, timeout }) }); resetTaskForm(); await loadTasks(); } catch (error) { info('task-progress', error.message, 'err'); }
+}
+async function deleteTask(task) { if (!confirm(`Aufgabe „${task.title}“ aus der Liste entfernen? Chat und Run-Verlauf bleiben erhalten.`)) return; try { await request(tasksUrl(`/${encodeURIComponent(task.task_id)}`), { method: 'DELETE' }); if (editingTask === task.task_id) resetTaskForm(); await loadTasks(); } catch (error) { info('task-progress', error.message, 'err'); } }
+async function moveTask(index, offset) { const ids = taskQueue.tasks.map(task => task.task_id); [ids[index], ids[index + offset]] = [ids[index + offset], ids[index]]; try { applyTaskQueue(await request(tasksUrl('/order'), { method: 'POST', body: JSON.stringify({ task_ids: ids }) })); } catch (error) { info('task-progress', error.message, 'err'); } }
+async function taskCommand(command) { try { const data = await request(tasksUrl(`/${command}`), { method: 'POST' }); applyTaskQueue(data); const active = data.tasks.find(task => task.status === 'running'); if (active && active.conversation_id !== conversationId) await conversations(active.conversation_id); if (!current && active) await restoreActive(); } catch (error) { info('task-progress', error.message, 'err'); await loadTasks(); } }
+$('task-add').addEventListener('click', saveTask); $('task-edit-cancel').addEventListener('click', resetTaskForm);
+$('task-new').addEventListener('keydown', event => { if (event.key === 'Enter' && event.ctrlKey) { event.preventDefault(); saveTask(); } });
+$('tasks-start').addEventListener('click', () => taskCommand('start')); $('tasks-pause').addEventListener('click', () => taskCommand('pause')); $('tasks-resume').addEventListener('click', () => taskCommand('resume'));
+const taskBaseSelectProject = selectProject;
+selectProject = async function(projectId) { resetTaskForm(); taskQueue = null; taskQueueKey = ''; $('task-list').replaceChildren(); await taskBaseSelectProject(projectId); await loadTasks(); };
+setInterval(() => { if (activeProject && !document.hidden) loadTasks(); }, 3000);
+loadTasks();

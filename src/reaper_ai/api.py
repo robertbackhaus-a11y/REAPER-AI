@@ -33,6 +33,7 @@ _MAX_LOG = 128_000
 _store = Store()
 try:
     _interrupted_on_startup = _store.interrupt_active_runs()
+    _store.interrupt_running_tasks()
     _startup_storage_error: str | None = None
 except StorageError as _startup_error:
     _interrupted_on_startup = []
@@ -214,6 +215,7 @@ def _watch(run_id: str, proc: subprocess.Popen) -> None:
                 refresh_project_index(_store, project)
         except (RepositoryIndexError, StorageError) as exc:
             entry["index_error"] = str(exc)
+    _finish_task(entry)
 
 
 @app.get("/health")
@@ -1033,6 +1035,215 @@ def cancel_run(run_id: str):
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise HTTPException(status_code=500, detail=f"Cancellation failed: {exc}") from exc
     return {"run_id": run_id, "status": "cancelling"}
+
+
+# Sequential task list of a coding project. A task is an ordinary run in its own
+# conversation; the end of one task's run (in _watch) starts the next open task
+# while the queue is running. A failed task halts the queue until the user
+# resumes it, through checkpoint recovery when the run allows it.
+_queue_lock = threading.RLock()
+
+
+class TaskCreateRequest(BaseModel):
+    title: str = Field(default="", max_length=200)
+    prompt: str = Field(min_length=1, max_length=20_000)
+    timeout: int = Field(default=660, ge=1, le=3600)
+
+
+class TaskUpdateRequest(BaseModel):
+    title: str | None = Field(default=None, max_length=200)
+    prompt: str | None = Field(default=None, min_length=1, max_length=20_000)
+    timeout: int | None = Field(default=None, ge=1, le=3600)
+
+
+class TaskOrderRequest(BaseModel):
+    task_ids: list[str] = Field(max_length=1_000)
+
+
+def _task_queue(project_id: str) -> dict:
+    try:
+        tasks = _store.list_tasks(project_id)
+        state = _store.task_queue_state(project_id)
+    except StorageError as exc:
+        raise _storage_failure(exc) from exc
+    active = next((task for task in tasks if task["status"] == "running"), None)
+    return {"project_id": project_id, "state": state, "tasks": tasks,
+            "active_task_id": active["task_id"] if active else None,
+            "completed": sum(task["status"] == "completed" for task in tasks), "total": len(tasks)}
+
+
+def _task_or_404(project_id: str, task_id: str) -> dict:
+    try:
+        task = _store.get_task(task_id)
+    except StorageError as exc:
+        raise _storage_failure(exc) from exc
+    if task is None or task["project_id"] != project_id:
+        raise HTTPException(status_code=404, detail="Unknown task")
+    return task
+
+
+def _next_task(project_id: str) -> dict | None:
+    """Tasks run in list order; completed tasks are never executed again."""
+    return next((task for task in _store.list_tasks(project_id) if task["status"] != "completed"), None)
+
+
+def _launch_task(project: dict, task: dict) -> None:
+    """Start one task as a normal run in its own conversation, or recover its interrupted run."""
+    try:
+        recoverable = bool(task["run_id"]) and _recovery_record(task["run_id"])[2]
+    except HTTPException:
+        recoverable = False
+    try:
+        if recoverable:
+            run = resume_run(task["run_id"])
+        else:
+            conversation_id = task["conversation_id"]
+            if conversation_id is None or _store.get_conversation(conversation_id) is None:
+                conversation_id = _store.create_conversation(
+                    workspace=project["workspace"], model=project["model"], title=task["title"],
+                    project_id=project["project_id"])["id"]
+            run = start_run(StartRequest(project_id=project["project_id"], task=task["prompt"],
+                                         timeout=task["timeout_seconds"], conversation_id=conversation_id))
+        _store.update_task(task["task_id"], status="running", run_id=run["run_id"],
+                           conversation_id=run["conversation_id"], error=None)
+    except HTTPException as exc:
+        _store.set_task_queue_state(project["project_id"], "stopped")
+        if exc.status_code != 409:
+            _store.update_task(task["task_id"], status="failed", error=f"Task could not start: {exc.detail}")
+        raise
+    except StorageError as exc:
+        _store.set_task_queue_state(project["project_id"], "stopped")
+        raise _storage_failure(exc) from exc
+
+
+def _advance_queue(project_id: str, *, retry_failed: bool = False) -> None:
+    with _queue_lock:
+        if _store.task_queue_state(project_id) != "running":
+            return
+        task = _next_task(project_id)
+        if task is None:
+            _store.set_task_queue_state(project_id, "stopped")
+            return
+        if task["status"] == "running":
+            return
+        if task["status"] == "failed" and not retry_failed:
+            _store.set_task_queue_state(project_id, "stopped")
+            raise HTTPException(status_code=409, detail="A failed task blocks the list; resume it first")
+        project = _store.get_project(project_id)
+        if not _is_coding(project):
+            _store.set_task_queue_state(project_id, "stopped")
+            return
+        _launch_task(project, task)
+
+
+def _finish_task(entry: dict) -> None:
+    """Record the run outcome on its task, then continue or halt the task list."""
+    with _queue_lock:
+        try:
+            task = _store.task_for_run(entry["run_id"])
+            if task is None or task["status"] != "running":
+                return
+            if entry["status"] == "completed":
+                _store.update_task(task["task_id"], status="completed", error=None)
+            else:
+                reason = entry["result"].get("reason") if isinstance(entry.get("result"), dict) else None
+                _store.update_task(task["task_id"], status="failed",
+                                   error=f"Run {entry['run_id']} ended with status {entry['status']}"
+                                         + (f": {str(reason)[:500]}" if reason else ""))
+                _store.set_task_queue_state(task["project_id"], "stopped")
+                return
+            _advance_queue(task["project_id"])
+        except (HTTPException, StorageError) as exc:
+            # The failed task and the halted queue are already recorded.
+            entry["task_error"] = str(getattr(exc, "detail", exc))
+
+
+def _start_queue(project_id: str, *, retry_failed: bool) -> dict:
+    _coding_project_or_409(project_id)
+    try:
+        _store.set_task_queue_state(project_id, "running")
+        _advance_queue(project_id, retry_failed=retry_failed)
+    except StorageError as exc:
+        raise _storage_failure(exc) from exc
+    return _task_queue(project_id)
+
+
+@app.get("/projects/{project_id}/tasks")
+def list_tasks(project_id: str):
+    _coding_project_or_409(project_id)
+    return _task_queue(project_id)
+
+
+@app.post("/projects/{project_id}/tasks", status_code=201)
+def create_task(project_id: str, request: TaskCreateRequest):
+    _coding_project_or_409(project_id)
+    try:
+        return _store.create_task(project_id, title=request.title, prompt=request.prompt, timeout=request.timeout)
+    except StorageError as exc:
+        raise _storage_failure(exc) from exc
+
+
+@app.patch("/projects/{project_id}/tasks/{task_id}")
+def update_task(project_id: str, task_id: str, request: TaskUpdateRequest):
+    task = _task_or_404(project_id, task_id)
+    if task["status"] in {"running", "completed"}:
+        raise HTTPException(status_code=409, detail=f"A {task['status']} task cannot be edited")
+    changes = request.model_dump(exclude_unset=True, exclude_none=True)
+    if "timeout" in changes:
+        changes["timeout_seconds"] = changes.pop("timeout")
+    if task["status"] == "failed" and "prompt" in changes:
+        # A changed assignment starts as a fresh run instead of recovering the old one.
+        changes.update(status="open", run_id=None, error=None)
+    try:
+        return _store.update_task(task_id, **changes)
+    except StorageError as exc:
+        raise _storage_failure(exc) from exc
+
+
+@app.delete("/projects/{project_id}/tasks/{task_id}", status_code=204)
+def delete_task(project_id: str, task_id: str):
+    task = _task_or_404(project_id, task_id)
+    if task["status"] == "running":
+        raise HTTPException(status_code=409, detail="A running task cannot be deleted")
+    try:
+        _store.delete_task(task_id)
+    except StorageError as exc:
+        raise _storage_failure(exc) from exc
+    return Response(status_code=204)
+
+
+@app.post("/projects/{project_id}/tasks/order")
+def order_tasks(project_id: str, request: TaskOrderRequest):
+    _coding_project_or_409(project_id)
+    current = _task_queue(project_id)["tasks"]
+    if sorted(request.task_ids) != sorted(task["task_id"] for task in current):
+        raise HTTPException(status_code=422, detail="task_ids must list every task of the project once")
+    try:
+        _store.reorder_tasks(project_id, request.task_ids)
+    except StorageError as exc:
+        raise _storage_failure(exc) from exc
+    return _task_queue(project_id)
+
+
+@app.post("/projects/{project_id}/tasks/start")
+def start_tasks(project_id: str):
+    return _start_queue(project_id, retry_failed=False)
+
+
+@app.post("/projects/{project_id}/tasks/resume")
+def resume_tasks(project_id: str):
+    return _start_queue(project_id, retry_failed=True)
+
+
+@app.post("/projects/{project_id}/tasks/pause")
+def pause_tasks(project_id: str):
+    """Halt after the running task; the existing cancel action stops a run immediately."""
+    _coding_project_or_409(project_id)
+    try:
+        _store.set_task_queue_state(project_id, "stopped")
+    except StorageError as exc:
+        raise _storage_failure(exc) from exc
+    return _task_queue(project_id)
 
 
 # REAPER-AI A03 STRUCTURED EVENTS

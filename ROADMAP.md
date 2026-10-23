@@ -246,6 +246,10 @@ The autonomous coding logic was not changed. Practical macOS acceptance and a pl
 
 Technical repository reviews remain a supporting capability. D01 remains a diagnostic and model-comparison benchmark rather than an independent v1.0 blocking criterion.
 
+### Unreleased — Sequential task list
+
+**Implemented after v1.0.0; not released.** Coding projects get a compact task list in the sidebar (add, edit, delete, reorder; *Starten*, *Anhalten*, *Fortsetzen*). Sentinel processes open tasks one at a time; each task is a normal run in its own linked conversation. The end of a task's run starts the next open task, a non-completed outcome marks the task failed and halts the list, and *Fortsetzen* reuses checkpoint recovery where possible. Completed tasks are never rerun. Tasks persist in the existing SQLite store; no new agent, scheduler, framework, or state system was added, and nothing is committed automatically. Practical check on a scratch Git workspace with `qwen3.8-q5:latest`: two short tasks (add a function, then document it in a new README) ran back to back; the second started automatically about two seconds after the first completed, both ended `completed` in their own conversations, and no commit was created. The existing 45 unit tests pass; no new tests were added.
+
 ## 6. Binding development principles
 
 REAPER remains a lean local single-user coding agent.

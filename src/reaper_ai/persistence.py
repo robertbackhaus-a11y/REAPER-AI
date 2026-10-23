@@ -217,6 +217,22 @@ class Store:
             );
             CREATE INDEX IF NOT EXISTS project_index_imports_path
                 ON project_index_imports(project_id, path);
+            CREATE TABLE IF NOT EXISTS project_tasks (
+                task_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+                position INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('open', 'running', 'completed', 'failed')),
+                conversation_id TEXT REFERENCES conversations(id) ON DELETE SET NULL,
+                run_id TEXT,
+                error TEXT,
+                timeout_seconds INTEGER NOT NULL DEFAULT 660,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS project_tasks_order
+                ON project_tasks(project_id, position);
             """
         )
         Store._add_column(connection, "conversations", "project_id", "TEXT")
@@ -227,6 +243,8 @@ class Store:
         # Selected global MCP server IDs only; definitions stay in mcp.json.
         Store._add_column(connection, "projects", "mcp_servers_json", "TEXT NOT NULL DEFAULT '[]'")
         Store._add_column(connection, "projects", "kind", "TEXT NOT NULL DEFAULT 'coding'")
+        # Sequential task list: 'running' lets a finished task start the next open one.
+        Store._add_column(connection, "projects", "task_queue_state", "TEXT NOT NULL DEFAULT 'stopped'")
         connection.execute("CREATE INDEX IF NOT EXISTS conversations_project_updated ON conversations(project_id, updated_at DESC)")
         connection.execute("CREATE INDEX IF NOT EXISTS runs_project_started ON runs(project_id, started_at DESC)")
         connection.execute("CREATE INDEX IF NOT EXISTS durable_memory_project_created ON durable_memory(project_id, created_at DESC)")
@@ -593,6 +611,108 @@ class Store:
         except sqlite3.Error as exc:
             raise StorageError(f"Could not query top Python files by symbols: {exc}") from exc
         return [dict(row) for row in rows]
+
+    def list_tasks(self, project_id: str) -> list[dict]:
+        try:
+            with self._connect() as connection:
+                rows = connection.execute(
+                    "SELECT * FROM project_tasks WHERE project_id = ? ORDER BY position, created_at", (project_id,)
+                ).fetchall()
+        except sqlite3.Error as exc:
+            raise StorageError(f"Could not list tasks: {exc}") from exc
+        return [dict(row) for row in rows]
+
+    def get_task(self, task_id: str) -> dict | None:
+        try:
+            with self._connect() as connection:
+                row = connection.execute("SELECT * FROM project_tasks WHERE task_id = ?", (task_id,)).fetchone()
+        except sqlite3.Error as exc:
+            raise StorageError(f"Could not load task: {exc}") from exc
+        return dict(row) if row else None
+
+    def task_for_run(self, run_id: str) -> dict | None:
+        try:
+            with self._connect() as connection:
+                row = connection.execute("SELECT * FROM project_tasks WHERE run_id = ?", (run_id,)).fetchone()
+        except sqlite3.Error as exc:
+            raise StorageError(f"Could not load task: {exc}") from exc
+        return dict(row) if row else None
+
+    def create_task(self, project_id: str, *, title: str, prompt: str, timeout: int = 660) -> dict:
+        now = utc_now()
+        task = {"task_id": uuid.uuid4().hex, "project_id": project_id, "title": title.strip()[:200] or prompt.strip()[:80],
+                "prompt": prompt, "status": "open", "conversation_id": None, "run_id": None, "error": None,
+                "timeout_seconds": timeout, "created_at": now, "updated_at": now}
+        try:
+            with self._connect() as connection:
+                task["position"] = connection.execute(
+                    "SELECT COALESCE(MAX(position), 0) + 1 FROM project_tasks WHERE project_id = ?", (project_id,)
+                ).fetchone()[0]
+                connection.execute(
+                    "INSERT INTO project_tasks(task_id, project_id, position, title, prompt, status, conversation_id, run_id, error, timeout_seconds, created_at, updated_at) "
+                    "VALUES(:task_id, :project_id, :position, :title, :prompt, :status, :conversation_id, :run_id, :error, :timeout_seconds, :created_at, :updated_at)",
+                    task,
+                )
+        except sqlite3.Error as exc:
+            raise StorageError(f"Could not save task: {exc}") from exc
+        return task
+
+    def update_task(self, task_id: str, **changes: Any) -> dict | None:
+        fields = {key: value for key, value in changes.items()
+                  if key in {"title", "prompt", "status", "conversation_id", "run_id", "error", "timeout_seconds"}}
+        fields["updated_at"] = utc_now()
+        assignments = ", ".join(f"{key} = :{key}" for key in fields)
+        fields["task_id"] = task_id
+        try:
+            with self._connect() as connection:
+                connection.execute(f"UPDATE project_tasks SET {assignments} WHERE task_id = :task_id", fields)
+                row = connection.execute("SELECT * FROM project_tasks WHERE task_id = ?", (task_id,)).fetchone()
+        except sqlite3.Error as exc:
+            raise StorageError(f"Could not update task: {exc}") from exc
+        return dict(row) if row else None
+
+    def delete_task(self, task_id: str) -> bool:
+        try:
+            with self._connect() as connection:
+                return connection.execute("DELETE FROM project_tasks WHERE task_id = ?", (task_id,)).rowcount == 1
+        except sqlite3.Error as exc:
+            raise StorageError(f"Could not delete task: {exc}") from exc
+
+    def reorder_tasks(self, project_id: str, task_ids: list[str]) -> None:
+        try:
+            with self._connect() as connection:
+                for position, task_id in enumerate(task_ids, start=1):
+                    connection.execute("UPDATE project_tasks SET position = ? WHERE task_id = ? AND project_id = ?",
+                                       (position, task_id, project_id))
+        except sqlite3.Error as exc:
+            raise StorageError(f"Could not reorder tasks: {exc}") from exc
+
+    def task_queue_state(self, project_id: str) -> str:
+        try:
+            with self._connect() as connection:
+                row = connection.execute("SELECT task_queue_state FROM projects WHERE project_id = ?", (project_id,)).fetchone()
+        except sqlite3.Error as exc:
+            raise StorageError(f"Could not load task queue state: {exc}") from exc
+        return row["task_queue_state"] if row and row["task_queue_state"] == "running" else "stopped"
+
+    def set_task_queue_state(self, project_id: str, state: str) -> None:
+        try:
+            with self._connect() as connection:
+                connection.execute("UPDATE projects SET task_queue_state = ? WHERE project_id = ?", (state, project_id))
+        except sqlite3.Error as exc:
+            raise StorageError(f"Could not save task queue state: {exc}") from exc
+
+    def interrupt_running_tasks(self) -> None:
+        """On API startup a running task's process is gone: mark it failed and halt its queue."""
+        try:
+            with self._connect() as connection:
+                connection.execute(
+                    "UPDATE project_tasks SET status = 'failed', error = 'API restarted while the task was running', "
+                    "updated_at = ? WHERE status = 'running'", (utc_now(),)
+                )
+                connection.execute("UPDATE projects SET task_queue_state = 'stopped' WHERE task_queue_state = 'running'")
+        except sqlite3.Error as exc:
+            raise StorageError(f"Could not mark interrupted tasks: {exc}") from exc
 
     def create_conversation(
         self, *, workspace: str | None = None, model: str | None = None, title: str | None = None,
