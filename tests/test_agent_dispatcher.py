@@ -14,6 +14,23 @@ from reaper_ai.agent import dispatch_tool, new_agent_state
 from reaper_ai import engine
 from reaper_ai.persistence import Store
 
+# The shell tool runs Windows PowerShell on Windows and /bin/sh elsewhere.
+WINDOWS = os.name == "nt"
+if WINDOWS:
+    SHELL_PWD = "Get-Location"
+    SHELL_FAIL = "Write-Error 'expected failure'; exit 7"
+    SHELL_SLEEP = "Start-Sleep -Seconds 2"
+    SHELL_ECHO = "Write-Output autonomous"
+    SHELL_VALUE_CHECK = ("if ([IO.File]::ReadAllText('sample.py') -eq \"VALUE = 'fixed'`r`n\") "
+                         "{ Write-Output verified } else { Write-Error 'wrong content'; exit 7 }")
+else:
+    SHELL_PWD = "pwd"
+    SHELL_FAIL = "echo 'expected failure' >&2; exit 7"
+    SHELL_SLEEP = "sleep 2"
+    SHELL_ECHO = "echo autonomous"
+    SHELL_VALUE_CHECK = ("if printf \"VALUE = 'fixed'\\n\" | cmp -s - sample.py; "
+                         "then echo verified; else echo 'wrong content' >&2; exit 7; fi")
+
 
 class AgentDispatcherTests(unittest.TestCase):
     def test_fragment_read_is_retained_and_an_identical_repeat_is_visible(self):
@@ -149,26 +166,26 @@ class AgentDispatcherTests(unittest.TestCase):
             self.assertTrue(python["ok"], python)
             self.assertIn("executables", python["data"])
 
-            location = dispatch_tool({"tool": "shell", "args": {"command": "Get-Location", "timeout": 10},
+            location = dispatch_tool({"tool": "shell", "args": {"command": SHELL_PWD, "timeout": 10},
                                       "context": context})
             self.assertTrue(location["ok"], location)
             self.assertEqual(location["exit_code"], 0)
             self.assertIn(str(root), location["stdout"])
 
-            failed = dispatch_tool({"tool": "shell", "args": {"command": "Write-Error 'expected failure'; exit 7",
+            failed = dispatch_tool({"tool": "shell", "args": {"command": SHELL_FAIL,
                                                                    "timeout": 10}, "context": context},
                                    )
             self.assertFalse(failed["ok"])
             self.assertEqual(failed["exit_code"], 7)
             self.assertIn("expected failure", failed["stderr"])
 
-            timed_out = dispatch_tool({"tool": "shell", "args": {"command": "Start-Sleep -Seconds 2", "timeout": 1},
+            timed_out = dispatch_tool({"tool": "shell", "args": {"command": SHELL_SLEEP, "timeout": 1},
                                       "context": context})
             self.assertFalse(timed_out["ok"])
             self.assertEqual(timed_out["exit_code"], -1)
             self.assertIn("timed out", timed_out["error"].lower())
 
-            autonomous = dispatch_tool({"tool": "shell", "args": {"command": "Write-Output autonomous"},
+            autonomous = dispatch_tool({"tool": "shell", "args": {"command": SHELL_ECHO},
                                         "context": context})
             self.assertTrue(autonomous["ok"], autonomous)
             self.assertIn("autonomous", autonomous["stdout"])
@@ -218,9 +235,7 @@ class AgentDispatcherTests(unittest.TestCase):
                      "expected_hash": hashlib.sha256(initial.encode("utf-8")).hexdigest()}}},
                 {"kind": "action", "reason": "Verify the first correction attempt.",
                  "verification_for": ["Run the value check after the write."],
-                 "action": {"tool": "shell", "args": {"command": (
-                     "if ([IO.File]::ReadAllText('sample.py') -eq \"VALUE = 'fixed'`r`n\") "
-                     "{ Write-Output verified } else { Write-Error 'wrong content'; exit 7 }"), "timeout": 10}}},
+                 "action": {"tool": "shell", "args": {"command": SHELL_VALUE_CHECK, "timeout": 10}}},
                 {"kind": "action", "reason": "Read the failed correction before replacing it.",
                  "open_verifications": ["Correct the value and rerun the failing check."],
                  "action": {"tool": "read_file", "args": {"path": "sample.py"}}},
@@ -233,9 +248,7 @@ class AgentDispatcherTests(unittest.TestCase):
                 {"kind": "action", "reason": "Verify the corrected file with the same failing check.",
                  "phase": "verify", "current_task": "Verify the corrected value",
                  "verification_for": ["Run the value check again."],
-                 "action": {"tool": "shell", "args": {"command": (
-                     "if ([IO.File]::ReadAllText('sample.py') -eq \"VALUE = 'fixed'`r`n\") "
-                     "{ Write-Output verified } else { Write-Error 'wrong content'; exit 7 }"), "timeout": 10}}},
+                 "action": {"tool": "shell", "args": {"command": SHELL_VALUE_CHECK, "timeout": 10}}},
                 {"kind": "final", "reason": "The corrected value passed the repeated command check.",
                  "summary": "sample.py now contains the fixed value.",
                  "verification": "The final PowerShell check returned verified with exit code 0.",

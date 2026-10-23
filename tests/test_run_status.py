@@ -104,6 +104,15 @@ class RunStatusTests(unittest.TestCase):
         self.assertEqual(x["toolCalls"], 1)
         self.assertEqual(x["duration"], "10 s")
 
+    def test_recovery_after_a_terminal_event_is_running_again(self):
+        events = [("run_started", {"timestamp": 1000.0}), ("run_completed", {"status": "cancelled", "timestamp": 1010.0}),
+                  ("recovery_started", {"timestamp": 2000.0, "next_stage": "agent_execute"})]
+        stats = self.apply(events, "console.log(JSON.stringify(s));")
+        self.assertEqual(stats["status"], "running")
+        self.assertFalse(stats["completed"])
+        self.assertIsNone(stats["finishedAt"])
+        self.assertEqual(stats["activity"], "Recovery ab agent_execute")
+
     def test_timeout_and_failure_report_reason(self):
         for status, label in (("timed_out", "Timeout"), ("failed", "Fehler")):
             run = {"run_id": "r5", "status": status, "result": {"status": status, "reason": "budget exhausted", "checks": [], "changed_files": []}}

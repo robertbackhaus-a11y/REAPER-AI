@@ -50,7 +50,7 @@
   function applyEvent(stats, type, data = {}) {
     const time = typeof data.timestamp === 'number' ? data.timestamp * 1000 : null;
     stats.events += 1;
-    if (type === 'run_started' || type === 'recovery_started') { if (time && !stats.startedAt) stats.startedAt = time; stats.status = 'running'; if (type === 'recovery_started') stats.activity = `Recovery ab ${data.next_stage || 'Checkpoint'}`; }
+    if (type === 'run_started' || type === 'recovery_started') { if (time && !stats.startedAt) stats.startedAt = time; stats.status = 'running'; stats.completed = false; stats.finishedAt = null; if (type === 'recovery_started') stats.activity = `Recovery ab ${data.next_stage || 'Checkpoint'}`; }
     else if (type === 'phase_changed') { if (!stats.modelActive) stats.activity = phaseLabels[data.phase] || data.phase || stats.activity; }
     else if (type === 'model_activity') {
       if (data.status === 'started') { stats.modelCalls += 1; stats.modelActive = true; stats.activity = `Modell denkt nach${data.model ? ` (${data.model})` : ''}`; }

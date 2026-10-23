@@ -7,7 +7,7 @@ REAPER-AI is a small, local, single-user project. Contributions should make it *
 1. Read [ARCHITECTURE.md](ARCHITECTURE.md) and [ROADMAP.md](ROADMAP.md).
 2. Keep the change within one clearly defined issue or work package.
 3. Discuss larger architectural changes before implementing them.
-4. Do not assume planned features already exist; the project is being built from scratch.
+4. Do not assume planned features already exist; [ROADMAP.md](ROADMAP.md) separates released, unreleased, and planned work.
 
 ## Implementation rules
 

@@ -21,7 +21,8 @@ from reaper_ai.agent import AgentState, dispatch_tool, new_agent_state
 from reaper_ai.mcp_client import discover_mcp_tools
 from reaper_ai.persistence import StorageError, Store
 
-OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
+OLLAMA_BASE = os.environ.get("REAPER_OLLAMA_URL", "").strip().rstrip("/") or "http://127.0.0.1:11434"
+OLLAMA_URL = f"{OLLAMA_BASE}/api/chat"
 MODEL = os.environ.get("REAPER_MODEL", "qwen3.6:35b")
 MAX_WALL_SECONDS = 600
 _MAX_REPLY_CHARS = 80_000

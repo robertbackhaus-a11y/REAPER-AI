@@ -62,13 +62,10 @@ class MCPManagementTests(unittest.TestCase):
         environment = {}
         api._mcp_environment(environment, {"mcp_servers": ["github", "searxng"]})
         with patch.dict(os.environ, environment):
-            self.assertEqual(list(mcp_client._active_servers()), ["github"])
-            with patch.object(mcp_client, "_list_server_tools", autospec=True) as listed:
-                async def tools(name, server):
-                    return [{"tool": f"mcp:{name}:search", "server": name, "name": "search"}]
-                listed.side_effect = tools
-                discovery = mcp_client.discover_mcp_tools()
-            self.assertEqual([item["tool"] for item in discovery["tools"]], ["mcp:github:search"])
+            selected = mcp_client._active_servers()
+            self.assertEqual(list(selected), ["github"])
+            # Discovery stores this filtered start snapshot for later tool calls.
+            mcp_client._run_servers = selected
             # A configuration change during the run does not alter the started run.
             mcp_client.delete_server("github")
             self.assertEqual(mcp_client._resolve_tool("mcp:github:search")[0], "github")

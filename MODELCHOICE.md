@@ -1,8 +1,10 @@
 # REAPER-AI — Model Selection and D01 Evaluation
 
 **Date:** 20–21 October 2026
-**Baseline:** REAPER-AI v0.7.0 (`876fab1`), with a later current-S03 comparison recorded below
+**Baseline:** REAPER-AI v0.7.0 (`876fab1`), with later S03 and v1.0.0 acceptance evidence recorded below
 **Decision:** Retain `qwen3.8-q5:latest` as Sentinel's primary model.
+
+**Release context (v1.0.0):** The C01–C05 acceptance chain provides independent evidence for multi-file coding, verification, checkpoint recovery, and preservation of an existing dirty working tree with Qwen3.8-Q5. It does not establish a general reliability guarantee for arbitrary tasks or models. MCP and SearXNG configuration are separate operational concerns; no practical SearXNG web-search run is recorded here.
 
 ## 1. Purpose
 

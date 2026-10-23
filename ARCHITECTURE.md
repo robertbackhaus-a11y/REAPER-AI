@@ -1,27 +1,9 @@
-## Installation (Windows)
-
-Requirements: Windows 11, Python 3.12+, Git and Ollama.
-
-```powershell
-git clone https://github.com/robertbackhaus-a11y/REAPER-AI.git
-cd REAPER-AI
-py -3.12 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install .
-ollama pull qwen3.6:35b
-.\.venv\Scripts\python.exe -m uvicorn reaper_ai.api:app --host 127.0.0.1 --port 8000
-```
-
-Open http://127.0.0.1:8000/ in your browser.
-
-For development, use `pip install -e .` instead of `pip install .` to install the project in editable mode.
-
-REAPER-AI runs locally and does not commit or push changes automatically.
-
 # REAPER-AI — Architecture
 
-**Version:** 0.10.0
-**Status:** M0–M4, M5/P01–P03, M6/P01–P06, P0 targeted edits, P1 working-memory consolidation, S02/S03 evidence-aware questions and assessments, and optional native MCP discovery/execution are implemented. C01–C05 complete the v0.10.0 autonomous-coding acceptance with immediate links from reads to relevant open questions, stable task-bound source selection before general relevance ranking, preserved shell exit code/stdout/stderr in the next decision context, checkpoint recovery across an actual post-patch interruption and restart, and task-scoped edits in a dirty working tree. One checkpoint-recovered end-to-end Sentinel coding acceptance and the D01 read-only acceptance are recorded; broader task reliability remains an explicit limitation. v0.8.0 adds MCP tool support through the existing dispatcher; v0.9.0 adds project file navigation and a hash-guarded browser editor; v0.10.0 makes model assessments and question updates evidence-linked while preserving their distinction from observed tool facts.
-**Scope:** Local, single-user autonomous coding agent  
+**Version:** 1.0.0
+**Installation and start:** see [README.md](README.md#requirements-and-installation) (Windows, Linux, and macOS).
+**Status:** M0–M4, M5/P01–P03, M6/P01–P06, P0 targeted edits, P1 working-memory consolidation, S02/S03 evidence-aware questions and assessments, and optional native MCP discovery/execution are implemented. C01–C05 complete the v1.0.0 autonomous-coding acceptance with immediate links from reads to relevant open questions, stable task-bound source selection before general relevance ranking, preserved shell exit code/stdout/stderr in the next decision context, checkpoint recovery across an actual post-patch interruption and restart, and task-scoped edits in a dirty working tree. One checkpoint-recovered end-to-end Sentinel coding acceptance and the D01 read-only acceptance are recorded; broader task reliability remains an explicit limitation. v0.8.0 adds MCP tool support through the existing dispatcher; v0.9.0 adds project file navigation and a hash-guarded browser editor; v0.10.0 makes model assessments and question updates evidence-linked while preserving their distinction from observed tool facts; v0.11.0 adds POSIX process-group supervision beside the Windows Job Object path, the read-only Git Diff tab, MCP server management with per-project activation, the run status panel, tool-to-code navigation, and general chat projects beside coding projects. v1.0.0 adds a configurable Ollama endpoint, consistent terminal SSE replay, and Linux-compatible test paths.
+**Scope:** Local, single-user autonomous coding agent
 **Language:** English for repository documentation; user interaction follows the user's language.
 
 ## 1. Objective
@@ -45,7 +27,7 @@ The former REAPER-AI v0.x implementation is **not** an architectural baseline. T
 | Area | Decision | Rationale |
 |---|---|---|
 | Workflow orchestration | **LangGraph (Python library)** | Explicit state, nodes, routing, and checkpoint-safe iteration; no homegrown free-running tool loop |
-| Local inference | **Ollama** | Local model hosting, selectable models, tool-capable API |
+| Local inference | **Ollama** | Local model hosting, selectable models, tool-capable API; `http://127.0.0.1:11434` unless `REAPER_OLLAMA_URL` names another server |
 | Core application | **Python** | Direct integration of graphs, tools, Git, subprocesses |
 | User interface | **Custom lightweight browser UI (HTML/CSS/JavaScript)** | Full control, minimal dependencies; Chainlit is not used |
 | API/server | **FastAPI, embedded local HTTP/SSE service** | Serve the custom UI and expose sessions, runs, projects, cancellation, and structured events |
@@ -229,7 +211,7 @@ Tools are narrow Python adapters returning **structured results**. A shell remai
 | `write_file` | Whole-text write with read-hash precondition | Changed path, before/after hashes |
 | `apply_patch` | One exact text replacement in an existing UTF-8 file | Changed path, before/after hashes; no write unless the original text occurs once |
 | `git_status` / `git_diff` | Optional repository inspection | Machine-observed repository state |
-| `shell` | PowerShell or child process execution with cwd/timeout/output cap | Command, exit code, captured output |
+| `shell` | Command execution through Windows PowerShell (`powershell -Command`) on Windows or `/bin/sh -c` on Linux/macOS, with cwd/timeout/output cap | Command, exit code, captured output |
 | `find_python` | Python launcher discovery | Resolvable executable paths |
 
 The dispatcher exposes `list_files`, `read_file`, `read_file_range`, `search_text`, `write_file`, `apply_patch`, `git_status`, `git_diff`, `find_python`, and `shell` through the iterative graph. A workspace is initial project context, not a filesystem boundary: file paths may be absolute, and the shell's working directory can be explicitly supplied. Git actions are observational and do not require a repository.
@@ -350,6 +332,8 @@ run_completed
 
 Event payloads include `run_id`, timestamps, status, and applicable evidence identifiers. FastAPI exposes a small HTTP API for commands and SSE for one-way live run events. The browser renders these events without scraping logs. Engine logic remains independent of the frontend.
 
+Each supervisor process's events are persisted once, after it exits, and are appended after the events already stored for the run, so a resumed run keeps its earlier process's events in order. The API status is authoritative: when the engine emitted no `run_completed` or one with a different status (cancellation, timeout, interruption), the API records its own `run_completed` with `source: "api"`. A finished run is streamed from the database; a running run streams the stored events of its earlier processes and then its live log, with the same sequence numbers and the same final event the later replay will show.
+
 ## 11. Persistence and recovery
 
 M5/P01 uses a small SQLite database through `reaper_ai.persistence.Store`. The default path is `%LOCALAPPDATA%\REAPER-AI\reaper-ai.sqlite3`; `REAPER_DATA_DIR` can select a different parent directory. It is application data, never a target workspace or repository artifact.
@@ -372,7 +356,7 @@ The Windows path is covered by the Windows regression suite and an actual Job Ob
 
 ## 12. Operational boundaries
 
-- Windows 11 is the primary target.
+- Windows 11 and Linux are practically confirmed targets; macOS is accepted on the shared POSIX implementation without practical testing.
 - Single local user and local Ollama models; no cloud LLM dependency.
 - Project repositories can be outside the application directory.
 - Clearly distinguish **application installation**, **application data**, and **user project workspace**.
@@ -393,9 +377,9 @@ The following items are intentionally **not settled** by this document:
 
 1. **Inference adapter:** direct Ollama client or LangChain-compatible adapter, based on reliable tool-call behavior with the selected models.
 2. **Execution isolation:** CLI engine runs under a managed Windows Job Object or a dedicated POSIX engine process group. The Windows timeout path and the POSIX cleanup branch have focused coverage; P02 is accepted with Windows and Linux practically confirmed and macOS accepted on the shared POSIX implementation without practical testing.
-4. **File editing implementation:** patch-based edit tool and precondition strategy to prevent accidental overwrites.
-5. **Verification policy:** task-specific minimum checks and success criteria, without a heavyweight universal test pipeline.
-6. **Memory (resolved for initial release):** Basic Memory is deferred. Scoped SQLite memory is sufficient for explicit user decisions and observed completed-run evidence; reconsider only with a measured need for richer retrieval.
+3. **File editing implementation:** patch-based edit tool and precondition strategy to prevent accidental overwrites.
+4. **Verification policy:** task-specific minimum checks and success criteria, without a heavyweight universal test pipeline.
+5. **Memory (resolved for initial release):** Basic Memory is deferred. Scoped SQLite memory is sufficient for explicit user decisions and observed completed-run evidence; reconsider only with a measured need for richer retrieval.
 
 These decisions must be resolved before production implementation; they do not block agreement on the execution architecture.
 
@@ -429,9 +413,9 @@ Verified in a real browser coding run:
 Limitations:
 - Structural verification does not establish functional correctness.
 - The displayed Git diff reflects the current workspace, not an immutable run snapshot.
-- Browser cancellation and reconnection have not been separately verified.
+- Browser cancellation and a browser reload during a run were checked in the browser for P06 (v0.11.0).
 - Persistent sessions, completed run history, explicit stage-checkpoint recovery, and scoped durable memory are implemented in SQLite (M5/P01–P03).
-- Run-result presentation and public run-ID consistency require refinement.
+- Public run-ID consistency requires refinement.
 
 M5/P01–P03 verification is covered by focused storage/API tests for conversation/message/run association, persisted stage results/events, checkpoint integrity, stale-run detection, restart from the checkpoint's next stage, and durable-memory scope/source/restart behavior. M6 has focused dispatcher/agent tests for file list/read/range/search/write, a failed PowerShell content check followed by guarded correction and successful recheck, recovery from the saved next decision without re-running tools, absolute-path writing, Git status, Python discovery, and PowerShell output/nonzero/timeout handling. D01 was accepted on 2026-10-20: `d01-1792496155` completed read-only with 18 model calls and 17 tool calls in 128.9 seconds, made no source changes, recovered from invalid range requests, and did not repeat a successful range read. Its final report is an agent assessment rather than a source of truth: external review retained one false timeout claim and minor active-run/replay caveats. C01/C02 were then exercised end-to-end in `183ee8ae8303`: task-bound source excerpts stayed visible for the active coding task, a successful shell verification retained its exit code and both output streams, and Qwen 3.8 Q5 completed a multi-file CLI feature with independent functional checks in 20 model calls and 19 tool calls over 202.4 seconds, without identical repeated actions. C03 then exercised the same checkpoint/recovery mechanism in `8f7670dc9ebf`: after a hash-bound source patch, the run was cancelled, REAPER restarted, and the saved `agent_observe` checkpoint resumed at `agent_decide` without repeating the source investigation or patch. The resumed agent passed both tests, verified the CLI output, updated the fixture documentation, and completed. C04 exercised task-scoped edits in a dirty Git working tree in `7211e4ac8a5a`: the dispatcher applied hash-bound changes to the shared CLI file without removing its existing user change, and independent checks confirmed an unrelated changed file and an untracked user file retained their pre-run SHA-256 values. The run also preserved the default CLI output and passed all 3 fixture tests. The system therefore records observed tool evidence separately from model conclusions; these runs demonstrate accepted workflows, not universal semantic reliability.
 

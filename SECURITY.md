@@ -24,4 +24,4 @@ A useful report includes the affected revision, expected versus actual behavior,
 - **Cancellation:** Long-running operations and child processes must be terminable; explicit bounds and truthful failure states are part of the intended architecture.
 - **Verification:** A model assertion that work is complete is not a security or correctness guarantee. Trust actual tool results and repository state.
 
-These are **design requirements**, not a claim that the unimplemented application already enforces them. See [ARCHITECTURE.md](ARCHITECTURE.md) and [ROADMAP.md](ROADMAP.md).
+These are **design requirements**; not every one is enforced mechanically by the current application (for example, there is no shell allow-list or approval step). See [ARCHITECTURE.md](ARCHITECTURE.md) and [ROADMAP.md](ROADMAP.md).

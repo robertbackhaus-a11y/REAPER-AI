@@ -105,7 +105,7 @@ class ApiPersistenceTests(unittest.TestCase):
             captured["env"] = kwargs["env"]
             return Process()
 
-        with patch.object(api.os, "name", "nt"), patch.object(api, "_validate_workspace", return_value=Path("C:/project")), \
+        with patch.object(api, "_is_windows", return_value=True), patch.object(api, "_validate_workspace", return_value=Path("C:/project")), \
              patch.object(api, "_installed_models", return_value=["model"]), patch.object(api.subprocess, "Popen", side_effect=fake_popen), \
              patch.object(api.threading, "Thread"):
             response = api.resume_run("resume-api")
@@ -127,7 +127,7 @@ class ApiPersistenceTests(unittest.TestCase):
             captured["env"] = kwargs["env"]
             return Process()
 
-        with patch.object(api.os, "name", "nt"), patch.object(api, "_validate_workspace", return_value=Path("C:/project")), \
+        with patch.object(api, "_is_windows", return_value=True), patch.object(api, "_validate_workspace", return_value=Path("C:/project")), \
              patch.object(api, "_installed_models", return_value=["configured-model"]), \
              patch.object(api.subprocess, "Popen", side_effect=fake_popen), patch.object(api.threading, "Thread"):
             response = api.start_run(api.StartRequest(project_id=project["project_id"], task="Inspect"))
@@ -168,3 +168,137 @@ class ApiPersistenceTests(unittest.TestCase):
             response = api.cancel_run("posix-cancel")
         self.assertEqual(response["status"], "cancelling")
         kill.assert_called_once_with(6789, signal.SIGTERM)
+
+    # Terminal SSE replay: live stream and persisted replay must agree, keep every
+    # recovery segment, and end with the authoritative run status.
+    @staticmethod
+    def _log(*events, result=None):
+        lines = ["REAPER_EVENT: " + json.dumps({"type": kind, **payload}) for kind, payload in events]
+        if result is not None:
+            lines.append("RUN_RESULT: " + json.dumps(result))
+        return "\n".join(lines) + "\n"
+
+    def _finish(self, run_id, log_path, text, code, *, status="running", watch=True):
+        Path(log_path).write_text(text, encoding="utf-8")
+        entry = api._runs.get(run_id) or {
+            "run_id": run_id, "workspace": "C:/project", "model": "model", "task": "inspect", "timeout": 20,
+            "started_at": "then"}
+        if run_id not in api._runs:
+            api._store.create_run({**entry, "status": "running"})
+        entry.update({"status": status, "finished_at": None, "exit_code": None, "result": None,
+                      "log_path": str(log_path)})
+        api._runs[run_id] = entry
+
+        class FinishedProcess:
+            def wait(self):
+                return code
+
+        if watch:
+            api._watch(run_id, FinishedProcess())
+        return lambda: api._watch(run_id, FinishedProcess())
+
+    @staticmethod
+    def _stream(run_id):
+        class ConnectedRequest:
+            async def is_disconnected(self):
+                return False
+
+        # Finished-run replay does not await I/O. Drive its coroutine and
+        # async generator directly so these persistence tests do not need a
+        # Windows event-loop socket.
+        request = api.stream_events(run_id, ConnectedRequest())
+        try:
+            request.send(None)
+        except StopIteration as completed:
+            response = completed.value
+        else:
+            raise AssertionError("Finished-run replay unexpectedly awaited I/O")
+
+        chunks = []
+        iterator = response.body_iterator
+        while True:
+            try:
+                next_chunk = iterator.__anext__()
+                next_chunk.send(None)
+            except StopIteration as yielded:
+                chunks.append(yielded.value)
+            except StopAsyncIteration:
+                break
+        body = "".join(chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk for chunk in chunks)
+        events = []
+        for block in body.split("\n\n"):
+            fields = dict(line.split(": ", 1) for line in block.splitlines() if ": " in line and not line.startswith(":"))
+            if "event" in fields:
+                events.append((int(fields["id"]), fields["event"], json.loads(fields["data"]).get("status")))
+        return events
+
+    def test_recovered_run_replay_keeps_every_segment_in_order(self):
+        second_log = Path(str(self.log_path) + "-recovery")
+        self.addCleanup(second_log.unlink, missing_ok=True)
+        self._finish("recovered-run", self.log_path, self._log(
+            ("run_started", {}), ("phase_changed", {"phase": "agent_decide"}), ("tool_started", {"tool": "shell"}),
+            ("tool_completed", {"tool": "shell", "ok": True}), ("checkpoint_saved", {"stage": "agent_observe"})),
+            130, status="cancelling")
+        self.assertEqual(api._store.get_run("recovered-run")["status"], "cancelled")
+        self._finish("recovered-run", second_log, self._log(
+            ("recovery_started", {"next_stage": "agent_decide"}), ("run_completed", {"status": "completed"}),
+            result={"status": "completed"}), 0)
+        live = self._stream("recovered-run")
+        api._runs = {}
+        replayed = self._stream("recovered-run")
+        self.assertEqual(replayed, live)
+        self.assertEqual([kind for _, kind, _ in replayed],
+                         ["run_started", "phase_changed", "tool_started", "tool_completed", "checkpoint_saved",
+                          "run_completed", "recovery_started", "run_completed"])
+        self.assertEqual([sequence for sequence, _, _ in replayed], list(range(1, 9)))
+        self.assertEqual(replayed[5][2], "cancelled")
+        self.assertEqual(replayed[-1][2], "completed")
+
+    def test_live_stream_of_a_recovered_run_matches_its_later_replay(self):
+        second_log = Path(str(self.log_path) + "-recovery")
+        self.addCleanup(second_log.unlink, missing_ok=True)
+        self._finish("live-recovery", self.log_path, self._log(("run_started", {}), ("tool_started", {"tool": "shell"})),
+                     130, status="cancelling")
+        finish = self._finish("live-recovery", second_log, self._log(
+            ("recovery_started", {"next_stage": "agent_execute"}), ("run_completed", {"status": "completed"}),
+            result={"status": "completed"}), 0, watch=False)
+
+        async def finish_while_waiting(_seconds):
+            # The supervisor exits while the client is connected to the running stream.
+            if api._runs["live-recovery"]["finished_at"] is None:
+                finish()
+
+        with patch.object(api.asyncio, "sleep", side_effect=finish_while_waiting):
+            live = self._stream("live-recovery")
+        api._runs = {}
+        replayed = self._stream("live-recovery")
+        self.assertEqual(live, replayed)
+        self.assertEqual([kind for _, kind, _ in live],
+                         ["run_started", "tool_started", "run_completed", "recovery_started", "run_completed"])
+        self.assertEqual(live[-1], (5, "run_completed", "completed"))
+
+    def test_terminal_replay_reports_the_authoritative_status(self):
+        # The engine finished, but the user had already cancelled: the API status wins.
+        self._finish("cancel-race", self.log_path, self._log(
+            ("run_started", {}), ("run_completed", {"status": "completed"}), result={"status": "completed"}),
+            0, status="cancelling")
+        live = self._stream("cancel-race")
+        api._runs = {}
+        replayed = self._stream("cancel-race")
+        self.assertEqual(replayed, live)
+        self.assertEqual(api._store.get_run("cancel-race")["status"], "cancelled")
+        self.assertEqual(replayed[-1][1:], ("run_completed", "cancelled"))
+
+    def test_timed_out_replay_after_restart_still_ends_with_a_terminal_event(self):
+        self._finish("timed-out", self.log_path, self._log(("run_started", {}), ("tool_started", {"tool": "shell"})), 2)
+        live = self._stream("timed-out")
+        api._runs = {}
+        replayed = self._stream("timed-out")
+        self.assertEqual(replayed, live)
+        self.assertEqual(replayed[-1], (3, "run_completed", "timed_out"))
+
+    def test_completed_run_replay_keeps_the_single_engine_terminal_event(self):
+        self._finish("clean-run", self.log_path, self._log(
+            ("run_started", {}), ("run_completed", {"status": "completed"}), result={"status": "completed"}), 0)
+        api._runs = {}
+        self.assertEqual(self._stream("clean-run"), [(1, "run_started", None), (2, "run_completed", "completed")])

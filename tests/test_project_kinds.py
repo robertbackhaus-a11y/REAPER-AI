@@ -16,7 +16,7 @@ from reaper_ai.persistence import Store
 
 class ProjectKindTests(unittest.TestCase):
     def setUp(self):
-        self.directory = Path(tempfile.mkdtemp(prefix="reaper-ai-kinds-"))
+        self.directory = Path(tempfile.mkdtemp(prefix="reaper-ai-kinds-", dir=Path.cwd()))
         self.previous = (api._store, api._runs, api._active, api._procs)
         api._store = Store(self.directory / "reaper-ai.sqlite3")
         api._runs, api._active, api._procs = {}, None, {}

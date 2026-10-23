@@ -1024,6 +1024,17 @@ class Store:
             raise StorageError(f"Could not load run events: {exc}") from exc
         return [{"sequence": row["sequence"], "event_type": row["event_type"], "payload": self._decoded(row["payload_json"])} for row in rows]
 
+    def last_event_sequence(self, run_id: str) -> int:
+        """Return the highest stored event sequence of a run, or 0 if it has none."""
+        try:
+            with self._connect() as connection:
+                row = connection.execute(
+                    "SELECT COALESCE(MAX(sequence), 0) AS last FROM execution_events WHERE run_id = ?", (run_id,),
+                ).fetchone()
+        except sqlite3.Error as exc:
+            raise StorageError(f"Could not load run events: {exc}") from exc
+        return int(row["last"])
+
     def list_stage_results(self, run_id: str) -> list[dict]:
         try:
             with self._connect() as connection:
