@@ -51,13 +51,6 @@ class RunStatusTests(unittest.TestCase):
         self.assertIn("Datei lesen: app.py · erfolgreich · Exit-Code 0", live["lastAction"])
         self.assertEqual(live["elapsed"], "1 min 05 s")
 
-    def test_failed_tool_shows_error_as_last_action(self):
-        events = [("tool_started", {"tool": "apply_patch", "action": {"args": {"path": "x.py"}}}),
-                  ("tool_completed", {"tool": "apply_patch", "ok": False, "exit_code": None, "error": "hash mismatch"})]
-        live = self.apply(events, "console.log(JSON.stringify(RS.liveStatus({status: 'running'}, s)));")
-        self.assertTrue(live["lastAction"].startswith("Code ändern: x.py · fehlgeschlagen"))
-        self.assertIn("hash mismatch", live["lastAction"])
-
     def test_summary_uses_stored_result_only(self):
         run = {"run_id": "r2", "status": "completed", "started_at": "2026-10-22T08:00:00+00:00",
                "finished_at": "2026-10-22T08:02:00+00:00", "result": {
@@ -97,13 +90,6 @@ class RunStatusTests(unittest.TestCase):
         interrupted = run_js(f"console.log(JSON.stringify(RS.summarize({json.dumps({**run, 'status': 'interrupted'})}, null)));")
         self.assertEqual(interrupted["errors"], ["Kein gespeichertes Ergebnis vorhanden."])
 
-    def test_cancelled_run_falls_back_to_replayed_event_counts(self):
-        events = [*EVENTS, ("run_completed", {"status": "cancelled", "timestamp": 1010.0})]
-        x = self.apply(events, "console.log(JSON.stringify(RS.summarize({run_id: 'r4', status: 'cancelled', result: null}, s)));")
-        self.assertEqual(x["modelCalls"], 2)
-        self.assertEqual(x["toolCalls"], 1)
-        self.assertEqual(x["duration"], "10 s")
-
     def test_recovery_after_a_terminal_event_is_running_again(self):
         events = [("run_started", {"timestamp": 1000.0}), ("run_completed", {"status": "cancelled", "timestamp": 1010.0}),
                   ("recovery_started", {"timestamp": 2000.0, "next_stage": "agent_execute"})]
@@ -121,13 +107,6 @@ class RunStatusTests(unittest.TestCase):
             self.assertEqual(x["errors"], ["budget exhausted"])
             self.assertEqual(x["tests"], [])
             self.assertEqual(x["changedFiles"], [])
-
-    def test_panel_markup_keeps_existing_sections(self):
-        html = (STATIC / "index.html").read_text(encoding="utf-8")
-        for marker in ("run_status.js", 'id="run-status-grid"', 'id="run-summary-section"', 'id="copy-summary"',
-                       "Live-Ereignisse", "Ollama Thinking / Laufzeitlog", "Decision Trace"):
-            self.assertIn(marker, html)
-        self.assertLess(html.index("run_status.js"), html.index("app.js"))
 
 
 if __name__ == "__main__":

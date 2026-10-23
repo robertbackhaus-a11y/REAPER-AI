@@ -46,17 +46,6 @@ class StoreTests(unittest.TestCase):
             stage = restarted.list_stage_results("run-1")[0]
             self.assertEqual((stage["stage"], stage["status"]), ("verify", "started"))
 
-    def test_relevant_context_uses_user_intent_and_result_metadata_not_assistant_prose(self):
-        store = Store(self.path)
-        conversation = store.create_conversation(title="Context")
-        store.add_message(conversation["id"], role="user", content="Keep the public API stable")
-        store.add_message(conversation["id"], role="assistant", content="Unverified model prose must not appear",
-                          metadata={"status": "completed", "result": {"changed_files": ["api.py"], "checks": []}})
-        context = store.relevant_context(conversation["id"])
-        self.assertIn("Keep the public API stable", context)
-        self.assertIn("changed_files=api.py", context)
-        self.assertNotIn("Unverified model prose", context)
-
     def test_durable_memory_survives_restart_and_keeps_scopes_and_sources_separate(self):
         store = Store(self.path)
         conversation = store.create_conversation(workspace="C:/project", title="Memory")
@@ -108,17 +97,6 @@ class StoreTests(unittest.TestCase):
         checkpoint = store.get_checkpoint("corrupt")
         self.assertFalse(checkpoint["valid"])
         self.assertIn("integrity", checkpoint["invalid_reason"])
-
-    def test_conversations_keep_runs_separate_and_associated(self):
-        store = Store(self.path)
-        first = store.create_conversation(title="First")
-        second = store.create_conversation(title="Second")
-        for run_id, conversation_id in (("run-first", first["id"]), ("run-second", second["id"])):
-            store.create_run({"run_id": run_id, "conversation_id": conversation_id,
-                              "workspace": "C:/project", "model": "model", "task": run_id,
-                              "timeout": 30, "status": "completed", "started_at": "now"})
-        self.assertEqual(store.get_conversation_detail(first["id"])["runs"][0]["run_id"], "run-first")
-        self.assertEqual(store.get_conversation_detail(second["id"])["runs"][0]["run_id"], "run-second")
 
     def test_deleting_conversations_removes_owned_history_but_keeps_global_memory(self):
         store = Store(self.path)

@@ -89,12 +89,20 @@ def _ollama_options() -> dict[str, Any]:
     return options
 
 
+def _shell_environment() -> str:
+    """Describe the shell that the dispatcher will actually invoke."""
+    if os.name == "nt":
+        return "Windows PowerShell (`powershell -Command`); use PowerShell syntax, not Bash/CMD syntax such as `||` or `2>nul`."
+    return "POSIX `/bin/sh -c`; use POSIX shell syntax, not PowerShell or CMD syntax."
+
+
 def _decision_system_prompt() -> str:
     """Keep Sentinel's technical contract intact while adding project guidance."""
     project_prompt = os.environ.get("REAPER_PROJECT_SYSTEM_PROMPT", "").strip()
+    system = _AGENT_DECISION_SYSTEM.replace("{shell_environment}", _shell_environment())
     if not project_prompt:
-        return _AGENT_DECISION_SYSTEM
-    return _AGENT_DECISION_SYSTEM + "\n\nProject-specific instructions (supplemental; the technical contract above remains binding):\n" + project_prompt
+        return system
+    return system + "\n\nProject-specific instructions (supplemental; the technical contract above remains binding):\n" + project_prompt
 
 
 class AgentRunState(TypedDict):
@@ -221,8 +229,7 @@ index_imports(path?), plus the exact qualified tools dynamically advertised in `
 as tool evidence, not automatically verified fact. Index tools are project-scoped metadata/navigation only; use `read_file_range` to retrieve source.
 Paths may be workspace-relative or
 absolute. Git is optional. Shell commands and writes use the started user's normal operating-system permissions.
-On Windows, `shell` executes Windows PowerShell (`powershell -Command`), not CMD, Bash, or PowerShell 7. Use
-PowerShell syntax such as `Test-Path`; do not use Bash/CMD operators such as `||` or `2>nul`.
+The `shell` tool executes {shell_environment}.
 Before modifying an existing text file, read it and pass that result's sha256 as expected_hash. Use `apply_patch` for
 one exact, uniquely occurring source text replacement; use `write_file` for new files or whole-file replacement. Use
 only the supported tools, respect tool errors and path rules, and never commit, push, or release automatically."""
@@ -1247,7 +1254,7 @@ def _agent_prompt(state: AgentRunState) -> str:
     prompt = {"task": state["task"], "current_task": agent.get("current_task", ""), "phase": agent.get("phase", "explore"),
               "workspace": state["workspace"],
               "path_rule": "Paths may be workspace-relative or absolute.",
-              "shell_environment": "Windows PowerShell (powershell -Command); use PowerShell syntax, never Bash/CMD `||` or `2>nul`.",
+              "shell_environment": _shell_environment(),
               "working_memory": _work_memory_snapshot(agent), "progress": progress, "verification": agent["verification"],
               "code_findings": [], "visible_source_coverage": [],
               "context_omissions": [],

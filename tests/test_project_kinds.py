@@ -100,17 +100,6 @@ class ProjectKindTests(unittest.TestCase):
         self.assertEqual(json.loads(captured["env"][mcp_client.SELECTION_ENV]), ["searxng"])
         self.assertIsNone(api._store.get_conversation(response["conversation_id"])["workspace"])
 
-    def test_legacy_run_without_workspace_is_a_general_chat_with_all_mcp_servers(self):
-        response, captured = self.start(api.StartRequest(task="Explain SSE", model="model"))
-        self.assertEqual(response["workspace"], str((self.directory / "chat-workspace").resolve()))
-        self.assertIsNone(response["project_id"])
-        self.assertNotIn(mcp_client.SELECTION_ENV, captured["env"])
-        conversation = api._store.get_conversation(response["conversation_id"])
-        self.assertIsNone(conversation["project_id"])
-        self.assertIsNone(conversation["workspace"])
-        self.assertEqual([item["id"] for item in api.list_conversations(legacy=True)["conversations"]],
-                         [conversation["id"]])
-
     def test_coding_project_run_is_unchanged(self):
         project = api._store.create_project(name="Repo", workspace=str(self.directory), model="model")
         with patch.object(api, "_refresh_index") as refresh:

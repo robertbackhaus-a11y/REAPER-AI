@@ -33,6 +33,15 @@ else:
 
 
 class AgentDispatcherTests(unittest.TestCase):
+    def test_decision_contract_describes_the_active_shell(self):
+        self.assertIn("PowerShell", engine._decision_system_prompt())
+        workspace = str(Path.cwd())
+        with patch.object(engine.os, "name", "posix"):
+            self.assertIn("POSIX `/bin/sh -c`", engine._decision_system_prompt())
+            prompt = json.loads(engine._agent_prompt({"task": "Run a check", "workspace": workspace,
+                                                      "agent": new_agent_state()}))
+        self.assertEqual(prompt["shell_environment"], "POSIX `/bin/sh -c`; use POSIX shell syntax, not PowerShell or CMD syntax.")
+
     def test_fragment_read_is_retained_and_an_identical_repeat_is_visible(self):
         agent = new_agent_state()
         action = {"tool": "read_file_range", "args": {"path": "sample.py", "start_line": 10, "end_line": 10}}

@@ -38,7 +38,6 @@ The following work is implemented and released. Completion means that the descri
 - Terminal usage totals for a recovered run currently cover its resumed process; retained decision traces and event logs provide the complete cross-process measurement.
 - P02 is accepted: Windows and Linux (Debian 13 under WSL2) are practically confirmed. macOS is accepted on the shared POSIX implementation but has not been practically tested.
 - A hard crash of the API process during a running run has not been practically tested; P02 demonstrated recovery after cancellation and an API restart.
-- The engine's decision prompt describes the `shell` tool as Windows PowerShell on every platform, although it runs `/bin/sh` on Linux and macOS; the P02 Linux runs completed regardless.
 - v1.0.0 configures the Ollama endpoint through `REAPER_OLLAMA_URL`, keeps terminal SSE replay and live streaming on one authoritative sequence/status path, and uses Linux-compatible unit-test paths.
 
 **D01** remains a diagnostic benchmark and model-comparison exercise, not the primary product target. Its accepted Qwen 3.8 run demonstrated a viable read-only workflow, while the externally reviewed report also showed that a completed technical analysis can contain factual errors.

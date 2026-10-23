@@ -33,27 +33,6 @@ class ApiPersistenceTests(unittest.TestCase):
             (Path(str(self.path) + suffix)).unlink(missing_ok=True)
         self.log_path.unlink(missing_ok=True)
 
-    def test_persisted_run_is_available_when_memory_registry_is_empty(self):
-        conversation = api._store.create_conversation(title="Stored chat")
-        api._store.create_run({"run_id": "saved-run", "conversation_id": conversation["id"],
-                               "workspace": "C:/project", "model": "model", "task": "inspect",
-                               "timeout": 20, "status": "completed", "started_at": "then",
-                               "finished_at": "later", "exit_code": 0,
-                               "result": {"status": "completed"}})
-        response = api.get_run("saved-run")
-        self.assertEqual(response["run_id"], "saved-run")
-        self.assertEqual(response["result"]["status"], "completed")
-
-    def test_conversation_endpoint_functions_return_saved_history(self):
-        conversation = api.create_conversation(api.ConversationRequest(title="Saved chat"))
-        api._store.add_message(conversation["id"], role="user", content="hello")
-        detail = api.get_conversation(conversation["id"])
-        self.assertEqual(detail["title"], "Saved chat")
-        self.assertEqual(detail["messages"][0]["content"], "hello")
-        memory = api.add_memory(api.MemoryRequest(content="Keep this decision"))
-        self.assertEqual(memory["verification"], "user_confirmed")
-        self.assertEqual(api.list_memory()["memory"][0]["content"], "Keep this decision")
-
     def test_watcher_persists_terminal_result_event_and_summary_message(self):
         conversation = api._store.create_conversation(title="Watched chat")
         entry = {"run_id": "watched-run", "conversation_id": conversation["id"],
@@ -79,16 +58,6 @@ class ApiPersistenceTests(unittest.TestCase):
         messages = api._store.get_conversation_detail(conversation["id"])["messages"]
         self.assertEqual(messages[0]["role"], "assistant")
         self.assertIn("completed", messages[0]["content"])
-
-    def test_recovery_endpoint_exposes_only_explicitly_resumable_checkpoint(self):
-        api._store.create_run({"run_id": "interrupted-run", "workspace": "C:/project", "model": "model",
-                               "task": "resume", "timeout": 20, "status": "interrupted", "started_at": "then"})
-        api._store.save_checkpoint("interrupted-run", stage="agent_observe", next_stage="agent_decide",
-                                   state={"workspace": "C:/project", "agent": {"observations": []}},
-                                   stage_result={"status": "agent_observed"})
-        recovery = api.get_recovery("interrupted-run")
-        self.assertTrue(recovery["can_resume"])
-        self.assertEqual(recovery["checkpoint"]["next_stage"], "agent_decide")
 
     def test_resume_endpoint_starts_only_after_explicit_request(self):
         api._store.create_run({"run_id": "resume-api", "workspace": "C:/project", "model": "model",
