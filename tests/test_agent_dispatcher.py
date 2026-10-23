@@ -91,6 +91,40 @@ class AgentDispatcherTests(unittest.TestCase):
         self.assertEqual(update["status"], "agent_finalizing")
         self.assertEqual(update["agent"]["progress"]["open_verifications"], [])
 
+    def test_final_question_update_accepts_observed_tool_evidence(self):
+        agent = new_agent_state()
+        agent["information_gaps"] = [{
+            "status": "proposed", "kind": "question", "summary": "What is the current git status?",
+            "resolution": "open", "evidence_needed": "git_status output",
+        }]
+        observation = {
+            "step": 1, "action": {"tool": "git_status", "args": {}},
+            "result": {"ok": True, "exit_code": 0, "stdout": "", "stderr": "",
+                       "data": {"output": " M report_cli.py\n"}, "changes": [], "error": "", "duration_ms": 1},
+        }
+        agent["observations"] = [observation]
+        engine._record_progress(agent, observation)
+        state = {"task": "Preserve local changes", "workspace": str(Path.cwd()), "agent": agent,
+                 "status": "pending", "error": "", "details": [], "last_result": None}
+        final = {
+            "kind": "final", "outcome": "completed", "reason": "The working-tree state was observed.",
+            "summary": "The existing local change remains present.", "verification": "git_status succeeded.",
+            "open_verifications": [],
+            "question_updates": [{"question": "What is the current git status?", "resolution": "answered",
+                                  "evidence": [{"tool": "git_status"}]}],
+        }
+        with patch.object(engine, "ask_json", return_value=final), patch.object(engine, "_emit_event"):
+            update = engine.agent_decide(state)
+        question = update["agent"]["information_gaps"][0]
+        self.assertEqual(question["resolution"], "answered")
+        self.assertEqual(question["evidence"], [{"tool": "git_status"}])
+        self.assertNotIn("unresolved_questions", update["agent"]["verification"])
+        unobserved = engine._memory_question_items(
+            [{"question": "Is an unrelated command complete?", "resolution": "answered",
+              "evidence": [{"tool": "shell"}]}], [], update["agent"]["facts"],
+        )
+        self.assertEqual(unobserved[0]["resolution"], "open")
+
     def test_current_truncated_range_outranks_an_older_full_read(self):
         agent = new_agent_state()
         agent["current_task"] = "Inspect api.py error handling and state execution"

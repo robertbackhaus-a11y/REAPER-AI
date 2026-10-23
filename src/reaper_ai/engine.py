@@ -163,10 +163,12 @@ Return exactly one decision:
  "assessments":[{"claim":"technical conclusion","assessment":"supported|refuted|inconclusive",
                  "evidence":[{"path":"observed path","sha256":"observed hash","start_line":1,"end_line":2}]}],
  "question_updates":[{"question":"existing open question","resolution":"answered|inconclusive|open",
-                      "evidence_needed":"specific missing proof","evidence":[{"path":"observed path","sha256":"observed hash","start_line":1,"end_line":2}]}]}
+                      "evidence_needed":"specific missing proof","evidence":[{"path":"observed path","sha256":"observed hash","start_line":1,"end_line":2},{"tool":"observed tool name"}]}]}
 or
 {"kind":"final","outcome":"completed or partial","reason":"short completion or blockage rationale","summary":"concise evidence-based result",
- "verification":"what observed tool results establish","open_verifications":[]}
+ "verification":"what observed tool results establish","open_verifications":[],
+ "question_updates":[{"question":"existing open question","resolution":"answered|inconclusive|open",
+                      "evidence_needed":"specific missing proof","evidence":[{"path":"observed path","sha256":"observed hash","start_line":1,"end_line":2},{"tool":"observed tool name"}]}]}
 `plan`, `open_verifications`, and `verification_for` are optional. `action.tool` must be supported and `action.args`
 must be an object. The work-memory fields are optional and incremental: provide only additions or changes; never repeat
 the whole memory merely to restate it. `decisions` and `information_gaps` are model proposals, not proof of a file
@@ -174,7 +176,7 @@ change or a passed check. An `assessment` links a model conclusion to observed t
 interpretation: a successful read supplies the requested source evidence only. It does not automatically support,
 refute, or close a technical question. Every new `information_gaps` question must name its specific
 `evidence_needed`. After evidence relevant to one of your questions is read, provide an `assessment` and a
-`question_updates` entry with cited observed evidence, or leave it `open` and state the remaining evidence needed.
+`question_updates` entry with cited observed source or tool evidence, or leave it `open` and state the remaining evidence needed.
 `question_updates` never changes a question solely because a tool call succeeded. Use `reason` only for a short
 decision rationale, not private reasoning.
 
@@ -374,8 +376,9 @@ def _memory_text_items(value: Any, *, field: str, source_hashes: set[tuple[str, 
     return items
 
 
-def _observed_evidence_references(value: Any, sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Keep only source references whose complete range was actually observed."""
+def _observed_evidence_references(value: Any, sources: list[dict[str, Any]],
+                                  facts: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    """Keep only observed source ranges or observed tool references as evidence."""
     source_ranges = [
         (item.get("path"), item.get("sha256"), item.get("start_line"), item.get("end_line"))
         for item in sources if isinstance(item, dict)
@@ -385,6 +388,13 @@ def _observed_evidence_references(value: Any, sources: list[dict[str, Any]]) -> 
         return references
     for candidate in value:
         if not isinstance(candidate, dict):
+            continue
+        tool = candidate.get("tool")
+        if isinstance(tool, str) and any(
+            item.get("status") == "observed" and item.get("tool") == tool
+            for item in facts or [] if isinstance(item, dict)
+        ):
+            references.append({"tool": tool})
             continue
         path, digest = candidate.get("path"), candidate.get("sha256")
         start, end = candidate.get("start_line"), candidate.get("end_line")
@@ -421,7 +431,8 @@ def _memory_assessment_items(value: Any, sources: list[dict[str, Any]]) -> list[
     return items
 
 
-def _memory_question_items(value: Any, sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _memory_question_items(value: Any, sources: list[dict[str, Any]],
+                           facts: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     """Keep explicit model questions and their evidence need separate from tool facts."""
     raw_items = value if isinstance(value, list) else [value] if isinstance(value, str) else []
     items: list[dict[str, Any]] = []
@@ -431,13 +442,13 @@ def _memory_question_items(value: Any, sources: list[dict[str, Any]]) -> list[di
             question = raw.get("question", raw.get("summary", raw.get("text", "")))
             evidence_needed = raw.get("evidence_needed", "")
             resolution = raw.get("resolution", "open")
-            evidence = _observed_evidence_references(raw.get("evidence"), sources)
+            evidence = _observed_evidence_references(raw.get("evidence"), sources, facts)
         if not isinstance(question, str) or not question.strip():
             continue
         if resolution not in {"open", "answered", "inconclusive"}:
             resolution = "open"
-        # A model may update its own question only with an actual observed
-        # source reference; a successful tool call does not perform this update.
+        # A model may update its own question only with actual observed evidence;
+        # a successful tool call alone does not perform this update.
         if resolution != "open" and not evidence:
             resolution = "open"
         item: dict[str, Any] = {
@@ -497,7 +508,7 @@ def _compact_memory_item(item: dict[str, Any]) -> dict[str, Any]:
     if isinstance(evidence, list):
         compact["evidence"] = [
             {key: value for key, value in entry.items()
-             if key in {"path", "sha256", "name", "qualname", "kind", "start_line", "end_line", "module", "local_module"}}
+             if key in {"path", "sha256", "tool", "name", "qualname", "kind", "start_line", "end_line", "module", "local_module"}}
             for entry in evidence[:4] if isinstance(entry, dict)
         ]
     elif isinstance(evidence, dict):
@@ -557,9 +568,9 @@ def _update_work_memory_from_decision(agent: dict[str, Any], decision: dict[str,
     agent["decisions"] = _append_unique(agent["decisions"], assessments)
     for key in ("information_gaps", "open_questions"):
         agent["information_gaps"] = _append_unique(
-            agent["information_gaps"], _memory_question_items(decision.get(key), sources)
+            agent["information_gaps"], _memory_question_items(decision.get(key), sources, agent["facts"])
         )
-    question_updates = _memory_question_items(decision.get("question_updates"), sources)
+    question_updates = _memory_question_items(decision.get("question_updates"), sources, agent["facts"])
     _apply_question_updates(agent, question_updates)
     return {"assessments": assessments, "question_updates": question_updates}
 
