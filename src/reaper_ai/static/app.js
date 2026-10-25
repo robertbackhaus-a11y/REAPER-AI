@@ -205,10 +205,11 @@ function renderEditor() {
   renderFileTree();
 }
 function showWorkspaceView(view) {
-  if (view !== 'chat' && !isCodingContext()) view = 'chat';
-  for (const name of ['chat', 'editor', 'diff']) { $(`${name}-panel`).hidden = view !== name; $(`show-${name}`).classList.toggle('active', view === name); }
+  if (!['chat', 'knowledge'].includes(view) && !isCodingContext()) view = 'chat';
+  for (const name of ['chat', 'editor', 'diff', 'knowledge']) { $(`${name}-panel`).hidden = view !== name; $(`show-${name}`).classList.toggle('active', view === name); }
   if (view === 'editor') renderEditor();
   if (view === 'diff') loadChanges();
+  if (view === 'knowledge') loadKnowledge();
 }
 function treeNode() { return { folders: new Map(), files: [] }; }
 function renderFileTree() {
@@ -616,3 +617,59 @@ const taskBaseSelectProject = selectProject;
 selectProject = async function(projectId) { resetTaskForm(); taskQueue = null; taskQueueKey = ''; $('task-list').replaceChildren(); await taskBaseSelectProject(projectId); await loadTasks(); };
 setInterval(() => { if (activeProject && !document.hidden) loadTasks(); }, 3000);
 loadTasks();
+
+
+// Project knowledge: the durable-memory entries Sentinel receives in later runs.
+// Legacy chats show the global entries without a project.
+let knowledgeItems = [], editingKnowledge = null;
+const knowledgeLabels = { user_decision: 'Entscheidung', verified_result: 'Beobachtet' };
+function knowledgeUrl(suffix = '') { return activeProject ? `/projects/${encodeURIComponent(activeProject)}/memory${suffix}` : `/memory${suffix}`; }
+function knowledgeText(item) { return `[${knowledgeLabels[item.kind] || item.kind}] ${item.content}`; }
+async function loadKnowledge() {
+  const project = activeProject;
+  try {
+    const data = await request(knowledgeUrl('?limit=500')); if (project !== activeProject) return;
+    knowledgeItems = (data.memory || []).filter(item => activeProject || !item.project_id);
+    if (editingKnowledge && !knowledgeItems.some(item => item.id === editingKnowledge)) resetKnowledgeForm();
+    renderKnowledge();
+  } catch (error) { info('knowledge-status', error.message, 'err'); }
+}
+function renderKnowledge() {
+  info('knowledge-status', knowledgeItems.length ? `${knowledgeItems.length} Eintrag/Einträge · ${activeProject ? 'Projekt' : 'Legacy-Chats (global)'}` : 'Noch kein Projektwissen', 'muted');
+  const list = $('knowledge-list'); list.replaceChildren();
+  for (const item of knowledgeItems) {
+    const entry = document.createElement('li'); entry.className = `knowledge-item ${item.kind}${editingKnowledge === item.id ? ' selected' : ''}`;
+    const head = document.createElement('div'); head.className = 'knowledge-meta';
+    const badge = document.createElement('span'); badge.className = 'task-badge'; badge.textContent = knowledgeLabels[item.kind] || item.kind;
+    const date = document.createElement('small'); date.className = 'muted'; date.textContent = new Date(item.created_at).toLocaleString('de-DE');
+    const actions = document.createElement('span'); actions.className = 'task-actions';
+    const action = (label, text, handler) => { const button = document.createElement('button'); button.type = 'button'; button.className = 'secondary icon-button'; button.textContent = text; button.title = label; button.setAttribute('aria-label', label); button.addEventListener('click', event => { event.stopPropagation(); handler(); }); actions.appendChild(button); };
+    action('Kopieren', '⧉', () => copyText(item.content)); action('Bearbeiten', '✎', () => editKnowledge(item)); action('Löschen', '×', () => deleteKnowledge(item));
+    head.append(badge, date, actions);
+    const body = document.createElement('div'); body.className = 'knowledge-content'; body.textContent = item.content;
+    entry.append(head, body); entry.addEventListener('click', () => editKnowledge(item)); list.appendChild(entry);
+  }
+}
+function resetKnowledgeForm() { editingKnowledge = null; $('knowledge-text').value = ''; $('knowledge-save').textContent = 'Hinzufügen'; $('knowledge-cancel').hidden = true; }
+function editKnowledge(item) { editingKnowledge = item.id; $('knowledge-text').value = item.content; $('knowledge-save').textContent = 'Speichern'; $('knowledge-cancel').hidden = false; renderKnowledge(); $('knowledge-text').focus(); }
+async function saveKnowledge() {
+  const content = $('knowledge-text').value.trim(); if (!content) { info('knowledge-status', 'Erkenntnis eingeben', 'err'); return; }
+  try {
+    const edited = Boolean(editingKnowledge);
+    if (edited) await request(knowledgeUrl(`/${editingKnowledge}`), { method: 'PATCH', body: JSON.stringify({ content }) });
+    else await request(knowledgeUrl(), { method: 'POST', body: JSON.stringify({ content }) });
+    resetKnowledgeForm(); await loadKnowledge(); await loadProjectMemory(); info('activity', edited ? 'Wissenseintrag gespeichert' : 'Wissenseintrag hinzugefügt', 'ok');
+  } catch (error) { info('knowledge-status', error.message, 'err'); }
+}
+async function deleteKnowledge(item) {
+  if (!confirm('Diesen Wissenseintrag dauerhaft löschen?')) return;
+  try { await request(knowledgeUrl(`/${item.id}`), { method: 'DELETE' }); if (editingKnowledge === item.id) resetKnowledgeForm(); await loadKnowledge(); await loadProjectMemory(); } catch (error) { info('knowledge-status', error.message, 'err'); }
+}
+$('show-knowledge').addEventListener('click', () => showWorkspaceView('knowledge'));
+$('knowledge-refresh').addEventListener('click', loadKnowledge);
+$('knowledge-copy-all').addEventListener('click', () => copyText(knowledgeItems.map(knowledgeText).join('\n\n')));
+$('knowledge-save').addEventListener('click', saveKnowledge); $('knowledge-cancel').addEventListener('click', () => { resetKnowledgeForm(); renderKnowledge(); });
+$('knowledge-text').addEventListener('keydown', event => { if (event.key === 'Enter' && event.ctrlKey) { event.preventDefault(); saveKnowledge(); } });
+$('save-memory').addEventListener('click', () => { if (!$('knowledge-panel').hidden) setTimeout(loadKnowledge, 300); });
+const knowledgeBaseSelectProject = selectProject;
+selectProject = async function(projectId) { resetKnowledgeForm(); knowledgeItems = []; $('knowledge-list').replaceChildren(); await knowledgeBaseSelectProject(projectId); };

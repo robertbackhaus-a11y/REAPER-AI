@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Literal
 
 import httpx
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -729,11 +729,11 @@ def list_project_conversations(project_id: str):
 
 
 @app.get("/memory")
-def list_memory(workspace: str | None = None, project_id: str | None = None):
+def list_memory(workspace: str | None = None, project_id: str | None = None, limit: int = Query(default=20, ge=1, le=500)):
     try:
         if project_id is not None:
             _project_or_404(project_id)
-        return {"memory": _store.list_memory(workspace, project_id=project_id)}
+        return {"memory": _store.list_memory(workspace, limit, project_id=project_id)}
     except StorageError as exc:
         raise _storage_failure(exc) from exc
 
@@ -755,10 +755,10 @@ def add_memory(request: MemoryRequest):
 
 
 @app.get("/projects/{project_id}/memory")
-def list_project_memory(project_id: str):
+def list_project_memory(project_id: str, limit: int = Query(default=20, ge=1, le=500)):
     _project_or_404(project_id)
     try:
-        return {"memory": _store.list_memory(project_id=project_id)}
+        return {"memory": _store.list_memory(limit=limit, project_id=project_id)}
     except StorageError as exc:
         raise _storage_failure(exc) from exc
 
@@ -771,6 +771,53 @@ def add_project_memory(project_id: str, request: MemoryRequest):
                                  project_id=project_id, verification="user_confirmed")
     except StorageError as exc:
         raise _storage_failure(exc) from exc
+
+
+class MemoryUpdateRequest(BaseModel):
+    content: str = Field(min_length=1, max_length=2_000)
+
+
+def _update_memory(memory_id: int, project_id: str | None, request: MemoryUpdateRequest) -> dict:
+    try:
+        item = _store.update_memory(memory_id, request.content, project_id=project_id)
+    except StorageError as exc:
+        raise _storage_failure(exc) from exc
+    if item is None:
+        raise HTTPException(status_code=404, detail="Unknown knowledge entry")
+    return item
+
+
+def _delete_memory(memory_id: int, project_id: str | None) -> dict:
+    try:
+        deleted = _store.delete_memory(memory_id, project_id=project_id)
+    except StorageError as exc:
+        raise _storage_failure(exc) from exc
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Unknown knowledge entry")
+    return {"deleted": memory_id}
+
+
+@app.patch("/memory/{memory_id}")
+def update_memory(memory_id: int, request: MemoryUpdateRequest):
+    """Edit global (legacy-chat) knowledge; project entries are edited through their project."""
+    return _update_memory(memory_id, None, request)
+
+
+@app.delete("/memory/{memory_id}")
+def delete_memory(memory_id: int):
+    return _delete_memory(memory_id, None)
+
+
+@app.patch("/projects/{project_id}/memory/{memory_id}")
+def update_project_memory(project_id: str, memory_id: int, request: MemoryUpdateRequest):
+    _project_or_404(project_id)
+    return _update_memory(memory_id, project_id, request)
+
+
+@app.delete("/projects/{project_id}/memory/{memory_id}")
+def delete_project_memory(project_id: str, memory_id: int):
+    _project_or_404(project_id)
+    return _delete_memory(memory_id, project_id)
 
 
 @app.post("/runs", status_code=202)

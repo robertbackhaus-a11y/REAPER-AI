@@ -951,6 +951,41 @@ class Store:
             raise StorageError(f"Could not load durable memory: {exc}") from exc
         return [dict(row) for row in rows]
 
+    def _memory_scope(self, connection: sqlite3.Connection, memory_id: int, project_id: str | None) -> dict | None:
+        """Return the entry only when it belongs to the project (or to no project for legacy chats)."""
+        if project_id is None:
+            row = connection.execute("SELECT * FROM durable_memory WHERE id = ? AND project_id IS NULL", (memory_id,)).fetchone()
+        else:
+            row = connection.execute("SELECT * FROM durable_memory WHERE id = ? AND project_id = ?",
+                                     (memory_id, project_id)).fetchone()
+        return dict(row) if row else None
+
+    def update_memory(self, memory_id: int, content: str, project_id: str | None = None) -> dict | None:
+        """Replace an entry's text. A user edit makes it a user-confirmed decision, even if it was observed."""
+        content = content.strip()[:2_000]
+        if not content:
+            raise StorageError("Durable-memory content is empty")
+        try:
+            with self._connect() as connection:
+                if not self._memory_scope(connection, memory_id, project_id):
+                    return None
+                connection.execute(
+                    "UPDATE durable_memory SET content = ?, kind = 'user_decision', verification = 'user_confirmed' "
+                    "WHERE id = ?", (content, memory_id)
+                )
+                return self._memory_scope(connection, memory_id, project_id)
+        except sqlite3.Error as exc:
+            raise StorageError(f"Could not update durable memory: {exc}") from exc
+
+    def delete_memory(self, memory_id: int, project_id: str | None = None) -> bool:
+        try:
+            with self._connect() as connection:
+                if not self._memory_scope(connection, memory_id, project_id):
+                    return False
+                return connection.execute("DELETE FROM durable_memory WHERE id = ?", (memory_id,)).rowcount == 1
+        except sqlite3.Error as exc:
+            raise StorageError(f"Could not delete durable memory: {exc}") from exc
+
     def relevant_memory(self, workspace: str, limit: int = 6, project_id: str | None = None) -> str:
         lines = []
         for item in reversed(self.list_memory(workspace, limit, project_id)):
