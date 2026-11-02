@@ -990,6 +990,14 @@ def _recovery_record(run_id: str) -> tuple[dict, dict | None, bool, str]:
     allowed = {"interrupted", "cancelled", "timed_out"}
     if entry["status"] not in allowed:
         return entry, checkpoint, False, f"Run status {entry['status']} cannot be resumed"
+    # An earlier attempt must not be continued once its conversation has moved on.
+    if entry.get("conversation_id"):
+        try:
+            runs = _store.conversation_runs(entry["conversation_id"])
+        except StorageError as exc:
+            raise _storage_failure(exc) from exc
+        if runs and runs[-1]["run_id"] != run_id:
+            return entry, checkpoint, False, f"A newer run ({runs[-1]['run_id']}) exists in this conversation"
     if checkpoint is None:
         return entry, None, False, "No checkpoint was recorded before interruption"
     if not checkpoint.get("valid"):
@@ -1157,9 +1165,26 @@ class TaskOrderRequest(BaseModel):
     task_ids: list[str] = Field(max_length=1_000)
 
 
+def _task_attempts(task: dict) -> list[dict]:
+    """Every attempt of a task, oldest first: a retry or an edited prompt starts a new
+    run in the task's own conversation, and recovery continues the same run."""
+    runs = _store.conversation_runs(task["conversation_id"]) if task["conversation_id"] else []
+    if task["run_id"] and all(run["run_id"] != task["run_id"] for run in runs):
+        stored = _store.get_run(task["run_id"])
+        if stored:
+            runs.append({key: stored.get(key) for key in ("run_id", "status", "started_at", "finished_at")})
+    for number, run in enumerate(runs, start=1):
+        run.update(attempt=number, current=run["run_id"] == task["run_id"])
+    return runs
+
+
+def _with_attempts(task: dict) -> dict:
+    return {**task, "attempts": _task_attempts(task)}
+
+
 def _task_queue(project_id: str) -> dict:
     try:
-        tasks = _store.list_tasks(project_id)
+        tasks = [_with_attempts(task) for task in _store.list_tasks(project_id)]
         state = _store.task_queue_state(project_id)
     except StorageError as exc:
         raise _storage_failure(exc) from exc
@@ -1380,26 +1405,60 @@ def _run_writes(run_id: str) -> tuple[dict[str, dict], list[str], str]:
     return files, sorted(untracked_tools), source
 
 
+def _task_run_ids(task: dict) -> list[str]:
+    return [attempt["run_id"] for attempt in task["attempts"]]
+
+
+def _task_writes(run_ids: list[str]) -> tuple[dict[str, dict], list[str], list[dict]]:
+    """Merge the writes of all attempts: the first recorded hash before, the last after."""
+    files: dict[str, dict] = {}
+    untracked_tools: set[str] = set()
+    attempts = []
+    for number, run_id in enumerate(run_ids, start=1):
+        run_files, run_tools, source = _run_writes(run_id)
+        entry = _entry(run_id)
+        attempts.append({"attempt": number, "run_id": run_id, "status": entry.get("status"),
+                         "started_at": entry.get("started_at"), "source": source, "files": sorted(run_files)})
+        untracked_tools.update(run_tools)
+        for path, written in run_files.items():
+            item = files.get(path)
+            if item is None:
+                files[path] = {**written, "attempts": [number], "changed_between_attempts": False}
+                continue
+            # Someone edited the file between two attempts: the diff mixes that edit in.
+            if written["before_hash"] != item["after_hash"]:
+                item["changed_between_attempts"] = True
+            item["writes"] += written["writes"]
+            item["after_hash"] = written["after_hash"]
+            item["attempts"].append(number)
+    return files, sorted(untracked_tools), attempts
+
+
 @app.get("/projects/{project_id}/tasks/{task_id}/changes")
 def get_task_changes(project_id: str, task_id: str):
     """Attribute working-tree files to one task without a separate change history.
 
-    A file counts as the task's state only while its content hash still equals the
-    hash the task's last write produced; later edits and files that other tasks
-    also wrote are reported, never silently attributed.
+    All attempts of the task count. A file counts as the task's state only while its
+    content hash still equals the hash the task's last write produced; later edits,
+    edits between attempts and files that other tasks also wrote are reported, never
+    silently attributed.
     """
     project = _coding_project_or_409(project_id)
-    task = _task_or_404(project_id, task_id)
-    if not task["run_id"]:
+    try:
+        task = _with_attempts(_task_or_404(project_id, task_id))
+    except StorageError as exc:
+        raise _storage_failure(exc) from exc
+    run_ids = _task_run_ids(task)
+    if not run_ids:
         return {"task_id": task_id, "run_id": None, "status": task["status"], "files": [],
-                "untracked_tools": [], "source": "none"}
-    files, untracked_tools, source = _run_writes(task["run_id"])
+                "untracked_tools": [], "source": "none", "attempts": []}
+    files, untracked_tools, attempts = _task_writes(run_ids)
     others: dict[str, list[str]] = {}
     for other in _task_queue(project_id)["tasks"]:
-        if other["task_id"] == task_id or not other["run_id"]:
+        if other["task_id"] == task_id:
             continue
         try:
-            other_files = _run_writes(other["run_id"])[0]
+            other_files = _task_writes(_task_run_ids(other))[0]
         except HTTPException:
             continue
         for path in other_files.keys() & files.keys():
@@ -1426,8 +1485,8 @@ def get_task_changes(project_id: str, task_id: str):
         item["diff_path"] = prefix + path
         item["pending"] = item["diff_path"] in pending
         item["other_tasks"] = others.get(path, [])
-    return {"task_id": task_id, "run_id": task["run_id"], "status": task["status"], "source": source,
-            "files": sorted(files.values(), key=lambda item: item["path"]),
+    return {"task_id": task_id, "run_id": run_ids[-1], "status": task["status"], "source": attempts[-1]["source"],
+            "attempts": attempts, "files": sorted(files.values(), key=lambda item: item["path"]),
             "untracked_tools": untracked_tools, "git": bool(changes.get("git"))}
 
 

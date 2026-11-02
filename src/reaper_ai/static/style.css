@@ -313,14 +313,19 @@ h1 { margin: 0; color: #f0f7ff; font-size: 18px; letter-spacing: .01em; }
 .task-controls { display: flex; gap: 6px; flex-wrap: wrap; }
 .task-controls button { padding: 5px 9px; font-size: 12px; }
 .task-list { display: grid; grid-template-columns: minmax(0, 1fr); gap: 4px; overflow-x: hidden; margin: 0; padding: 0; list-style: none; max-height: 26vh; overflow-y: auto; }
-.task-item { display: flex; min-width: 0; align-items: center; gap: 6px; padding: 4px 6px; border: 1px solid #1d3550; border-radius: 7px; font-size: 12px; }
+.task-item { display: flex; flex-wrap: wrap; min-width: 0; align-items: center; gap: 6px; padding: 4px 6px; border: 1px solid #1d3550; border-radius: 7px; font-size: 12px; }
 .task-item.running { border-color: var(--cyan); }
 .task-badge { flex: none; padding: 1px 6px; border-radius: 10px; color: #b9d5ee; background: #12263d; font-size: 11px; }
 .task-item.running .task-badge { color: #08121e; background: var(--cyan); }
 .task-item.completed .task-badge { color: #54e5a9; }
 .task-item.failed .task-badge { color: #ff91a2; }
-.task-title { flex: 1; min-width: 0; padding: 2px 4px; border: 0; color: #cfe3f7; background: transparent; font-weight: 500; text-align: left; overflow: hidden; text-overflow: ellipsis; }
+.task-title { flex: 1 1 0; min-width: 0; padding: 2px 4px; border: 0; color: #cfe3f7; background: transparent; font-weight: 500; text-align: left; overflow: hidden; text-overflow: ellipsis; }
 .task-title:disabled { opacity: 1; cursor: default; }
+.task-attempts { display: flex; flex-wrap: wrap; flex-basis: 100%; align-items: center; gap: 4px; padding-left: 4px; }
+.task-attempt { padding: 0 6px; border: 1px solid #1d3550; border-radius: 10px; color: #9fb9d3; background: transparent; font-size: 11px; }
+.task-attempt.failed, .task-attempt.timed_out, .task-attempt.cancelled, .task-attempt.interrupted { color: #ff91a2; }
+.task-attempt.completed { color: #54e5a9; }
+.task-attempt.current { border-color: var(--cyan); font-weight: 600; }
 .task-actions { display: flex; gap: 2px; flex: none; }
 .task-actions .icon-button { padding: 1px 6px; font-size: 12px; }
 .knowledge-panel[hidden] { display: none; }

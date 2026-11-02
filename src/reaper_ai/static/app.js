@@ -63,7 +63,7 @@ function renderRunSummary(summary) {
 setInterval(() => { if (displayedRun && !terminal.has(displayedRun.status)) setText('run-elapsed', RunStatus.liveStatus(displayedRun, runStats.get(displayedRun.run_id)).elapsed); }, 1000);
 // The right panel always shows the selected chat: its live run while that run is
 // active, otherwise the chat's last recorded run. Events of other runs only update caches.
-function showPanelRun(run, { active = false, action = '' } = {}) { const switched = displayedRun?.run_id !== run.run_id; displayedRun = run; $('active-run').hidden = false; $('no-run').hidden = true; $('active-run-title').textContent = `${active ? 'Aktiver' : 'Letzter'} Run ${run.run_id}`; setAction(action); renderRunPanel(); if (switched) { renderTimeline(run.run_id); renderDiagnostics(run.run_id); } }
+function showPanelRun(run, { active = false, action = '', selected = false } = {}) { const switched = displayedRun?.run_id !== run.run_id; displayedRun = run; $('active-run').hidden = false; $('no-run').hidden = true; $('active-run-title').textContent = `${active ? 'Aktiver' : selected ? 'Ausgewählter' : 'Letzter'} Run ${run.run_id}`; setAction(action); renderRunPanel(); if (switched) { renderTimeline(run.run_id); renderDiagnostics(run.run_id); } }
 function diagnosticRunId(data) { return data?.api_run_id || data?.run_id || displayedRun?.run_id || current?.run_id || ''; }
 function renderDiagnostics(id) { if (!id || displayedRun?.run_id !== id) return; const traces = [...(decisionTraces.get(id)?.values() || [])]; const traceText = traces.length ? JSON.stringify(traces, null, 2) : 'Noch keine Modellentscheidung aufgezeichnet.'; const trace = $('decision-trace'); const context = traceText.length <= 300_000 ? codeLinkContext(displayedRun) : null; if (renderedTrace.text !== traceText || renderedTrace.context !== context || !trace.firstChild) { renderedTrace = { text: traceText, context }; trace.replaceChildren(); appendLinkedText(trace, traceText, context); } const thinking = [...(modelThinking.get(id)?.values() || [])]; const thinkingText = thinking.map(item => item.available ? `Schritt ${item.step} · ${item.model}\n${item.thinking}${item.truncated ? '\n[Thinking gekürzt]' : ''}` : `Schritt ${item.step} · ${item.model}\n${item.reason || 'Kein Ollama-Thinking geliefert.'}`).join('\n\n'); const log = runtimeLogs.get(id) || ''; $('active-log').textContent = [thinkingText, log].filter(Boolean).join(thinkingText && log ? '\n\n--- Laufzeitlog ---\n' : ''); $('active-log').scrollTop = $('active-log').scrollHeight; }
 function recordDiagnostic(type, data, id = diagnosticRunId(data)) { if (!id) return; if (type === 'decision_trace') { const traces = decisionTraces.get(id) || new Map(); traces.set(data.trace_id, { ...(traces.get(data.trace_id) || {}), ...data }); decisionTraces.set(id, traces); } if (type === 'model_thinking') { const thinking = modelThinking.get(id) || new Map(); thinking.set(data.trace_id, data); modelThinking.set(id, thinking); } renderDiagnostics(id); }
@@ -73,7 +73,7 @@ function renderActive() { setRunStatus(current ? current.status || 'running' : '
 function setAction(text) { $('active-action').textContent = text; }
 function stopFeed() { if (stream) { stream.close(); stream = null; } if (poll) { clearInterval(poll); poll = null; } }
 function clearActive() { current = null; stopFeed(); setRunStatus(''); $('start').disabled = false; $('cancel').disabled = true; }
-function showRecordedRun(run) { if (liveRunSelected()) { renderActive(); return; } if (!run) { hidePanelRun(); return; } if (!timelines.has(run.run_id)) eventFeed(run.run_id, { historical: true }); showPanelRun(run, { action: 'Gespeicherter Run – keine Live-Ausführung aktiv.' }); updateLog(run.run_id); }
+function showRecordedRun(run, { selected = false } = {}) { if (liveRunSelected()) { renderActive(); return; } if (!run) { hidePanelRun(); return; } if (!timelines.has(run.run_id)) eventFeed(run.run_id, { historical: true }); showPanelRun(run, { selected, action: 'Gespeicherter Run – keine Live-Ausführung aktiv.' }); updateLog(run.run_id); }
 function timelineEntry(type, data) { const item = document.createElement('div'); item.className = 'event-entry'; const title = document.createElement('strong'); title.textContent = type.replaceAll('_', ' '); const details = document.createElement('span'); const context = codeLinkContext(displayedRun); const target = type === 'tool_started' ? CodeLinks.actionTarget(data.action || {}, context) : null; if (target) { details.append(`${data.tool || 'Werkzeug'} · `); details.appendChild(codeLink(`${target.path}${target.line ? `:${target.line}${target.endLine && target.endLine !== target.line ? `-${target.endLine}` : ''}` : ''}`, target)); } else if (Array.isArray(data.files) && data.files.length && !data.phase && !data.tool && !data.status && !data.next_stage) data.files.forEach((file, index) => { if (index) details.append(', '); const fileTarget = CodeLinks.resolve(String(file), context, { force: true }); if (fileTarget) details.appendChild(codeLink(String(file), fileTarget)); else details.append(String(file)); }); else appendLinkedText(details, data.phase || data.tool || data.status || data.next_stage || (data.model || ''), context); item.append(title, details); return item; }
 function refreshPanelLinks() { if (!displayedRun) return; renderTimeline(displayedRun.run_id); renderDiagnostics(displayedRun.run_id); renderRunPanel(); }
 function renderTimeline(id) { const box = $('active-timeline'); box.replaceChildren(...(timelines.get(id) || []).map(([type, data]) => timelineEntry(type, data))); box.scrollTop = box.scrollHeight; }
@@ -342,7 +342,7 @@ function renderDiffList() {
     text.append(name, dir); button.append(badge, text); button.addEventListener('click', () => showFileDiff(item.path));
     const mark = diffState.mode === 'worktree' ? taskChanges?.byPath.get(item.path) : null;
     if (mark) {
-      const own = mark.state === 'as_left' && !mark.other_tasks.length, note = taskFileNote(mark);
+      const own = taskFileOwn(mark), note = taskFileNote(mark);
       button.classList.add('task-file', own ? 'task-own' : 'task-mixed'); button.title += `\nAufgabe „${taskChanges.title}“: ${note}`;
       const tag = document.createElement('span'); tag.className = 'task-file-tag'; tag.textContent = own ? 'Aufgabe' : 'Aufgabe?'; tag.title = note; button.appendChild(tag);
     }
@@ -664,11 +664,33 @@ function renderTasks() {
     const locked = task.status === 'running';
     action('Nach oben', '↑', () => moveTask(index, -1), index === 0);
     action('Nach unten', '↓', () => moveTask(index, 1), index === tasks.length - 1);
-    action(task.run_id ? 'Änderungen ansehen: von dieser Aufgabe geschriebene Dateien im Diff hervorheben' : 'Änderungen ansehen (noch nicht gestartet)', '±', () => showTaskChanges(task), !task.run_id);
+    const started = (task.attempts || []).length > 0;
+    action(started ? 'Änderungen ansehen: von allen Versuchen dieser Aufgabe geschriebene Dateien im Diff hervorheben' : 'Änderungen ansehen (noch nicht gestartet)', '±', () => showTaskChanges(task), !started);
     action('Bearbeiten', '✎', () => editTask(task), locked || task.status === 'completed');
     action('Löschen', '×', () => deleteTask(task), locked);
     item.append(badge, title, actions); list.appendChild(item);
+    if (task.attempts?.length > 1 || task.attempts?.some(attempt => !attempt.current)) item.appendChild(taskAttemptRow(task));
   });
+}
+// Earlier runs of a task stay in its conversation; each attempt opens that run in the run panel.
+function taskAttemptRow(task) {
+  const row = document.createElement('div'); row.className = 'task-attempts';
+  const label = document.createElement('small'); label.className = 'muted'; label.textContent = 'Versuche:'; row.appendChild(label);
+  for (const attempt of task.attempts) {
+    const button = document.createElement('button'); button.type = 'button'; button.className = `task-attempt ${attempt.status}${attempt.current ? ' current' : ''}`;
+    button.textContent = `#${attempt.attempt} ${RunStatus.statusLabel(attempt.status)}${attempt.current ? ' · aktuell' : ''}`;
+    button.title = `Run ${attempt.run_id} · gestartet ${attempt.started_at || '?'}${attempt.finished_at ? ` · beendet ${attempt.finished_at}` : ''}
+${attempt.current ? 'Aktueller Run der Aufgabe' : 'Früherer Versuch'} – im Run-Panel öffnen`;
+    button.addEventListener('click', () => openTaskAttempt(task, attempt)); row.appendChild(button);
+  }
+  return row;
+}
+async function openTaskAttempt(task, attempt) {
+  try {
+    if (task.conversation_id !== conversationId) await conversations(task.conversation_id);
+    if (current?.run_id === attempt.run_id) { renderActive(); return; }
+    showRecordedRun(await request(`/runs/${encodeURIComponent(attempt.run_id)}`), { selected: attempt !== task.attempts.at(-1) });
+  } catch (error) { info('task-progress', error.message, 'err'); }
 }
 function resetTaskForm() { editingTask = ''; $('task-new').value = ''; $('task-add').textContent = 'Hinzufügen'; $('task-edit-cancel').hidden = true; }
 function editTask(task) { editingTask = task.task_id; $('task-new').value = task.prompt; $('task-add').textContent = 'Speichern'; $('task-edit-cancel').hidden = false; $('task-new').focus(); }
@@ -687,10 +709,17 @@ const taskBaseSelectProject = selectProject;
 selectProject = async function(projectId) { resetTaskForm(); taskQueue = null; taskQueueKey = ''; taskChanges = null; $('task-list').replaceChildren(); await taskBaseSelectProject(projectId); await loadTasks(); };
 
 // „Änderungen ansehen“: the API attributes files to a task only from the write_file /
-// apply_patch records of its run and compares their last content hash with the
-// working tree. Commit and push stay the Diff tab's own explicit actions.
+// apply_patch records of all its runs (attempts) and compares their last content hash
+// with the working tree. Commit and push stay the Diff tab's own explicit actions.
 const taskFileStates = { as_left: 'unverändert seit der Aufgabe', changed_since: 'seit der Aufgabe weiter geändert, der Diff enthält fremde Änderungen', missing: 'Datei existiert nicht mehr' };
-function taskFileNote(file) { return `${taskFileStates[file.state] || file.state}${file.other_tasks.length ? ` · auch geschrieben von: ${file.other_tasks.join(', ')}` : ''}`; }
+function taskFileOwn(file) { return file.state === 'as_left' && !file.other_tasks.length && !file.changed_between_attempts; }
+function taskFileNote(file) {
+  const notes = [taskFileStates[file.state] || file.state];
+  if ((taskChanges?.data?.attempts?.length || 0) > 1) notes.push(`geschrieben in Versuch ${file.attempts.join(', ')}`);
+  if (file.changed_between_attempts) notes.push('zwischen zwei Versuchen fremd geändert, der Diff enthält diese Änderung');
+  if (file.other_tasks.length) notes.push(`auch geschrieben von: ${file.other_tasks.join(', ')}`);
+  return notes.join(' · ');
+}
 async function loadTaskChanges(task, load = diffLoad) {
   try {
     const data = await request(tasksUrl(`/${encodeURIComponent(task.task_id)}/changes`));
@@ -715,10 +744,12 @@ function renderTaskChanges() {
   const line = (text, cls = 'muted') => { const item = document.createElement('small'); item.className = cls; item.textContent = text; box.appendChild(item); };
   if (!data) { line(taskChanges.error ? `Änderungen der Aufgabe nicht verfügbar: ${taskChanges.error}` : 'Wird geladen …', taskChanges.error ? 'err' : 'muted'); return; }
   const listed = new Set(diffFiles.map(item => item.path));
-  const shown = data.files.filter(file => listed.has(file.diff_path)), own = shown.filter(file => file.state === 'as_left' && !file.other_tasks.length);
-  line(data.files.length ? `${data.files.length} von Sentinel geschriebene Datei(en) · ${shown.length} mit offener Änderung hervorgehoben` : 'Der Run hat keine Dateien über write_file/apply_patch geschrieben.', data.files.length ? 'muted' : 'ok');
+  const shown = data.files.filter(file => listed.has(file.diff_path)), own = shown.filter(taskFileOwn);
+  const attempts = data.attempts || [];
+  if (attempts.length > 1) line(`${attempts.length} Versuche: ${attempts.map(item => `${item.attempt} (${item.status}, ${item.files.length} Datei(en))`).join(' · ')}`);
+  line(data.files.length ? `${data.files.length} von Sentinel geschriebene Datei(en) · ${shown.length} mit offener Änderung hervorgehoben` : `${attempts.length > 1 ? 'Kein Versuch hat' : 'Der Run hat keine'} Dateien über write_file/apply_patch geschrieben.`, data.files.length ? 'muted' : 'ok');
   if (data.status === 'running') line('Aufgabe läuft noch: Stand des letzten Checkpoints.');
-  if (shown.length > own.length) line(`${shown.length - own.length} Datei(en) nicht eindeutig zuzuordnen (später geändert oder auch von anderen Aufgaben geschrieben). Diff vor dem Commit prüfen.`, 'err');
+  if (shown.length > own.length) line(`${shown.length - own.length} Datei(en) nicht eindeutig zuzuordnen (später oder zwischen Versuchen geändert oder auch von anderen Aufgaben geschrieben). Diff vor dem Commit prüfen.`, 'err');
   for (const file of data.files.filter(file => !listed.has(file.diff_path))) line(`${file.path}: ${file.state === 'missing' ? 'gelöscht' : 'keine offene Änderung (bereits committet oder zurückgesetzt)'}`);
   if (data.untracked_tools.length) line(`Der Run hat ${data.untracked_tools.join(', ')} genutzt; dadurch geänderte Dateien sind nicht aufgezeichnet und werden nicht hervorgehoben.`, 'err');
   if (commitEnabled() && own.length) {

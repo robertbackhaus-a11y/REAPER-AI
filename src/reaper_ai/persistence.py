@@ -1168,6 +1168,18 @@ class Store:
             raise StorageError(f"Could not load run: {exc}") from exc
         return self._run_from_row(row) if row else None
 
+    def conversation_runs(self, conversation_id: str) -> list[dict]:
+        """Run ids and status of one conversation, oldest first, without results."""
+        try:
+            with self._connect() as connection:
+                rows = connection.execute(
+                    "SELECT run_id, status, started_at, finished_at FROM runs WHERE conversation_id = ? "
+                    "ORDER BY started_at, rowid", (conversation_id,)
+                ).fetchall()
+        except sqlite3.Error as exc:
+            raise StorageError(f"Could not list conversation runs: {exc}") from exc
+        return [dict(row) for row in rows]
+
     def list_events(self, run_id: str) -> list[dict]:
         try:
             with self._connect() as connection:
