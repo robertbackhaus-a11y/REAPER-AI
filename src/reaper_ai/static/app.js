@@ -296,6 +296,7 @@ async function saveEditorFile() {
 // parent, or a release tag against HEAD (optionally with uncommitted changes).
 // Only the GET change endpoints are called, so user changes are never touched.
 let diffFiles = [], activeDiffFile = '', diffRefreshTimer = null, diffRefs = null, diffLoad = 0;
+let gitStatus = null, gitBusy = false; const commitSelection = new Set();
 const diffState = { mode: 'worktree', commit: '', release: '' };
 const diffWidthKey = 'reaper-ai-diff-list-width';
 const diffStatusLabels = { modified: ['M', 'geändert'], added: ['A', 'hinzugefügt'], deleted: ['D', 'gelöscht'], renamed: ['R', 'umbenannt'], copied: ['C', 'kopiert'], conflict: ['U', 'Konflikt'], untracked: ['?', 'neu, ungetrackt'] };
@@ -337,10 +338,15 @@ function renderDiffList() {
     const text = document.createElement('span'); text.className = 'diff-file-text';
     const name = document.createElement('span'); name.className = 'diff-file-name'; name.textContent = item.path.slice(slash + 1);
     const dir = document.createElement('span'); dir.className = 'diff-file-dir'; dir.textContent = slash >= 0 ? item.path.slice(0, slash) : '.';
-    text.append(name, dir); button.append(badge, text); button.addEventListener('click', () => showFileDiff(item.path)); list.appendChild(button);
+    text.append(name, dir); button.append(badge, text); button.addEventListener('click', () => showFileDiff(item.path));
+    if (!commitEnabled()) { list.appendChild(button); continue; }
+    const row = document.createElement('div'); row.className = 'diff-row';
+    const check = document.createElement('input'); check.type = 'checkbox'; check.className = 'diff-check'; check.checked = commitSelection.has(item.path); check.title = 'Für den Commit auswählen';
+    check.addEventListener('change', () => { if (check.checked) commitSelection.add(item.path); else commitSelection.delete(item.path); renderGitBox(); });
+    row.append(check, button); list.appendChild(row);
   }
 }
-function resetDiffView(message = 'Keine Datei gewählt') { activeDiffFile = ''; $('diff-path').textContent = message; $('diff-content').replaceChildren(); setDiffNavigation(); }
+function resetDiffView(message = 'Keine Datei gewählt') { activeDiffFile = ''; $('diff-path').textContent = message; $('diff-content').replaceChildren(); setDiffNavigation(); renderGitBox(); }
 function diffQuery() {
   const params = new URLSearchParams({ mode: diffState.mode });
   if (diffState.mode === 'worktree') params.set('untracked', $('diff-untracked').checked);
@@ -377,14 +383,63 @@ async function loadChanges({ refs = false } = {}) {
   try {
     const data = await request(`/projects/${encodeURIComponent(activeProject)}/changes?${diffQuery()}`);
     if (load !== diffLoad) return;
-    if (!data.git) { diffFiles = []; renderDiffList(); resetDiffView(); info('diff-summary', 'Workspace ist kein Git-Repository.', 'err'); return; }
+    if (!data.git) { diffFiles = []; gitStatus = null; renderDiffList(); resetDiffView(); info('diff-summary', 'Workspace ist kein Git-Repository.', 'err'); return; }
     diffFiles = data.files || [];
+    for (const path of [...commitSelection]) if (!diffFiles.some(item => item.path === path)) commitSelection.delete(path);
     info('diff-summary', diffFiles.length ? `${data.total} geänderte Datei(en)${data.truncated ? `, erste ${diffFiles.length} angezeigt` : ''}` : 'Keine Änderungen in diesem Vergleich.', diffFiles.length ? 'muted' : 'ok');
     if (!diffFiles.some(item => item.path === activeDiffFile)) resetDiffView(diffFiles.length ? 'Datei links auswählen' : 'Keine Datei gewählt');
+    if (diffState.mode === 'worktree') await loadGitStatus(load); else renderGitBox();
+    if (load !== diffLoad) return;
     renderDiffList();
     if (activeDiffFile) await showFileDiff(activeDiffFile);
   } catch (error) { if (load === diffLoad) info('diff-summary', `Änderungen nicht verfügbar: ${error.message}`, 'err'); }
 }
+
+// Commit and push from the Diff tab: only in the working-tree comparison of a coding
+// project with a Git repository, and only on an explicit click. The backend commits
+// exactly the selected paths (`git commit --only`); other staged files stay staged.
+function commitEnabled() { return diffState.mode === 'worktree' && isCodingContext() && Boolean(gitStatus?.git); }
+async function loadGitStatus(load = diffLoad) {
+  try { const data = await request(`/projects/${encodeURIComponent(activeProject)}/git`); if (load === diffLoad) gitStatus = data; }
+  catch (error) { if (load === diffLoad) { gitStatus = null; showGitOutput(`Git-Status nicht verfügbar: ${error.message}`, 'err'); } }
+  renderGitBox();
+}
+function renderGitBox() {
+  const enabled = commitEnabled(); $('git-box').hidden = !enabled; if (!enabled) return;
+  const status = gitStatus;
+  $('git-branch').textContent = status.detached ? `⎇ losgelöster HEAD ${status.head ? status.head.slice(0, 8) : ''}` : `⎇ ${status.branch}${status.upstream ? ` → ${status.upstream}` : ''}`;
+  const pending = !status.head ? 'noch keine Commits' : !status.remotes.length ? 'kein Remote konfiguriert' : !status.upstream ? 'kein Upstream, Push setzt ihn' : `${status.ahead} ausstehende(r) Commit(s)${status.behind ? ` · ${status.behind} hinter Remote` : ''}`;
+  $('git-pending').textContent = `· ${pending}`;
+  const total = diffFiles.length, selected = commitSelection.size;
+  const all = $('commit-select-all'); all.checked = total > 0 && selected === total; all.indeterminate = selected > 0 && selected < total; all.disabled = !total || gitBusy;
+  const selectedOld = new Set(diffFiles.filter(item => item.old_path && commitSelection.has(item.path)).map(item => item.old_path));
+  const otherStaged = (status.staged || []).filter(path => !commitSelection.has(path) && !selectedOld.has(path));
+  info('git-selection', `${selected} von ${total} Datei(en) ausgewählt${otherStaged.length ? ` · ${otherStaged.length} weitere gestagte Datei(en) bleiben gestagt und werden nicht committet` : ''}`);
+  $('git-commit').disabled = gitBusy || !selected || !$('commit-message').value.trim();
+  const canPush = !status.detached && status.remotes.length > 0;
+  $('git-push').disabled = gitBusy || !canPush; $('git-push').textContent = status.ahead ? `Push (${status.ahead})` : 'Push';
+  $('commit-push').disabled = gitBusy || !canPush; if (!canPush) $('commit-push').checked = false;
+}
+function showGitOutput(text, cls = '') { const output = $('git-output'); output.hidden = !text; output.textContent = text; output.className = `git-output ${cls}`.trim(); }
+function gitStepsText(result) { return (result.steps || []).map(step => `$ ${step.command}${step.ok ? '' : `  (Exit-Code ${step.exit_code})`}\n${step.output || (step.ok ? 'OK' : '')}`).join('\n\n'); }
+async function runGitAction(label, url, body) {
+  gitBusy = true; renderGitBox(); showGitOutput(`${label} läuft …`);
+  try {
+    const result = await request(url, { method: 'POST', body: body ? JSON.stringify(body) : undefined });
+    const pushFailed = Boolean(body?.push) && result.ok && result.pushed === false;
+    let text = gitStepsText(result);
+    if (result.push_error) text += `${text ? '\n\n' : ''}Push nicht ausgeführt: ${result.push_error}`;
+    if (result.ok && result.commit) text = `Commit ${result.commit.slice(0, 8)} erstellt (${result.files} Datei(en)).\n\n${text}`;
+    showGitOutput(text || (result.ok ? `${label} erfolgreich.` : `${label} fehlgeschlagen.`), result.ok && !pushFailed ? 'ok' : 'err');
+    if (result.ok && result.commit) { commitSelection.clear(); $('commit-message').value = ''; }
+  } catch (error) { showGitOutput(`${label} fehlgeschlagen: ${error.message}`, 'err'); }
+  finally { gitBusy = false; diffRefs = null; await loadChanges(); }
+}
+function commitSelected() {
+  if (gitBusy || !commitSelection.size) return;
+  return runGitAction('Commit', `/projects/${encodeURIComponent(activeProject)}/git/commit`, { paths: [...commitSelection], message: $('commit-message').value, push: $('commit-push').checked });
+}
+function pushBranch() { if (!gitBusy) return runGitAction('Push', `/projects/${encodeURIComponent(activeProject)}/git/push`); }
 async function showFileDiff(path) {
   if (!activeProject) return;
   activeDiffFile = path; renderDiffList(); $('diff-path').textContent = path; setDiffNavigation();
@@ -420,7 +475,7 @@ function setupDiffResizer() {
 }
 
 const baseSelectProject = selectProject;
-selectProject = async function(projectId) { $('file-tree')._files = []; $('file-tree').innerHTML = '<p class="muted">Dateibaum wird geladen …</p>'; await baseSelectProject(projectId); editorFiles.clear(); activeEditorFile = ''; diffFiles = []; diffRefs = null; diffState.commit = ''; diffState.release = ''; resetDiffView(); showWorkspaceView('chat'); await loadFileTree(); };
+selectProject = async function(projectId) { $('file-tree')._files = []; $('file-tree').innerHTML = '<p class="muted">Dateibaum wird geladen …</p>'; await baseSelectProject(projectId); editorFiles.clear(); activeEditorFile = ''; diffFiles = []; diffRefs = null; gitStatus = null; commitSelection.clear(); $('commit-message').value = ''; showGitOutput(''); diffState.commit = ''; diffState.release = ''; resetDiffView(); showWorkspaceView('chat'); await loadFileTree(); };
 const baseHandleEvent = handleEvent;
 handleEvent = function(type, data, id, historical = false) { baseHandleEvent(type, data, id, historical); if (!historical && ['tool_completed', 'files_changed', 'run_completed'].includes(type)) scheduleDiffRefresh(); };
 setupDiffResizer();
@@ -432,6 +487,11 @@ $('diff-mode').addEventListener('change', event => { diffState.mode = event.targ
 $('diff-ref').addEventListener('change', event => { diffState[diffState.mode] = event.target.value; loadChanges(); });
 $('diff-untracked').addEventListener('change', () => loadChanges());
 $('diff-worktree').addEventListener('change', () => loadChanges());
+$('commit-select-all').addEventListener('change', event => { commitSelection.clear(); if (event.target.checked) for (const item of diffFiles) commitSelection.add(item.path); renderDiffList(); renderGitBox(); });
+$('commit-message').addEventListener('input', renderGitBox);
+$('commit-message').addEventListener('keydown', event => { if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) { event.preventDefault(); if (!$('git-commit').disabled) commitSelected(); } });
+$('git-commit').addEventListener('click', commitSelected);
+$('git-push').addEventListener('click', pushBranch);
 $('refresh-file-tree').addEventListener('click', loadFileTree);
 $('show-chat').addEventListener('click', () => showWorkspaceView('chat'));
 $('show-editor').addEventListener('click', () => showWorkspaceView('editor'));

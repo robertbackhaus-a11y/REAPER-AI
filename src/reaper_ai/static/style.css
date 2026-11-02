@@ -120,6 +120,22 @@ h1 { margin: 0; color: #f0f7ff; font-size: 18px; letter-spacing: .01em; }
 .diff-files-head { display: flex; align-items: center; justify-content: space-between; padding: 0 4px; color: #d8eaff; }
 .diff-files > small { padding: 0 4px; font-size: 11px; }
 .diff-file-list { flex: 1; min-height: 0; overflow: auto; scrollbar-color: #315b82 transparent; }
+.git-box { display: grid; gap: 6px; padding: 6px 4px 8px; border-bottom: 1px solid #213b57; }
+.git-box[hidden] { display: none; }
+.git-branch-row { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px; font-size: 12px; }
+.git-branch { color: #d8eaff; font-family: "Cascadia Code", Consolas, monospace; overflow-wrap: anywhere; }
+.git-box textarea { padding: 6px 8px; font-size: 12px; }
+.git-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.git-actions button { padding: 4px 10px; font-size: 12px; }
+.git-actions button:first-of-type { margin-left: auto; }
+.git-box > small { font-size: 11px; }
+.git-output { max-height: 160px; margin: 0; padding: 6px 8px; overflow: auto; border: 1px solid #213b57; border-radius: 6px; color: #b9cde2; background: #07111d; font-family: "Cascadia Code", Consolas, monospace; font-size: 11px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.git-output.err { border-color: #ff5e7888; color: #ffb8c1; }
+.git-output.ok { border-color: #22d89066; }
+.git-output[hidden] { display: none; }
+.diff-row { display: flex; align-items: center; gap: 2px; }
+.diff-row .diff-file { flex: 1; min-width: 0; }
+.diff-check { flex: 0 0 auto; width: auto; margin: 0 2px 0 4px; accent-color: var(--cyan); }
 .diff-resizer { cursor: col-resize; border-left: 1px solid #213b57; background: #0a1522; touch-action: none; }
 .diff-resizer:hover, .diff-resizer:focus-visible, .diff-resizer.dragging { outline: none; border-left-color: var(--cyan); background: #12345e; }
 .diff-file { display: flex; align-items: center; gap: 7px; width: 100%; padding: 5px 6px; border: 0; border-radius: 6px; color: #b6cee7; background: transparent; font-weight: 500; text-align: left; }

@@ -555,6 +555,56 @@ def get_project_change_diff(project_id: str, path: str, mode: str = "worktree", 
     return result
 
 
+# Git commit and push from the Diff tab. Both happen only on an explicit user
+# action; the agent's own Git tools are unaffected.
+class GitCommitRequest(BaseModel):
+    paths: list[str] = Field(min_length=1, max_length=10_000)
+    message: str = Field(max_length=20_000)
+    push: bool = False
+
+
+def _git_failure(result: dict) -> None:
+    """Validation problems become HTTP errors; Git's own failures are returned with their output."""
+    if not result.get("ok") and "steps" not in result:
+        raise HTTPException(status_code=400, detail=result.get("error", "Git command failed"))
+
+
+@app.get("/projects/{project_id}/git")
+def get_project_git_status(project_id: str):
+    """Return branch, upstream, pending commits, and staged paths of the project repository."""
+    project = _coding_project_or_409(project_id)
+    result = tools.git_branch_status(project["workspace"])
+    if not result.get("ok"):
+        raise HTTPException(status_code=500, detail=f"Git status failed: {result.get('error', '')}")
+    return result
+
+
+@app.post("/projects/{project_id}/git/commit")
+def commit_project_changes(project_id: str, request: GitCommitRequest):
+    """Commit the selected changed files and optionally push the branch afterwards."""
+    project = _coding_project_or_409(project_id)
+    if not request.message.strip():
+        raise HTTPException(status_code=422, detail="Commit message is required")
+    result = tools.git_commit_files(project["workspace"], request.paths, request.message)
+    _git_failure(result)
+    if result["ok"] and request.push:
+        pushed = tools.git_push(project["workspace"])
+        result["pushed"] = pushed["ok"]
+        result["steps"] = result["steps"] + pushed.get("steps", [])
+        if not pushed["ok"] and "steps" not in pushed:
+            result["push_error"] = pushed.get("error", "Push failed")
+    return result
+
+
+@app.post("/projects/{project_id}/git/push")
+def push_project_branch(project_id: str):
+    """Push the current branch to its configured remote."""
+    project = _coding_project_or_409(project_id)
+    result = tools.git_push(project["workspace"])
+    _git_failure(result)
+    return result
+
+
 # P05: global MCP server management. Every change is written straight to the
 # central mcp.json; the next run reads it, while a running run keeps the
 # definitions it captured at start.

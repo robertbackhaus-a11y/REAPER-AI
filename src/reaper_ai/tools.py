@@ -516,6 +516,124 @@ def git_file_diff(workspace: str, path: str, mode: str = "worktree", ref: str | 
             "truncated": len(proc.stdout) > max_bytes}
 
 
+def _git_write(args: list[str], cwd: str | Path, stdin: bytes | None = None,
+               timeout: int = 120) -> subprocess.CompletedProcess:
+    """Run a user-initiated Git command with the user's Git configuration.
+
+    Credential helpers and hooks work as on the command line; terminal prompts
+    are disabled so a missing credential fails instead of hanging the API.
+    """
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    return subprocess.run(["git", "--literal-pathspecs", *args], cwd=cwd, input=stdin,
+                          capture_output=True, timeout=timeout, env=env)
+
+
+def _git_step(command: str, proc: subprocess.CompletedProcess) -> dict:
+    output = "\n".join(part for part in (_git_text(proc), _git_text(proc, "stderr")) if part)
+    return {"command": command, "ok": proc.returncode == 0, "exit_code": proc.returncode, "output": output}
+
+
+def git_branch_status(workspace: str) -> dict:
+    """Return branch, upstream, ahead/behind counts, remotes, and staged paths (read-only)."""
+    try:
+        top = _git_read(["rev-parse", "--show-toplevel"], workspace)
+        if top.returncode:
+            return {"ok": True, "git": False}
+        root = _git_text(top)
+        branch = _git_text(_git_read(["branch", "--show-current"], root)) or None
+        head = _git_read(["rev-parse", "--verify", "--quiet", "HEAD"], root)
+        upstream_proc = _git_read(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"], root)
+        upstream = _git_text(upstream_proc) if upstream_proc.returncode == 0 else None
+        ahead = behind = None
+        if upstream:
+            counts = _git_read(["rev-list", "--left-right", "--count", "@{upstream}...HEAD"], root)
+            if counts.returncode == 0:
+                behind, ahead = (int(value) for value in _git_text(counts).split())
+        remotes = _git_text(_git_read(["remote"], root)).splitlines()
+        staged = _git_read(["diff", "--cached", "--name-only", "-z", "--no-renames"], root)
+    except (OSError, subprocess.TimeoutExpired, ValueError) as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "git": True, "root": root, "branch": branch, "detached": branch is None,
+            "head": _git_text(head) or None, "upstream": upstream, "ahead": ahead, "behind": behind,
+            "remotes": remotes,
+            "staged": [path for path in staged.stdout.decode("utf-8", "replace").split("\0") if path]}
+
+
+def git_commit_files(workspace: str, paths: list[str], message: str) -> dict:
+    """Commit exactly the selected working-tree changes of *workspace*.
+
+    Only paths listed by the worktree comparison are accepted. Selected
+    untracked files are added first; ``git commit --only`` then records the
+    working-tree state of the selected paths and leaves every other index
+    entry (including changes staged for other files) staged but uncommitted.
+    If the commit fails, files this call added are removed from the index again.
+    """
+    changes = git_changes(workspace, "worktree", max_files=1_000_000)
+    if not changes.get("ok"):
+        return changes
+    if not changes.get("git"):
+        return {"ok": False, "error": "Workspace is not a Git repository"}
+    entries = {item["path"]: item for item in changes["files"]}
+    unknown = [path for path in paths if path not in entries]
+    if unknown:
+        return {"ok": False, "error": f"Not a changed file of this workspace: {', '.join(unknown[:5])}"}
+    selected = [entries[path] for path in dict.fromkeys(paths)]
+    pathspecs = list(dict.fromkeys(
+        name for item in selected for name in (item["path"], item["old_path"]) if name))
+    untracked = [item["path"] for item in selected if item["status"] == "untracked"]
+    root, steps = changes["root"], []
+    try:
+        if untracked:
+            added = _git_write(["add", "--pathspec-from-file=-", "--pathspec-file-nul"], root,
+                               "\0".join(untracked).encode("utf-8"))
+            steps.append(_git_step(f"git add ({len(untracked)} untracked file(s))", added))
+            if added.returncode:
+                return {"ok": False, "steps": steps}
+        commit = _git_write(["commit", "--only", "-m", message, "--pathspec-from-file=-",
+                             "--pathspec-file-nul"], root, "\0".join(pathspecs).encode("utf-8"))
+        steps.append(_git_step(f"git commit --only ({len(pathspecs)} path(s))", commit))
+        if commit.returncode:
+            if untracked:
+                undo = _git_write(["rm", "--cached", "--quiet", "--pathspec-from-file=-",
+                                   "--pathspec-file-nul"], root, "\0".join(untracked).encode("utf-8"))
+                steps.append(_git_step("git rm --cached (undo add of untracked files)", undo))
+            return {"ok": False, "steps": steps}
+        head = _git_text(_git_read(["rev-parse", "HEAD"], root))
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"ok": False, "error": str(exc), "steps": steps}
+    return {"ok": True, "commit": head, "files": len(selected), "steps": steps}
+
+
+def git_push(workspace: str) -> dict:
+    """Push the current branch to its upstream with the user's Git configuration.
+
+    Without an upstream the branch is pushed to the only configured remote and
+    tracked from then on (``--set-upstream``); otherwise Git's own error is shown.
+    """
+    status = git_branch_status(workspace)
+    if not status.get("ok"):
+        return status
+    if not status.get("git"):
+        return {"ok": False, "error": "Workspace is not a Git repository"}
+    if status["detached"]:
+        return {"ok": False, "error": "Detached HEAD: check out a branch before pushing"}
+    if not status["remotes"]:
+        return {"ok": False, "error": "No Git remote is configured"}
+    args, command = ["push"], "git push"
+    if not status["upstream"]:
+        if len(status["remotes"]) != 1:
+            return {"ok": False, "error": "Branch has no upstream and several remotes exist; "
+                                          "set one with `git push -u <remote> <branch>`"}
+        remote, branch = status["remotes"][0], status["branch"]
+        args += ["--set-upstream", remote, branch]
+        command = f"git push --set-upstream {remote} {branch}"
+    try:
+        proc = _git_write(args, status["root"])
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": proc.returncode == 0, "steps": [_git_step(command, proc)]}
+
+
 def git_diff(workspace: str) -> dict:
     try:
         result = subprocess.run(
