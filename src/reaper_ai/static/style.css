@@ -337,3 +337,12 @@ h1 { margin: 0; color: #f0f7ff; font-size: 18px; letter-spacing: .01em; }
 .knowledge-meta { display: flex; align-items: center; gap: 8px; }
 .knowledge-meta .task-actions { margin-left: auto; }
 .knowledge-content { color: #cfe3f7; font-size: 13px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.task-changes[hidden] { display: none; }
+.task-changes { display: grid; gap: 4px; margin: 6px 0; padding: 7px 8px; border: 1px solid #2c5a7f; border-radius: 8px; background: #0b1d30; font-size: 12px; }
+.task-changes-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+.task-changes-head strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.task-changes button:not(.icon-button) { justify-self: start; padding: 4px 9px; font-size: 12px; }
+.diff-file.task-own { box-shadow: inset 3px 0 #54e5a9; }
+.diff-file.task-mixed { box-shadow: inset 3px 0 #f2c14e; }
+.task-file-tag { flex: none; margin-left: auto; padding: 0 5px; border-radius: 9px; color: #08121e; background: #54e5a9; font-size: 10px; font-weight: 650; }
+.task-mixed .task-file-tag { background: #f2c14e; }

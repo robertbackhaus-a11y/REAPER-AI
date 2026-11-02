@@ -297,6 +297,7 @@ async function saveEditorFile() {
 // Only the GET change endpoints are called, so user changes are never touched.
 let diffFiles = [], activeDiffFile = '', diffRefreshTimer = null, diffRefs = null, diffLoad = 0;
 let gitStatus = null, gitBusy = false; const commitSelection = new Set();
+let taskChanges = null; // files of the task chosen via „Änderungen ansehen“, highlighted in the working-tree list
 const diffState = { mode: 'worktree', commit: '', release: '' };
 const diffWidthKey = 'reaper-ai-diff-list-width';
 const diffStatusLabels = { modified: ['M', 'geändert'], added: ['A', 'hinzugefügt'], deleted: ['D', 'gelöscht'], renamed: ['R', 'umbenannt'], copied: ['C', 'kopiert'], conflict: ['U', 'Konflikt'], untracked: ['?', 'neu, ungetrackt'] };
@@ -339,12 +340,19 @@ function renderDiffList() {
     const name = document.createElement('span'); name.className = 'diff-file-name'; name.textContent = item.path.slice(slash + 1);
     const dir = document.createElement('span'); dir.className = 'diff-file-dir'; dir.textContent = slash >= 0 ? item.path.slice(0, slash) : '.';
     text.append(name, dir); button.append(badge, text); button.addEventListener('click', () => showFileDiff(item.path));
+    const mark = diffState.mode === 'worktree' ? taskChanges?.byPath.get(item.path) : null;
+    if (mark) {
+      const own = mark.state === 'as_left' && !mark.other_tasks.length, note = taskFileNote(mark);
+      button.classList.add('task-file', own ? 'task-own' : 'task-mixed'); button.title += `\nAufgabe „${taskChanges.title}“: ${note}`;
+      const tag = document.createElement('span'); tag.className = 'task-file-tag'; tag.textContent = own ? 'Aufgabe' : 'Aufgabe?'; tag.title = note; button.appendChild(tag);
+    }
     if (!commitEnabled()) { list.appendChild(button); continue; }
     const row = document.createElement('div'); row.className = 'diff-row';
     const check = document.createElement('input'); check.type = 'checkbox'; check.className = 'diff-check'; check.checked = commitSelection.has(item.path); check.title = 'Für den Commit auswählen';
     check.addEventListener('change', () => { if (check.checked) commitSelection.add(item.path); else commitSelection.delete(item.path); renderGitBox(); });
     row.append(check, button); list.appendChild(row);
   }
+  renderTaskChanges();
 }
 function resetDiffView(message = 'Keine Datei gewählt') { activeDiffFile = ''; $('diff-path').textContent = message; $('diff-content').replaceChildren(); setDiffNavigation(); renderGitBox(); }
 function diffQuery() {
@@ -381,6 +389,7 @@ async function loadChanges({ refs = false } = {}) {
   if (diffState.mode !== 'worktree' && !diffState[diffState.mode]) { diffFiles = []; renderDiffList(); resetDiffView(); info('diff-summary', diffState.mode === 'commit' ? 'Keine lokalen Commits vorhanden.' : 'Keine lokalen Release-Tags vorhanden.', 'err'); return; }
   info('diff-summary', 'Änderungen werden geladen …');
   try {
+    if (diffState.mode === 'worktree' && taskChanges) await loadTaskChanges(taskChanges.task, load);
     const data = await request(`/projects/${encodeURIComponent(activeProject)}/changes?${diffQuery()}`);
     if (load !== diffLoad) return;
     if (!data.git) { diffFiles = []; gitStatus = null; renderDiffList(); resetDiffView(); info('diff-summary', 'Workspace ist kein Git-Repository.', 'err'); return; }
@@ -655,6 +664,7 @@ function renderTasks() {
     const locked = task.status === 'running';
     action('Nach oben', '↑', () => moveTask(index, -1), index === 0);
     action('Nach unten', '↓', () => moveTask(index, 1), index === tasks.length - 1);
+    action(task.run_id ? 'Änderungen ansehen: von dieser Aufgabe geschriebene Dateien im Diff hervorheben' : 'Änderungen ansehen (noch nicht gestartet)', '±', () => showTaskChanges(task), !task.run_id);
     action('Bearbeiten', '✎', () => editTask(task), locked || task.status === 'completed');
     action('Löschen', '×', () => deleteTask(task), locked);
     item.append(badge, title, actions); list.appendChild(item);
@@ -674,7 +684,50 @@ $('task-add').addEventListener('click', saveTask); $('task-edit-cancel').addEven
 $('task-new').addEventListener('keydown', event => { if (event.key === 'Enter' && event.ctrlKey) { event.preventDefault(); saveTask(); } });
 $('tasks-start').addEventListener('click', () => taskCommand('start')); $('tasks-pause').addEventListener('click', () => taskCommand('pause')); $('tasks-resume').addEventListener('click', () => taskCommand('resume'));
 const taskBaseSelectProject = selectProject;
-selectProject = async function(projectId) { resetTaskForm(); taskQueue = null; taskQueueKey = ''; $('task-list').replaceChildren(); await taskBaseSelectProject(projectId); await loadTasks(); };
+selectProject = async function(projectId) { resetTaskForm(); taskQueue = null; taskQueueKey = ''; taskChanges = null; $('task-list').replaceChildren(); await taskBaseSelectProject(projectId); await loadTasks(); };
+
+// „Änderungen ansehen“: the API attributes files to a task only from the write_file /
+// apply_patch records of its run and compares their last content hash with the
+// working tree. Commit and push stay the Diff tab's own explicit actions.
+const taskFileStates = { as_left: 'unverändert seit der Aufgabe', changed_since: 'seit der Aufgabe weiter geändert, der Diff enthält fremde Änderungen', missing: 'Datei existiert nicht mehr' };
+function taskFileNote(file) { return `${taskFileStates[file.state] || file.state}${file.other_tasks.length ? ` · auch geschrieben von: ${file.other_tasks.join(', ')}` : ''}`; }
+async function loadTaskChanges(task, load = diffLoad) {
+  try {
+    const data = await request(tasksUrl(`/${encodeURIComponent(task.task_id)}/changes`));
+    if (load !== diffLoad || taskChanges?.task.task_id !== task.task_id) return;
+    taskChanges = { task, title: task.title, data, byPath: new Map(data.files.map(file => [file.diff_path, file])) };
+  } catch (error) { if (taskChanges?.task.task_id === task.task_id) taskChanges.error = error.message; }
+}
+async function showTaskChanges(task) {
+  taskChanges = { task, title: task.title, data: null, byPath: new Map() };
+  diffState.mode = 'worktree'; $('diff-untracked').checked = true; // files a task created are untracked
+  if ($('diff-panel').hidden) showWorkspaceView('diff'); else await loadChanges();
+}
+function renderTaskChanges() {
+  const box = $('task-changes'), visible = Boolean(taskChanges) && diffState.mode === 'worktree' && isCodingContext();
+  box.hidden = !visible; if (!visible) return;
+  const { data, title } = taskChanges; box.replaceChildren();
+  const head = document.createElement('div'); head.className = 'task-changes-head';
+  const label = document.createElement('strong'); label.textContent = `Aufgabe „${title}“`;
+  const close = document.createElement('button'); close.type = 'button'; close.className = 'secondary icon-button'; close.textContent = '×'; close.title = 'Hervorhebung aufheben';
+  close.addEventListener('click', () => { taskChanges = null; renderDiffList(); });
+  head.append(label, close); box.appendChild(head);
+  const line = (text, cls = 'muted') => { const item = document.createElement('small'); item.className = cls; item.textContent = text; box.appendChild(item); };
+  if (!data) { line(taskChanges.error ? `Änderungen der Aufgabe nicht verfügbar: ${taskChanges.error}` : 'Wird geladen …', taskChanges.error ? 'err' : 'muted'); return; }
+  const listed = new Set(diffFiles.map(item => item.path));
+  const shown = data.files.filter(file => listed.has(file.diff_path)), own = shown.filter(file => file.state === 'as_left' && !file.other_tasks.length);
+  line(data.files.length ? `${data.files.length} von Sentinel geschriebene Datei(en) · ${shown.length} mit offener Änderung hervorgehoben` : 'Der Run hat keine Dateien über write_file/apply_patch geschrieben.', data.files.length ? 'muted' : 'ok');
+  if (data.status === 'running') line('Aufgabe läuft noch: Stand des letzten Checkpoints.');
+  if (shown.length > own.length) line(`${shown.length - own.length} Datei(en) nicht eindeutig zuzuordnen (später geändert oder auch von anderen Aufgaben geschrieben). Diff vor dem Commit prüfen.`, 'err');
+  for (const file of data.files.filter(file => !listed.has(file.diff_path))) line(`${file.path}: ${file.state === 'missing' ? 'gelöscht' : 'keine offene Änderung (bereits committet oder zurückgesetzt)'}`);
+  if (data.untracked_tools.length) line(`Der Run hat ${data.untracked_tools.join(', ')} genutzt; dadurch geänderte Dateien sind nicht aufgezeichnet und werden nicht hervorgehoben.`, 'err');
+  if (commitEnabled() && own.length) {
+    const select = document.createElement('button'); select.type = 'button'; select.className = 'secondary'; select.textContent = `Für Commit auswählen (${own.length})`;
+    select.title = 'Nur eindeutig zugeordnete Dateien auswählen; Commit und Push bleiben manuelle Aktionen';
+    select.addEventListener('click', () => { commitSelection.clear(); own.forEach(file => commitSelection.add(file.diff_path)); if (!$('commit-message').value.trim()) $('commit-message').value = title; renderDiffList(); renderGitBox(); });
+    box.appendChild(select);
+  }
+}
 setInterval(() => { if (activeProject && !document.hidden) loadTasks(); }, 3000);
 loadTasks();
 
